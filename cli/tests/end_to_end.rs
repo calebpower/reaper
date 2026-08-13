@@ -169,6 +169,24 @@ run:
     }
 }
 
+/// Every harness takes its sessions down and takes its directory with it.
+///
+/// Not tidiness. `up` detaches a heartbeat into its own process group so it
+/// survives the terminal that started it, which is exactly right in production
+/// and means a test that leaves a session behind leaves a process behind too --
+/// renewing an expiry against a stand-in that stopped listening, for as long as
+/// the machine is up. They were found by looking, three deep, after an
+/// afternoon of running this suite.
+///
+/// Drop rather than an explicit call at the end of each test, because the tests
+/// that most need it are the ones that fail partway through.
+impl Drop for Harness {
+    fn drop(&mut self) {
+        let _ = self.run(&["down", "--all"]);
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 fn write(path: &Path, body: &str, mode: Option<u32>) {
     std::fs::write(path, body).unwrap();
     if let Some(m) = mode {
