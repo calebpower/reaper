@@ -10,7 +10,7 @@ Last updated: 2026-08-12.
 
 | Phase | What it delivers | State |
 |---|---|---|
-| **0** | Repo bootstrap: docs, manifest schema, seam guards, sweeper | **In progress** |
+| **0** | Repo bootstrap: docs, manifest schema, seam guards, sweeper | **Complete but for the sweeper**, which is blocked -- see below |
 | 1 | Provider seam + session core (`up`/`list`/`renew`/`down`) | Not started |
 | 2 | Guest templates + the runner | Not started |
 | 3 | Sync, build, execution | Not started |
@@ -20,6 +20,32 @@ Last updated: 2026-08-12.
 
 Phase detail is in [`reaper-plan.md`](reaper-plan.md) §6, amended by the
 decisions below. Phase 2 is parallel-safe with Phase 1; nothing else is.
+
+### What runs today
+
+`tools/check.sh` runs everything that needs no hypervisor, token or network:
+
+| Check | What it proves |
+|---|---|
+| `tools/lint-shell.sh` | Every shell script is shellcheck-clean, and the linter refuses to pass when shellcheck is missing |
+| `tools/guards.sh` | No tenant, operating system or hypervisor has leaked out of its seam |
+| `manifest/test/run.sh` | The schema accepts what it should and rejects what it claims to |
+
+Every assertion in those suites has been mutation-checked: broken deliberately,
+and observed failing, before being counted as coverage.
+
+### What is blocked
+
+**The sweeper.** Phase 0 calls for importing the deployed `pve-reap` script
+verbatim, then hardening it -- fixing the swallowed-error defect, adding a
+dry-run mode, and adding a decision self-test that runs against canned API
+payloads with nothing live. The script exists only on the sweeper's own machine
+and has not been retrieved, so `cull/` does not exist yet. Everything else in
+Phase 0 is done.
+
+Two things are wanted before Phase 1 can be accepted rather than merely written:
+the deployed sweeper script, and a harness token in `~/.config/reaper/` so the
+live checks can run.
 
 ## Decisions taken
 
