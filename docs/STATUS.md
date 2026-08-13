@@ -11,8 +11,8 @@ Last updated: 2026-08-12.
 | Phase | What it delivers | State |
 |---|---|---|
 | **0** | Repo bootstrap: docs, manifest schema, seam guards, sweeper | **Complete.** Sweeper imported, hardened, self-tested, and dry-run against the live API |
-| 1 | Provider seam + session core (`up`/`list`/`renew`/`down`) | **Built and verified offline**; live acceptance blocked |
-| 2 | Guest templates + the runner | **Software done and verified offline**; templates await building |
+| 1 | Provider seam + session core (`up`/`list`/`renew`/`down`) | **Accepted live.** up, list, renew and down all run against the real cluster |
+| 2 | Guest templates + the runner | **Ubuntu template built and proven.** FreeBSD template outstanding |
 | 3 | Sync, build, execution | Not started |
 | 4 | `reset` and the `@pristine` snapshot | Not started |
 | 5 | Tenant onboarding | Not started |
@@ -40,6 +40,49 @@ firstboot run before a session is called ready.
 `runner/test/run.sh` runs the runner's decision self-test: 50 cases against
 stubbed tools, asserting the invocation log rather than exit codes, because
 "it refused" and "it refused without touching anything" are different claims.
+
+### Measured against the real cluster
+
+| | |
+|---|---|
+| `up`, cold, to a ready session | **9m20s** |
+| `down` (stop, destroy, disks) | ~5s |
+| Template boot disk | 8 GiB |
+| Storage | plain LVM, no snapshots -- every clone is a full copy |
+
+Nine minutes is the number the original plan warned about and asked to be
+measured honestly. It is dominated by the full copy of the boot disk. It is
+acceptable for a session that lasts an afternoon, and it is why the pool disk
+is attached rather than carried: only the 8 GiB boot disk is copied, not the
+session's storage.
+
+### An extra privilege PVE 9 requires
+
+The original plan's list of token privileges predates PVE 9 and is incomplete.
+Cloning a machine with a network interface now also needs **`SDN.Use`**, granted
+here at `/sdn/zones` with propagation.
+
+That path is broader than the ideal `/sdn/zones/localnetwork/vmbr0`, and it was
+used because the narrower path could not be selected and this cluster has **no
+SDN zones configured** -- so the two are presently the same set of networks. If
+anyone configures SDN later, this grant silently widens to include those zones
+and should be narrowed then.
+
+### What live testing found that offline testing could not
+
+Six defects, all of which would have surfaced as sessions that silently cannot
+be reached or destroyed. Three of them shared a root cause worth naming: the
+stand-in API was **kinder than the real one**, accepting operations the real
+API refuses. It now models those refusals.
+
+| Found | Why offline missed it |
+|---|---|
+| Clones inherit the template's protection flag, so sessions could never be destroyed | Stand-in ignored protection |
+| A running machine cannot be deleted; destroy must stop first | Stand-in ignored run state |
+| The heartbeat died with its terminal -- no `setsid` | No test harness signals the process group |
+| `cloud-init clean` destroys networking on an ISO install | Not modelled at all |
+| `ConditionFirstBoot` never fires for host-key generation | Not modelled at all |
+| `DefaultDependencies=no` needed, or systemd deletes ssh.socket's start job | Not modelled at all |
 
 ### Phase 2 decisions
 
