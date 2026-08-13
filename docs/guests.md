@@ -13,30 +13,50 @@ entry -- never a change to framework code.
 
 A template must provide:
 
-**A second disk, unpartitioned**, which firstboot claims for the ZFS pool. It
-must not be the root disk. The runner discovers it as *the block device that is
-not the root device*; it never matches on a device name, because device naming
-is one of the few things that genuinely differs between operating systems and
-hardcoding it is how a framework accidentally supports exactly one.
-
 **ZFS**, whether native to the operating system or installed. The runner uses
 `zpool create`, `zfs create`, `zfs snapshot` and `zfs rollback`, and nothing
 exotic. This command surface is identical across the platforms supported so far,
 which is what makes the core mechanism portable for free.
 
-**SSH**, with the session public key trusted. SSH is the transport; there is no
-listening daemon in the guest beyond it.
+**A POSIX shell**, and the ordinary tools around it. The runner is a shell
+script the CLI delivers over SSH at session start; nothing is compiled for a
+guest and nothing reaper wrote lives in the template.
 
-**A discoverable IP.** The provider must be able to learn the machine's address
-without help from DNS or mDNS -- a guest agent is the usual mechanism.
+**SSH**, with the session public key trusted, for a single unprivileged user
+able to escalate. SSH is the transport: there is no listening daemon in the
+guest beyond it, and the runner is invoked rather than resident.
 
-**An init mechanism** that starts the runner at boot and restarts it if it
-dies. What that mechanism *is* -- an init system unit, an rc script, something
-else -- is the template's business and lives behind the runner's platform seam.
+**A discoverable address.** The provider must be able to learn it without DNS or
+mDNS -- a guest agent is the usual mechanism.
+
+**`rsync`**, which is how a working tree gets in and results get out.
 
 **A container engine**, if and only if the template is intended for
 `exec: container` tenants. Templates serving only `exec: host` tenants do not
-need one.
+need one, and firstboot skips the image-store configuration when it finds none.
+
+## What a template does *not* provide
+
+Three things it might seem to need, and does not.
+
+**Not the data disk.** The template carries only its boot disk. The provider
+attaches a fresh disk when it creates a session, and firstboot makes the pool on
+it. On storage without snapshots -- where every clone is a byte-for-byte copy --
+a data disk in the template would be copied in full on every single session,
+empty or not. Attaching it instead means a clone copies the boot disk alone, and
+the pool's size becomes a per-session decision rather than one frozen when the
+template was built.
+
+**Not an init mechanism for reaper.** Nothing reaper owns runs at boot. The CLI
+connects, delivers the runner, and invokes it. A runner living in the template
+would mean rebuilding two hand-made templates every time it changed, and version
+skew between a template and the CLI driving it.
+
+**Not installation media.** reaper never fetches an ISO and never uploads one.
+Media is expected to be on the provider already; a missing one is a request to
+whoever administers the cluster. The credential agrees with the design here --
+the harness token can allocate space but not templates, so it could not upload
+media even if the design wanted it to.
 
 ## What a template must not have
 
@@ -52,9 +72,44 @@ container execution is the default.
 
 **Project state of any kind.** A template is not a fixture.
 
+## How the pool disk is chosen
+
+Firstboot has to pick a disk to destroy, so the rule is written to fail closed.
+It is **not** "the disk that is not the root disk" -- on a system with a ZFS root
+`mount -p /` reports a dataset rather than a device, and any rule phrased that
+way needs a special case per platform.
+
+The rule is:
+
+> A candidate is a whole disk that is **unused**: no partition table, no
+> filesystem signature, not mounted, and not a member of any pool. Exactly one
+> candidate must exist.
+
+Zero candidates is an error. Two or more is an error. Refusing on ambiguity
+rather than guessing is the whole point, because the cost of guessing wrong is
+somebody's data.
+
+What varies by platform is only *how the list of disks is obtained*. Which disk
+gets chosen never varies.
+
+If the pool already exists and is healthy, firstboot does nothing and succeeds.
+
+## Host keys, and what is being trusted
+
+A freshly cloned machine has a host key nothing has ever seen, so strict
+checking would reject every first connection. reaper accepts the key on first
+use, against a **per-session** known-hosts file -- so a session starts with no
+history and cannot inherit a stale key from an address that has been recycled.
+
+State the trust plainly: this trusts the provider's report of the address. An
+attacker who could forge that, on the network between workstation and cluster,
+could impersonate a session. That is the same trust already placed in the
+provider to create the machine at all, so it adds no new party -- but it is a
+real assumption and it belongs written down rather than implied.
+
 ## Dataset layout
 
-Firstboot creates a pool (`tank`) on the second disk and these datasets:
+Firstboot creates a pool (`tank`) on the attached disk and these datasets:
 
 | Dataset | Contents | Rolled back? |
 |---|---|---|
@@ -93,8 +148,8 @@ The differences that have actually mattered so far:
 | Concern | How it varies |
 |---|---|
 | ZFS tooling | Native on some systems, a package on others. The *commands* do not vary |
-| Init | Unit files, rc scripts -- entirely different mechanisms |
-| Second disk naming | Different device conventions; solved by discovery, not by matching |
+| Enumerating disks | Entirely different tools; the *choice* among them does not vary |
+| Capping the ARC | Different knob, different file to persist it in |
 | Container engine | Availability, privilege model, and whether it can run native binaries at all |
 
 That last one is why `exec: host` exists. An engine that runs only foreign-format

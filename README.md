@@ -94,6 +94,9 @@ one of these -- a tenant-side change, or a plain "no":
 - **Not CI.** No pipeline integration, no build artifacts, no verdict publishing.
 - **Not a secrets manager.** The scope is "where do the credentials live", and
   no further.
+- **Not a media manager.** reaper never fetches an installation image, and never
+  uploads one. Media is expected to be on the provider already; a missing ISO is
+  a request to whoever administers the cluster, exactly like a missing template.
 
 ### Where this repository departs from `docs/reaper-plan.md`
 
