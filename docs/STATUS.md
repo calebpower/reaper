@@ -149,9 +149,11 @@ ssh, which was the fault -- after `VM.GuestAgent.Unrestricted` was added to the
 token's pool grant. That privilege adds nothing meaningful: the token could
 already create, destroy and re-disk every machine in the pool.
 
-**Template 9002 still exists and is still broken.** It is not this run's to
-destroy, so it was left alone and the registry points at 9004 instead. Deleting
-it is a one-line job for whoever owns it.
+The broken template was 9002. It was destroyed once Cal authorised it, and the
+working one took its name -- so the identifier changed and nothing else did. The
+safety guard refused 9002 until it was named explicitly, which was correct: only
+9001 had been authorised before, and inferring the rest from a precedent is how
+a template gets destroyed that somebody still wanted.
 
 ### How it was diagnosed
 
