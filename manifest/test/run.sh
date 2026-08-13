@@ -17,7 +17,7 @@ root=$(CDPATH='' cd -- "${here}/../.." && pwd)
 validate="${root}/target/debug/reaper-manifest-validate"
 if [ ! -x "${validate}" ]; then
     echo "building the validator first" >&2
-    ( cd "${root}" && cargo build --quiet --manifest-path manifest/validate/Cargo.toml ) \
+    ( cd "${root}" && cargo build --quiet --manifest-path manifest/Cargo.toml ) \
         || { echo "cannot build the validator" >&2; exit 1; }
 fi
 

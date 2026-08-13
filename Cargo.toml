@@ -3,7 +3,7 @@
 # re-implementing manifest handling three times.
 [workspace]
 resolver = "2"
-members = ["manifest/validate"]
+members = ["manifest"]
 
 [workspace.package]
 edition = "2021"

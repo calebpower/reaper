@@ -1,0 +1,31 @@
+# Container execution with a toolchain image and several images pre-pulled for
+# the run. The counterpart to no-images.yaml: between them they pin both ends of
+# what run.images may be.
+schema: 1
+project: container-with-images
+guests: [some-guest]
+exec: container
+build:
+  image: docker.io/library/toolchain@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+  cmd: make build
+  cache: [one, two]
+run:
+  cmd: make e2e
+  images:
+    - docker.io/library/database@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+    - docker.io/library/mail@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+    - registry.example.org/browser@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+reset:
+  datasets: [state]
+resources:
+  cores: 4
+  ram_gb: 8
+profiles:
+  dev:
+    ttl: 2h
+    warm_cache: true
+  nightly:
+    ttl: 12h
+    warm_cache: false
+    env:
+      ITERATIONS: "2000"
