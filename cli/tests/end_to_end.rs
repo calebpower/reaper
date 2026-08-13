@@ -822,3 +822,53 @@ fn a_machine_that_never_answers_is_left_tagged_rather_than_torn_down() {
     h.ok(&["down"]);
     assert!(h.machines().is_empty());
 }
+
+/// `--manifest` has to mean the same thing to every verb.
+///
+/// It used to decide *what* to run while the current directory decided *which
+/// session to run it on*, so `reaper sync --manifest other.yaml` looked up
+/// sessions for whichever project happened to be in `.reaper.yaml` and failed
+/// saying there were none -- naming a project it had not been asked about.
+/// Found live, driving a second guest from a scratch manifest.
+#[test]
+fn a_manifest_elsewhere_decides_the_project_too() {
+    let h = Harness::new("manifest-elsewhere");
+
+    // The directory's own manifest names one project; the one we pass names
+    // another. Only the second has a session.
+    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(
+        &h.dir.join("other.yaml"),
+        r#"
+schema: 1
+project: elsewhere
+guests: [a-guest]
+exec: host
+run:
+  cmd: make check
+"#,
+        None,
+    );
+
+    h.ok(&["up", "--manifest", "other.yaml"]);
+    assert_eq!(h.machines().len(), 1);
+
+    // Both must find the session the passed manifest describes, rather than
+    // looking for one belonging to the directory's project.
+    let synced = h.ok(&["sync", "--manifest", "other.yaml"]);
+    assert!(synced.contains("elsewhere"), "{synced}");
+    let ran = h.ok(&["run", "--manifest", "other.yaml"]);
+    assert!(ran.contains("elsewhere"), "{ran}");
+
+    // And the directory's own project still has no session, which is the
+    // thing that made the old behaviour look plausible.
+    let err = h.fails(&["sync"]);
+    assert!(err.contains("a-project"), "{err}");
+
+    // down and renew take it too. They did not, so `reaper down --manifest x`
+    // was rejected outright -- and in a script that reads as a session that
+    // was taken down when it was not.
+    h.ok(&["renew", "--manifest", "other.yaml"]);
+    h.ok(&["down", "--manifest", "other.yaml"]);
+    assert!(h.machines().is_empty(), "down must have acted on the right project");
+}

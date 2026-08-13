@@ -80,6 +80,9 @@ enum Command {
         session: Option<String>,
         #[arg(long)]
         ttl: Option<String>,
+        /// Which project's sessions. Defaults to .reaper.yaml here.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
     },
 
     /// Destroy a session and its machine.
@@ -89,6 +92,9 @@ enum Command {
         /// Every session, not just this project's.
         #[arg(long)]
         all: bool,
+        /// Which project's sessions. Defaults to .reaper.yaml here.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
     },
 
     /// Renew a session's expiry until it goes away. Started by `up`.
@@ -121,8 +127,16 @@ fn main() -> ExitCode {
             manifest,
         } => commands::exec(commands::Verb::Run, session, profile, manifest),
         Command::List => commands::list(),
-        Command::Renew { session, ttl } => commands::renew(session, ttl),
-        Command::Down { session, all } => commands::down(session, all),
+        Command::Renew {
+            session,
+            ttl,
+            manifest,
+        } => commands::renew(session, ttl, manifest),
+        Command::Down {
+            session,
+            all,
+            manifest,
+        } => commands::down(session, all, manifest),
         Command::Heartbeat { session } => commands::heartbeat(&session),
     };
 

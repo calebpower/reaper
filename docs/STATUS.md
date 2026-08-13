@@ -12,7 +12,7 @@ Last updated: 2026-08-13.
 |---|---|---|
 | **0** | Repo bootstrap: docs, manifest schema, seam guards, sweeper | **Complete.** Sweeper imported, hardened, self-tested, and dry-run against the live API |
 | 1 | Provider seam + session core (`up`/`list`/`renew`/`down`) | **Accepted live.** up, list, renew and down all run against the real cluster |
-| 2 | Guest templates + the runner | **Ubuntu rebuilt and proven.** FreeBSD unresolved and unregistered |
+| 2 | Guest templates + the runner | **Complete.** Both guests rebuilt, registered and proven live |
 | 3 | Sync, build, execution | **Accepted live.** sync, build and run against the real cluster, results flowing continuously |
 | 4 | `reset` and the `@pristine` snapshot | Not started |
 | 5 | Tenant onboarding | Not started |
@@ -129,7 +129,31 @@ clone that is never tagged at all, so the failure cannot recur -- an untagged
 machine in the pool is reported by the sweeper and never destroyed, which is the
 correct state for work in progress.
 
-### FreeBSD: diagnosed, not yet repaired
+### FreeBSD works
+
+Repaired and proven on 2026-08-13. `freebsd-15.1` is registered again, at
+template **9004**.
+
+| Proof | Result |
+|---|---|
+| `reaper up` | 1m34s to a reachable session |
+| Firstboot | `tank` ONLINE on `vtbd1`, all four datasets |
+| `reaper sync` | working tree in |
+| `reaper run`, **host execution** | ran on the guest itself; this guest's whole reason for existing, exercised through a session for the first time |
+| A second clone | distinct `hostid` *and* distinct host keys |
+
+The repair itself was three lines: delete the six empty key files, let
+`service sshd start` regenerate them, restore the truncated
+`/boot/loader.conf`. It was done through the guest agent -- the machine had no
+ssh, which was the fault -- after `VM.GuestAgent.Unrestricted` was added to the
+token's pool grant. That privilege adds nothing meaningful: the token could
+already create, destroy and re-disk every machine in the pool.
+
+**Template 9002 still exists and is still broken.** It is not this run's to
+destroy, so it was left alone and the registry points at 9004 instead. Deleting
+it is a one-line job for whoever owns it.
+
+### How it was diagnosed
 
 **The cause is known exactly.** Clones of template 9002 have no ssh because the
 template carries six **zero-byte** files in `/etc/ssh`, and FreeBSD's
@@ -345,19 +369,6 @@ there is something reaper put there.
 ### What is blocked
 
 **The FreeBSD template.** Not blocked by anything reaper owns. See above.
-
-**Repairing the FreeBSD template.** The fault is understood and the fix is
-small -- remove six empty files and re-seal cleanly -- but the machine that
-needs the fix has no ssh, which is the fault itself. Three ways in, none of
-which this credential can take today:
-
-| Route | What it needs |
-|---|---|
-| The guest agent | `VM.GuestAgent.Unrestricted` on the pool. Adds nothing meaningful: the token can already create, destroy and re-disk these machines |
-| The serial console reader | a PVE user with `VM.Console` on the pool, and a password file |
-| The web console | a person at a browser |
-
-A rebuild from the ISO is the fourth, and needs neither -- only the time.
 
 **The sweeper's live dry run**, from this workstation. Its credential file lives
 on the sweeper's own VM, which is deliberately not a deploy target for anything

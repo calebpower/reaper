@@ -234,10 +234,22 @@ rm -f /etc/hostid /etc/machine-id
 sync
 ```
 
-**Host keys are not deleted here**, unlike the other guest -- see the section
-above. And the entropy seed is left alone: removing it was tried while chasing
-that bug and made no difference, so there is no reason to strip randomness a
-clone could use.
+**Host keys are deleted here**, exactly as on the other guest. An earlier
+version of this runbook said to keep them, reasoning that FreeBSD regenerates
+them anyway. That reasoning was drawn from an image where the files were present
+and *empty*, which is the one case FreeBSD cannot handle -- see 6a. Absent files
+are regenerated on every boot, reliably, and that has now been proven by two
+clones with distinct keys.
+
+Keeping them would also mean every session sharing one host key, which is worth
+avoiding on its own account.
+
+Unlike the other guest, deleting them does not cut off your own connection:
+sshd here is a persistent daemon rather than socket-activated, so the session
+you are working in survives.
+
+The entropy seed is left alone: removing it was tried while chasing that bug and
+made no difference, so there is no reason to strip randomness a clone could use.
 
 Then shut the machine down **cleanly**:
 

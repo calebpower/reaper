@@ -464,7 +464,24 @@ pub fn list() -> Result<()> {
 
 /// The sessions a bare `renew`/`down` should act on: this project's, if we are
 /// standing in one, and otherwise nothing without an explicit name.
-fn implied_sessions(store: &Store, explicit: Option<String>) -> Result<Vec<Session>> {
+/// The project a verb was pointed at, if it was pointed at one.
+///
+/// Every verb that acts on a project's sessions takes `--manifest`, and they
+/// all have to agree about what it means -- otherwise it selects the work for
+/// one verb and is silently rejected by the next, which is how a `down` came to
+/// do nothing at all while reporting no error worth noticing.
+fn project_of(manifest_path: Option<PathBuf>) -> Result<Option<String>> {
+    match manifest_path {
+        Some(p) => Ok(Some(load_manifest(Some(p))?.project)),
+        None => Ok(None),
+    }
+}
+
+fn implied_sessions(
+    store: &Store,
+    explicit: Option<String>,
+    project: Option<&str>,
+) -> Result<Vec<Session>> {
     if let Some(name) = explicit {
         let s = store
             .get(&name)?
@@ -472,15 +489,26 @@ fn implied_sessions(store: &Store, explicit: Option<String>) -> Result<Vec<Sessi
         return Ok(vec![s]);
     }
 
-    let here = Path::new(".reaper.yaml");
-    if !here.exists() {
-        return Err(
-            "not inside a project, so there is nothing implied. Name a session, or run \
-             this where a .reaper.yaml is"
-                .into(),
-        );
-    }
-    let project = reaper_manifest::load(here)?.project;
+    // The project is passed in by any verb that has already read a manifest, so
+    // that `--manifest` means the same thing everywhere. It used to be read
+    // from `.reaper.yaml` here regardless, which made `--manifest` decide what
+    // to run while the current directory decided where to run it -- and pointed
+    // at a project with no sessions, `reaper sync --manifest other.yaml` failed
+    // saying there were no sessions for a project it had not been asked about.
+    let project = match project {
+        Some(p) => p.to_string(),
+        None => {
+            let here = Path::new(".reaper.yaml");
+            if !here.exists() {
+                return Err(
+                    "not inside a project, so there is nothing implied. Name a session, or run \
+                     this where a .reaper.yaml is"
+                        .into(),
+                );
+            }
+            reaper_manifest::load(here)?.project
+        }
+    };
     let mine: Vec<Session> = store
         .list()?
         .into_iter()
@@ -493,12 +521,17 @@ fn implied_sessions(store: &Store, explicit: Option<String>) -> Result<Vec<Sessi
     Ok(mine)
 }
 
-pub fn renew(session: Option<String>, ttl: Option<String>) -> Result<()> {
+pub fn renew(
+    session: Option<String>,
+    ttl: Option<String>,
+    manifest_path: Option<PathBuf>,
+) -> Result<()> {
     let cfg = load_config()?;
     let store = Store::open();
     let provider = provider_for(&cfg)?;
+    let project = project_of(manifest_path)?;
 
-    for s in implied_sessions(&store, session)? {
+    for s in implied_sessions(&store, session, project.as_deref())? {
         let ttl = match &ttl {
             Some(t) => duration::parse(t)?,
             None => s.ttl,
@@ -514,7 +547,7 @@ pub fn renew(session: Option<String>, ttl: Option<String>) -> Result<()> {
     Ok(())
 }
 
-pub fn down(session: Option<String>, all: bool) -> Result<()> {
+pub fn down(session: Option<String>, all: bool, manifest_path: Option<PathBuf>) -> Result<()> {
     let cfg = load_config()?;
     let store = Store::open();
     let provider = provider_for(&cfg)?;
@@ -522,7 +555,8 @@ pub fn down(session: Option<String>, all: bool) -> Result<()> {
     let targets = if all {
         store.list()?
     } else {
-        implied_sessions(&store, session)?
+        let project = project_of(manifest_path)?;
+        implied_sessions(&store, session, project.as_deref())?
     };
 
     if targets.is_empty() {
@@ -691,7 +725,7 @@ pub fn sync(session: Option<String>, manifest_path: Option<PathBuf>) -> Result<(
     let (manifest, tree) = load_manifest_at(manifest_path)?;
     let store = Store::open();
 
-    for s in implied_sessions(&store, session)? {
+    for s in implied_sessions(&store, session, Some(&manifest.project))? {
         let ssh = ssh_for(&cfg, &s)?;
         deliver_runner(&ssh)?;
         let (work, results) = workspace(&ssh, &manifest.project)?;
@@ -759,7 +793,7 @@ pub fn exec(
         None => None,
     };
 
-    for s in implied_sessions(&store, session)? {
+    for s in implied_sessions(&store, session, Some(&manifest.project))? {
         let g = manifest.guest(&s.guest).ok_or_else(|| {
             format!(
                 "this session runs on {:?}, and the manifest no longer names that \
