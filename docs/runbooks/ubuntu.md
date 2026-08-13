@@ -96,13 +96,22 @@ sudo systemctl enable --now qemu-guest-agent
 sudo modprobe zfs && zfs version
 ```
 
-If you did not import a key during the install, add it now:
+Trust the session key **for root**:
 
 ```sh
-mkdir -p ~/.ssh && chmod 700 ~/.ssh
-echo 'ssh-ed25519 AAAA... your session key' >> ~/.ssh/authorized_keys
-chmod 600 ~/.ssh/authorized_keys
+sudo mkdir -p /root/.ssh && sudo chmod 700 /root/.ssh
+echo 'ssh-ed25519 AAAA... your session key' | sudo tee -a /root/.ssh/authorized_keys
+sudo chmod 600 /root/.ssh/authorized_keys
 ```
+
+reaper connects as root, and `PermitRootLogin prohibit-password` is already the
+default here, so key authentication works and passwords do not.
+
+Root, because a session is a whole disposable machine whose blast radius is the
+sandbox -- the original design accepts rootful containers for the same reason.
+An unprivileged user would mean an escalation step that differs per guest: one
+platform's `sudo` is a package, another's `su` wants a password. The `reaper`
+user stays for console use when something has gone wrong.
 
 ## 5. Record what you built
 

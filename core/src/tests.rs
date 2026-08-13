@@ -431,3 +431,88 @@ fn the_default_pool_size_has_bounds_at_both_ends() {
 fn the_default_pool_size_defaults() {
     assert_eq!(parse(GOOD).unwrap().session.default_disk_gb, 64);
 }
+
+// --- transport -------------------------------------------------------------
+
+#[test]
+fn ssh_never_prompts_and_never_shares_a_known_hosts_file() {
+    // Both matter for the same reason: this runs unattended against machines
+    // that did not exist a minute ago.
+    let ssh = crate::transport::Ssh::new(
+        "ssh",
+        "root",
+        "192.0.2.7".parse().unwrap(),
+        None,
+        PathBuf::from("/state/known-hosts-a-session"),
+        Duration::from_secs(15),
+    );
+    let opts = ssh.options().join(" ");
+
+    assert!(opts.contains("BatchMode=yes"), "{opts}");
+    assert!(opts.contains("StrictHostKeyChecking=accept-new"), "{opts}");
+    assert!(
+        opts.contains("UserKnownHostsFile=/state/known-hosts-a-session"),
+        "the known-hosts file must be the per-session one: {opts}"
+    );
+    assert!(opts.contains("ConnectTimeout=15"), "{opts}");
+    assert!(opts.ends_with("192.0.2.7"), "the host comes last: {opts}");
+}
+
+#[test]
+fn a_configured_key_is_offered_and_it_is_the_only_one() {
+    // A workstation with several keys loaded can exhaust the server's auth
+    // attempts before reaching the right one, which presents as a permission
+    // error that has nothing to do with permissions.
+    let ssh = crate::transport::Ssh::new(
+        "ssh",
+        "root",
+        "192.0.2.7".parse().unwrap(),
+        Some(PathBuf::from("/keys/session")),
+        PathBuf::from("/state/kh"),
+        Duration::from_secs(15),
+    );
+    let opts = ssh.options().join(" ");
+    assert!(opts.contains("-i /keys/session"), "{opts}");
+    assert!(opts.contains("IdentitiesOnly=yes"), "{opts}");
+}
+
+#[test]
+fn with_no_key_configured_nothing_is_forced() {
+    let ssh = crate::transport::Ssh::new(
+        "ssh",
+        "root",
+        "192.0.2.7".parse().unwrap(),
+        None,
+        PathBuf::from("/state/kh"),
+        Duration::from_secs(15),
+    );
+    let opts = ssh.options().join(" ");
+    assert!(!opts.contains("IdentitiesOnly"), "{opts}");
+    assert!(!opts.contains("-i "), "{opts}");
+}
+
+#[test]
+fn ssh_defaults_are_sane_and_overridable() {
+    let c = parse(GOOD).unwrap();
+    assert_eq!(c.session.ssh_user, "root");
+    assert_eq!(c.session.ssh_command, "ssh");
+    assert_eq!(c.session.ssh_connect_timeout, Duration::from_secs(15));
+    assert!(c.session.ssh_key.is_none());
+
+    let text = r#"
+provider = "p"
+[session]
+ssh_user = "someone"
+ssh_command = "/usr/local/bin/ssh-wrapper"
+ssh_connect_timeout = "5s"
+ssh_key = "/keys/k"
+[guests.g]
+template = "t"
+[p]
+"#;
+    let c = parse(text).unwrap();
+    assert_eq!(c.session.ssh_user, "someone");
+    assert_eq!(c.session.ssh_command, "/usr/local/bin/ssh-wrapper");
+    assert_eq!(c.session.ssh_connect_timeout, Duration::from_secs(5));
+    assert_eq!(c.session.ssh_key, Some(PathBuf::from("/keys/k")));
+}

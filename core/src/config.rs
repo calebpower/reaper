@@ -86,6 +86,18 @@ pub struct SessionConfig {
     /// Size of the blank disk attached to each session, in gibibytes, unless a
     /// tenant asks for something else.
     pub default_disk_gb: u32,
+
+    /// Who reaper connects as. Root by default: a session is a whole disposable
+    /// machine and the blast radius is the sandbox, so an escalation dance
+    /// would add a per-guest difference -- one platform's `sudo` is a package,
+    /// another's `su` wants a password -- for no boundary that matters here.
+    pub ssh_user: String,
+    /// Which key to offer. `None` leaves it to the agent and the defaults.
+    pub ssh_key: Option<PathBuf>,
+    /// The ssh binary. Configurable so a site can point at a wrapper, which is
+    /// also what lets the suite exercise the whole path without a network.
+    pub ssh_command: String,
+    pub ssh_connect_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +137,10 @@ struct RawSession {
     ready_grace: Option<String>,
     max_concurrent: Option<usize>,
     default_disk_gb: Option<u32>,
+    ssh_user: Option<String>,
+    ssh_key: Option<String>,
+    ssh_command: Option<String>,
+    ssh_connect_timeout: Option<String>,
 }
 
 impl Default for RawSession {
@@ -135,6 +151,10 @@ impl Default for RawSession {
             ready_grace: None,
             max_concurrent: None,
             default_disk_gb: None,
+            ssh_user: None,
+            ssh_key: None,
+            ssh_command: None,
+            ssh_connect_timeout: None,
         }
     }
 }
@@ -257,6 +277,14 @@ pub fn parse(text: &str, path: &Path) -> Result<Config, ConfigError> {
             ready_grace,
             max_concurrent,
             default_disk_gb,
+            ssh_user: raw.session.ssh_user.unwrap_or_else(|| "root".to_string()),
+            ssh_key: raw.session.ssh_key.as_deref().map(paths::expand_tilde),
+            ssh_command: raw.session.ssh_command.unwrap_or_else(|| "ssh".to_string()),
+            ssh_connect_timeout: dur(
+                "ssh_connect_timeout",
+                raw.session.ssh_connect_timeout.as_ref(),
+                "15s",
+            )?,
         },
         guests: raw.guests,
         provider_table,

@@ -10,10 +10,12 @@ pub mod duration;
 pub mod paths;
 pub mod provider;
 pub mod session;
+pub mod transport;
 
 pub use config::{Config, ConfigError};
 pub use provider::{CreateRequest, MachineRef, MachineSummary, Provider, ProviderError};
 pub use session::{Session, Store};
+pub use transport::{Ssh, Transport};
 
 #[cfg(test)]
 mod tests;

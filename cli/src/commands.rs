@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime};
 use reaper_core::config::Config;
 use reaper_core::provider::{CreateRequest, MachineRef, Provider};
 use reaper_core::session::{Session, Store};
+use reaper_core::transport::{Ssh, Transport};
 use reaper_core::{config, duration};
 use reaper_manifest::Manifest;
 
@@ -178,6 +179,11 @@ pub fn up(
 
         match wait_for_address(provider.as_ref(), &machine, cfg.session.ready_grace)? {
             Some(address) => {
+                // A machine with an address is not yet a machine anyone can
+                // use: it has no pool. Firstboot is what makes it a session,
+                // so it happens before the session is called ready.
+                prepare(&cfg, &name, address)?;
+
                 let ready_at = SystemTime::now();
                 provider.set_expiry(&machine, ready_at + ttl)?;
 
@@ -223,6 +229,40 @@ fn wait_for_address(
         }
         std::thread::sleep(Duration::from_secs(3));
     }
+}
+
+/// The runner, as shipped. Compiled in so the CLI and the runner can never be
+/// separate versions of themselves -- the reason nothing reaper wrote lives in
+/// a template in the first place.
+const RUNNER: &str = include_str!("../../runner/runner.sh");
+
+/// Deliver the runner and build the session's storage.
+fn prepare(cfg: &Config, session: &str, address: std::net::IpAddr) -> Result<()> {
+    // Per-session, and thrown away with the session. A shared known-hosts file
+    // would accumulate keys for addresses that get recycled, and then refuse to
+    // connect at the least convenient moment.
+    let known_hosts = Store::open()
+        .path()
+        .with_file_name(format!("known-hosts-{session}"));
+    if let Some(dir) = known_hosts.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let _ = std::fs::remove_file(&known_hosts);
+
+    let ssh = Ssh::new(
+        cfg.session.ssh_command.clone(),
+        cfg.session.ssh_user.clone(),
+        address,
+        cfg.session.ssh_key.clone(),
+        known_hosts,
+        cfg.session.ssh_connect_timeout,
+    );
+
+    let dest = "/tmp/reaper-runner.sh";
+    println!("{session}: preparing storage on {}", ssh.describe());
+    ssh.put_executable(RUNNER.as_bytes(), dest)?;
+    ssh.run(&format!("{dest} firstboot"), "firstboot")?;
+    Ok(())
 }
 
 fn start_heartbeat(session: &str) -> Result<Option<u32>> {

@@ -38,10 +38,49 @@ impl Harness {
 
         write(&dir.join("token"), hypervisor.credential(), Some(0o600));
         write(
+            &dir.join("fake-ssh"),
+            r#"#!/bin/sh
+# Stands in for ssh. Records the invocation; captures an upload's stdin; fails
+# on demand. It deliberately does not run the runner -- the runner has its own
+# suite, and re-testing it through here would only make failures harder to read.
+printf '%s
+' "$*" >> "$(dirname "$0")/ssh.log"
+for a in "$@"; do
+    case "${a}" in
+        *"cat > "*) cat > "$(dirname "$0")/uploaded" ;;
+    esac
+done
+# Fails only for commands matching the pattern it was given, so a test can
+# break one step without breaking the ones before it.
+if [ -f "$(dirname "$0")/ssh.fail" ]; then
+    pattern=$(cat "$(dirname "$0")/ssh.fail")
+    for a in "$@"; do
+        case "${a}" in
+            *"${pattern}"*)
+                echo "stand-in ssh: refusing ${pattern}" >&2
+                exit 7 ;;
+        esac
+    done
+fi
+exit 0
+"#,
+            Some(0o755),
+        );
+        write(
             &dir.join("config.toml"),
             &format!(
-                "{}\n[session]\ndefault_ttl = \"2h\"\nheartbeat_interval = \"10m\"\n                 ready_grace = \"30m\"\nmax_concurrent = 2\n\n                 [guests.\"a-guest\"]\ntemplate = \"{template}\"\n",
-                hypervisor.site_config(&dir.join("token"), POOL)
+                "{provider}\n\
+                 [session]\n\
+                 default_ttl = \"2h\"\n\
+                 heartbeat_interval = \"10m\"\n\
+                 ready_grace = \"30m\"\n\
+                 max_concurrent = 2\n\
+                 ssh_command = \"{ssh}\"\n\
+                 ssh_user = \"root\"\n\n\
+                 [guests.\"a-guest\"]\n\
+                 template = \"{template}\"\n",
+                provider = hypervisor.site_config(&dir.join("token"), POOL),
+                ssh = dir.join("fake-ssh").display(),
             ),
             None,
         );
@@ -311,5 +350,71 @@ fn a_tenant_can_ask_for_a_bigger_pool_than_the_site_default() {
         disks.values().any(|d| d.ends_with(":200")),
         "expected a 200 GiB disk, attached: {disks:?}"
     );
+    h.ok(&["down"]);
+}
+
+// --- bringing a machine to readiness ---------------------------------------
+
+impl Harness {
+    fn ssh_log(&self) -> String {
+        std::fs::read_to_string(self.dir.join("ssh.log")).unwrap_or_default()
+    }
+    fn uploaded(&self) -> String {
+        std::fs::read_to_string(self.dir.join("uploaded")).unwrap_or_default()
+    }
+    /// Make the stand-in refuse only commands containing `pattern`.
+    fn make_ssh_fail(&self, pattern: &str) {
+        std::fs::write(self.dir.join("ssh.fail"), pattern).unwrap();
+    }
+}
+
+#[test]
+fn up_delivers_the_runner_and_builds_the_storage_before_declaring_ready() {
+    let h = Harness::new("prepare");
+    h.ok(&["up"]);
+
+    // The runner is shipped, not installed into a template.
+    let shipped = h.uploaded();
+    assert!(shipped.contains("firstboot"), "runner not uploaded: {shipped:.80}");
+    assert_eq!(
+        shipped,
+        include_str!("../../runner/runner.sh"),
+        "what was uploaded must be exactly the runner this build carries"
+    );
+
+    let log = h.ssh_log();
+    assert!(log.contains("chmod 0755 /tmp/reaper-runner.sh"), "{log}");
+    assert!(log.contains("/tmp/reaper-runner.sh firstboot"), "{log}");
+
+    // The connection is unattended and the host is brand new.
+    assert!(log.contains("BatchMode=yes"), "{log}");
+    assert!(log.contains("StrictHostKeyChecking=accept-new"), "{log}");
+    assert!(
+        log.contains("known-hosts-a-project"),
+        "the known-hosts file must be per-session: {log}"
+    );
+
+    h.ok(&["down"]);
+}
+
+#[test]
+fn a_session_whose_storage_cannot_be_built_is_not_reported_as_ready() {
+    // A machine with an address but no pool is not a session. Reporting it as
+    // up would send someone to a machine that cannot hold their work.
+    let h = Harness::new("prepare-fails");
+    h.make_ssh_fail("firstboot");
+
+    let err = h.fails(&["up"]);
+    assert!(err.contains("firstboot"), "{err}");
+    // The upload succeeded, so the failure really is the storage step and not
+    // an earlier one wearing its name.
+    assert!(!h.uploaded().is_empty(), "the runner should still have been delivered");
+
+    // The machine still exists and still carries its expiry, so nothing is
+    // leaked -- and the session is recorded, so `down` can clear it.
+    assert_eq!(h.machines().len(), 1);
+    assert!(h.ok(&["list"]).contains("a-project"));
+
+    std::fs::remove_file(h.dir.join("ssh.fail")).unwrap();
     h.ok(&["down"]);
 }

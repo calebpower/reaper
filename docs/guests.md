@@ -22,9 +22,16 @@ which is what makes the core mechanism portable for free.
 script the CLI delivers over SSH at session start; nothing is compiled for a
 guest and nothing reaper wrote lives in the template.
 
-**SSH**, with the session public key trusted, for a single unprivileged user
-able to escalate. SSH is the transport: there is no listening daemon in the
-guest beyond it, and the runner is invoked rather than resident.
+**SSH**, with the session public key trusted **for root**. SSH is the transport:
+there is no listening daemon in the guest beyond it, and the runner is invoked
+rather than resident.
+
+Root rather than an unprivileged user with escalation, deliberately. A session
+is a whole disposable machine and its blast radius is the sandbox -- the same
+reasoning that makes rootful containers acceptable inside one. Requiring
+escalation instead would add a difference between guests that has nothing to do
+with the work: on one platform `sudo` is a package, on another `su` wants a
+password. Templates may still carry an ordinary user for console debugging.
 
 **A discoverable address.** The provider must be able to learn it without DNS or
 mDNS -- a guest agent is the usual mechanism.

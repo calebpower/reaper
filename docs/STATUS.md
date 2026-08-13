@@ -12,7 +12,7 @@ Last updated: 2026-08-12.
 |---|---|---|
 | **0** | Repo bootstrap: docs, manifest schema, seam guards, sweeper | **Complete but for the sweeper**, which is blocked -- see below |
 | 1 | Provider seam + session core (`up`/`list`/`renew`/`down`) | **Built and verified offline**; live acceptance blocked |
-| 2 | Guest templates + the runner | Not started |
+| 2 | Guest templates + the runner | **Software done and verified offline**; templates await building |
 | 3 | Sync, build, execution | Not started |
 | 4 | `reset` and the `@pristine` snapshot | Not started |
 | 5 | Tenant onboarding | Not started |
@@ -31,10 +31,26 @@ decisions below. Phase 2 is parallel-safe with Phase 1; nothing else is.
 | `tools/guards.sh` | No tenant, operating system or hypervisor has leaked out of its seam |
 | `manifest/test/run.sh` | The schema accepts what it should and rejects what it claims to |
 
-`cargo test --workspace` runs 98 tests, including the CLI driven end to end as a
-subprocess against a stand-in hypervisor: up, list, renew and down, the
-concurrency cap, an unregistered guest, a failed destroy, and the heartbeat
-being started and stopped with its session.
+`cargo test --workspace` runs the Rust suites, including the CLI driven end to
+end as a subprocess against a stand-in hypervisor and a stand-in ssh: up, list,
+renew and down, the concurrency cap, an unregistered guest, a failed destroy,
+the heartbeat, the session's pool disk, and the runner being delivered and
+firstboot run before a session is called ready.
+
+`runner/test/run.sh` runs the runner's decision self-test: 50 cases against
+stubbed tools, asserting the invocation log rather than exit codes, because
+"it refused" and "it refused without touching anything" are different claims.
+
+### Phase 2 decisions
+
+| Question | Answer |
+|---|---|
+| Runner | POSIX sh, delivered over SSH and invoked. Nothing reaper wrote lives in a template, so upgrading it never means rebuilding one |
+| Data disk | Attached per session by the provider. Where cloning is a full copy, a template disk would be copied whole every time |
+| Template build | ISO install, documented step by step in `docs/runbooks/` |
+| FreeBSD root | UFS, so a session has exactly one pool |
+| SSH user | root, with the key trusted for root. A session's blast radius is the sandbox, and escalation would differ per guest |
+| Media | Never reaper's. Expected present on the provider; a missing ISO is a request to the cluster's administrator |
 
 Every assertion in those suites has been mutation-checked: broken deliberately,
 and observed failing, before being counted as coverage.
@@ -58,8 +74,13 @@ payloads with nothing live. The script exists only on the sweeper's own machine
 and has not been retrieved, so `cull/` does not exist yet. Everything else in
 Phase 0 is done.
 
-**Phase 1's live acceptance.** Everything is built and covered offline, but the
-stated criteria are live and need a harness token in `~/.config/reaper/`:
+**The templates themselves.** Not blocked by anything reaper owns -- they are
+built in the web interface, which needs no token. `docs/runbooks/` is the
+deliverable; follow it and record what you actually built.
+
+**Phase 1's and Phase 2's live acceptance.** Everything is built and covered
+offline, but the stated criteria are live and need a harness token in
+`~/.config/reaper/`:
 
 1. `providers/proxmox/tools/make-stub-template.sh <id>` -- a diskless machine
    converted to a template clones instantly and exercises every real API path
@@ -67,6 +88,10 @@ stated criteria are live and need a harness token in `~/.config/reaper/`:
 2. `reaper up`, `list`, `renew`, `down` against the real pool.
 3. Kill the heartbeat and confirm the sweeper collects the machine after
    expiry. This one also needs the sweeper, so it is blocked twice.
+4. For **each** template: a clone boots, firstboot builds the pool and the four
+   datasets, `zfs list` is sane, and a **second** clone proves the first boot
+   did not dirty the template. Record clone wall time and disk cost -- that
+   number decides whether the storage fallback is needed.
 
 Until then the honest description is *offline-verified, live pending* -- the
 mock exercises the real HTTP client, but it is still a mock, and it agrees with

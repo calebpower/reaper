@@ -93,14 +93,25 @@ service qemu-guest-agent start
 kldload zfs && zfs version
 ```
 
-Trust the session key:
+Trust the session key **for root**, and let root in by key:
 
 ```sh
-mkdir -p /home/reaper/.ssh && chmod 700 /home/reaper/.ssh
-echo 'ssh-ed25519 AAAA... your session key' >> /home/reaper/.ssh/authorized_keys
-chmod 600 /home/reaper/.ssh/authorized_keys
-chown -R reaper:reaper /home/reaper/.ssh
+mkdir -p /root/.ssh && chmod 700 /root/.ssh
+echo 'ssh-ed25519 AAAA... your session key' >> /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+
+sysrc -f /etc/ssh/sshd_config PermitRootLogin=prohibit-password 2>/dev/null || \
+    printf 'PermitRootLogin prohibit-password\n' >> /etc/ssh/sshd_config
+service sshd restart
 ```
+
+Unlike the other guest, this one refuses root over SSH by default, so that line
+is required. `prohibit-password` allows a key and still refuses a password.
+
+reaper connects as root because a session is a whole disposable machine whose
+blast radius is the sandbox, and because an unprivileged user would mean an
+escalation step that differs per guest -- `sudo` is not in the base system here.
+The `reaper` user stays for console use.
 
 ## 5. Record what you built
 
