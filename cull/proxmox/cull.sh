@@ -17,6 +17,20 @@
 
 set -eu
 
+DRY_RUN=0
+for _arg in "$@"; do
+	case "$_arg" in
+		-n|--dry-run) DRY_RUN=1 ;;
+		-h|--help)
+			echo "usage: $0 [--dry-run]"
+			echo
+			echo "Destroys expired ephemeral guests. With --dry-run, reports what"
+			echo "it would destroy and touches nothing."
+			exit 0 ;;
+		*) echo "unknown option: $_arg" >&2; exit 2 ;;
+	esac
+done
+
 PVE_HOST="${PVE_HOST:-bass:8006}"
 PVE_POOL="${PVE_POOL:-cal/ephemeral}"
 VMID_MIN="${VMID_MIN:-9000}"
@@ -37,13 +51,19 @@ fi
 log() { logger -t pve-reap -p daemon.info "$*"; echo "pve-reap: $*"; }
 err() { logger -t pve-reap -p daemon.err  "$*"; echo "pve-reap: $*" >&2; }
 
-# shellcheck source=/dev/null
 [ -r "$CRED" ] || { err "cannot read credential file $CRED"; exit 1; }
+# shellcheck source=/dev/null
+# The credential's path is configurable, so there is nothing for shellcheck to
+# read. The directive was two lines further up, where it annotated the wrong
+# command and therefore did nothing.
 . "$CRED"
 [ -n "${PVE_TOKEN:-}" ] || { err "PVE_TOKEN unset in $CRED"; exit 1; }
 
 api() {
 	_method="$1"; _path="$2"
+	# shellcheck disable=SC2086
+	# TLSOPT is a deliberate list of flags, not a filename; quoting it would
+	# pass one empty argument or one nonsensical one.
 	curl -sS --fail-with-body $TLSOPT \
 		-X "$_method" \
 		-H "Authorization: $PVE_TOKEN" \
@@ -60,14 +80,34 @@ now=$(date +%s)
 reaped=0
 skipped=0
 
+# Fetched, checked, and only then iterated.
+#
+# This used to be one pipeline: api | jq | while ... done. A pipeline takes its
+# exit status from the last command, so a failed API call produced an empty
+# loop and a clean exit -- an outage was indistinguishable from an idle
+# cluster, which is the worst way for a backstop to fail. `set -e` cannot help;
+# POSIX sh has no pipefail.
+#
+# Iterating from a here-document rather than a pipe also keeps the loop in this
+# shell, so the counters below survive it. In the pipeline form they were
+# incremented in a subshell and silently discarded.
+if ! resources=$(api GET "/cluster/resources?type=vm"); then
+	err "cannot list guests; the API is unreachable or the credential is refused"
+	exit 1
+fi
+
 # tags arrive semicolon-separated; @tsv keeps fields unambiguous
-api GET "/cluster/resources?type=vm" \
-	| jq -r --arg pool "$PVE_POOL" '
+if ! rows=$(printf '%s' "$resources" | jq -r --arg pool "$PVE_POOL" '
 		.data[]
 		| select(.pool == $pool)
 		| [.vmid, .node, (.status // "unknown"), (.tags // "")]
-		| @tsv' \
-	| while IFS="$(printf '\t')" read -r vmid node status tags; do
+		| @tsv'); then
+	err "the API answered with something that is not the guest list we expected"
+	exit 1
+fi
+
+while IFS="$(printf '\t')" read -r vmid node status tags; do
+	[ -n "$vmid" ] || continue
 
 	# Defense in depth: the ACL already confines the token to the pool,
 	# but a VMID guard means a misconfigured pool membership still
@@ -90,6 +130,12 @@ api GET "/cluster/resources?type=vm" \
 
 	age=$((now - expires))
 	log "vmid $vmid on $node expired ${age}s ago (status: $status); reaping"
+
+	if [ "$DRY_RUN" -eq 1 ]; then
+		log "vmid $vmid: dry run, leaving it alone"
+		reaped=$((reaped + 1))
+		continue
+	fi
 
 	if [ "$status" != "stopped" ]; then
 		if ! api POST "/nodes/$node/qemu/$vmid/status/stop" >/dev/null; then
@@ -119,6 +165,14 @@ api GET "/cluster/resources?type=vm" \
 	else
 		err "vmid $vmid: destroy failed; will retry next run"
 	fi
-done
+done <<ROWS
+$rows
+ROWS
+
+if [ "$DRY_RUN" -eq 1 ]; then
+	log "dry run: would have reaped $reaped, skipped $skipped"
+else
+	log "reaped $reaped, skipped $skipped"
+fi
 
 exit 0
