@@ -37,7 +37,7 @@ REAL_TOOLS="awk sed grep tr sort cat mkdir rm chmod cut head wc printf ln env sh
 new_case() {
     CASE="$1"
     WORK=$(mktemp -d -t reaper-runner)
-    mkdir -p "${WORK}/bin" "${WORK}/fix" "${WORK}/sysroot"
+    mkdir -p "${WORK}/bin" "${WORK}/fix" "${WORK}/sysroot" "${WORK}/pool"
     : > "${WORK}/log"
 
     for t in ${REAL_TOOLS}; do
@@ -132,12 +132,16 @@ fixture() { cat > "${WORK}/fix/$1"; }
 fixture_rc() { printf '%s\n' "$2" > "${WORK}/fix/$1"; }
 
 run_runner() {
+    run_rc=0
     ( PATH="${WORK}/bin" \
       FIX="${WORK}/fix" \
       FIXLOG="${WORK}/log" \
       FAKE_PLATFORM="${FAKE_PLATFORM:-Linux}" \
       REAPER_SYSROOT="${WORK}/sysroot" \
-      "${runner}" "$@" ) > "${WORK}/out" 2> "${WORK}/err"
+      REAPER_POOL_MOUNT="${WORK}/pool" \
+      "${runner}" "$@" ) > "${WORK}/out" 2> "${WORK}/err" || run_rc=$?
+    printf '%s\n' "${run_rc}" > "${WORK}/status"
+    return "${run_rc}"
 }
 
 ok()   { pass=$((pass + 1)); printf '  ok    %-52s %s\n' "${CASE}" "$1"; }
@@ -153,6 +157,14 @@ log_has() {
 log_lacks() {
     if grep -q "$1" "${WORK}/log"; then bad "must not be in log: $1"; else ok "absent: $1"; fi
 }
+# The runner's documented contract: 0 success, 1 failure, 2 a malformed call.
+# Asserting it is what separates "it refused" from "it fell over one line after
+# it should have refused", which look identical from a boolean exit status.
+exited() {
+    got=$(cat "${WORK}/status")
+    if [ "${got}" = "$1" ]; then ok "exited $1"; else bad "expected exit $1, got ${got}"; fi
+}
+
 errsays() {
     if grep -qi "$1" "${WORK}/err"; then ok "said: $1"; else bad "error should mention: $1"; fi
 }
@@ -205,7 +217,7 @@ log_has 'zfs create tank/state'
 log_has 'zfs create tank/work'
 wrote 'etc/modprobe.d/zfs-reaper.conf'
 wrote 'etc/containers/storage.conf'
-grep_file 'sysroot/etc/containers/storage.conf' 'graphroot = "/tank/images"' \
+grep_file 'sysroot/etc/containers/storage.conf' "graphroot = \"${WORK}/pool/images\"" \
     "image store points at the pool"
 
 echo
@@ -375,6 +387,179 @@ fixture_rc pool_exists.rc 1
 if run_runner firstboot; then bad "should have refused"; else ok "refused"; fi
 errsays 'unsupported platform'
 made_no_pool
+
+echo
+echo "workspaces, images and jobs"
+
+# A job script the runner is asked to run. Its contents are irrelevant here --
+# the CLI renders it and has its own suite for that -- but it must exist,
+# because a runner that will run a job it cannot read is a runner that will run
+# anything.
+a_job() {
+    # It records what it was handed. For host execution the job really runs, so
+    # asserting on what it saw is a better claim than asserting on an
+    # invocation -- it is the environment a tenant's command would actually get.
+    cat > "${WORK}/job.sh" <<EOF
+#!/bin/sh
+{ pwd; env | grep '^REAPER_'; } > "${WORK}/job-saw"
+EOF
+    printf '%s\n' "${WORK}/job.sh"
+}
+
+# What the job observed, once it has run.
+saw() {
+    if [ ! -f "${WORK}/job-saw" ]; then
+        bad "the job never ran"
+    elif grep -q "$1" "${WORK}/job-saw"; then
+        ok "the job saw: $1"
+    else
+        bad "the job should have seen: $1"
+    fi
+}
+
+new_case "workspace makes the working tree and the results directory"
+FAKE_PLATFORM=Linux
+if run_runner workspace --project a-project; then :; else bad "workspace should have succeeded"; fi
+if [ -d "${WORK}/pool/work/a-project/out" ]; then
+    ok "made the results directory"
+else
+    bad "the results directory must exist before the first job, or the reverse channel has nothing to read"
+fi
+outsays 'out='
+
+new_case "workspace refuses a project name that is not one"
+FAKE_PLATFORM=Linux
+if run_runner workspace --project '../../etc'; then bad "should have refused"; else ok "refused"; fi
+errsays 'not a usable project name'
+exited 2
+
+new_case "exec runs a job in the named image, with the tree and the caches mounted"
+FAKE_PLATFORM=Linux
+with_engine
+job=$(a_job)
+run_runner workspace --project a-project
+if run_runner exec --project a-project --job "${job}" \
+     --image docker.io/library/example@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+     --cache cargo --cache build-dir; then :; else bad "exec should have succeeded"; fi
+log_has 'podman run --rm'
+log_has 'run --rm -w /reaper/work'
+log_has "${WORK}/pool/work/a-project:/reaper/work"
+log_has "${WORK}/job.sh:/reaper/job.sh:ro"
+log_has 'REAPER_WORK=/reaper/work'
+log_has 'REAPER_OUT=/reaper/work/out'
+log_has "${WORK}/pool/cache/cargo:/reaper/cache/cargo"
+log_has 'REAPER_CACHE_CARGO=/reaper/cache/cargo'
+# A manifest name may carry a hyphen; an environment variable may not.
+log_has 'REAPER_CACHE_BUILD_DIR=/reaper/cache/build-dir'
+log_has '/bin/sh /reaper/job.sh'
+if [ -d "${WORK}/pool/cache/cargo" ]; then ok "made the cargo cache"; else bad "cache directory missing"; fi
+
+new_case "a cold profile mounts no cache at all"
+FAKE_PLATFORM=Linux
+with_engine
+job=$(a_job)
+run_runner workspace --project a-project
+if run_runner exec --project a-project --job "${job}" \
+     --image docker.io/library/example@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef; then :; else bad "exec should have succeeded"; fi
+log_has 'podman run --rm'
+# Not merely unset: a cold run must not even name a cache. Determinism mode is
+# the control for "was the warm cache the reason this passed", and a cache
+# reachable by a path the tenant could guess would defeat it.
+log_lacks '/reaper/cache'
+log_lacks 'REAPER_CACHE_'
+
+new_case "host execution runs the job here, with no engine involved"
+FAKE_PLATFORM=Linux
+job=$(a_job)
+run_runner workspace --project a-project
+if run_runner exec --project a-project --job "${job}"; then :; else bad "exec should have succeeded"; fi
+log_lacks 'podman'
+# The working directory is the synced tree, without the job having to arrange
+# it: a tenant's command should not need to know where it landed.
+saw "^${WORK}/pool/work/a-project\$"
+saw "REAPER_WORK=${WORK}/pool/work/a-project"
+saw "REAPER_OUT=${WORK}/pool/work/a-project/out"
+
+new_case "host execution still hands over the caches, by their host paths"
+FAKE_PLATFORM=Linux
+job=$(a_job)
+run_runner workspace --project a-project
+if run_runner exec --project a-project --job "${job}" --cache cargo; then :; else bad "exec should have succeeded"; fi
+saw "REAPER_CACHE_CARGO=${WORK}/pool/cache/cargo"
+
+new_case "exec refuses an image when there is no engine to run it"
+FAKE_PLATFORM=Linux
+job=$(a_job)
+run_runner workspace --project a-project
+if run_runner exec --project a-project --job "${job}" \
+     --image docker.io/library/example@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef; then
+    bad "should have refused"
+else
+    ok "refused"
+fi
+errsays 'no container engine'
+# And refused *before* invoking anything. Without this the assertion above
+# passes just as well when the refusal only logs and the shell then fails
+# trying to run an engine whose name is the empty string.
+exited 1
+
+new_case "exec refuses an image that is not pinned by digest"
+FAKE_PLATFORM=Linux
+with_engine
+job=$(a_job)
+run_runner workspace --project a-project
+if run_runner exec --project a-project --job "${job}" --image docker.io/library/example:latest; then
+    bad "should have refused"
+else
+    ok "refused"
+fi
+errsays 'not a digest-pinned image'
+exited 2
+log_lacks 'podman run'
+
+new_case "exec refuses a job script it cannot read"
+FAKE_PLATFORM=Linux
+run_runner workspace --project a-project
+if run_runner exec --project a-project --job "${WORK}/absent.sh"; then bad "should have refused"; else ok "refused"; fi
+errsays 'no job script'
+exited 2
+
+new_case "exec refuses before a tree has ever been synced"
+FAKE_PLATFORM=Linux
+job=$(a_job)
+if run_runner exec --project never-synced --job "${job}"; then bad "should have refused"; else ok "refused"; fi
+errsays 'sync first'
+exited 1
+
+new_case "pull fetches each digest, and refuses anything unpinned"
+FAKE_PLATFORM=Linux
+with_engine
+if run_runner pull \
+     docker.io/library/a@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+     docker.io/library/b@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; then
+    :
+else
+    bad "pull should have succeeded"
+fi
+log_has 'podman pull docker.io/library/a@sha256:aaa'
+log_has 'podman pull docker.io/library/b@sha256:bbb'
+
+new_case "pull refuses a moving tag rather than fetching it"
+FAKE_PLATFORM=Linux
+with_engine
+if run_runner pull docker.io/library/a:latest; then bad "should have refused"; else ok "refused"; fi
+errsays 'not a digest-pinned image'
+exited 2
+log_lacks 'podman pull'
+
+new_case "pull on a guest with no engine says so and does not fail"
+FAKE_PLATFORM=FreeBSD
+if run_runner pull docker.io/library/a@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; then
+    ok "did not fail"
+else
+    bad "a pre-pull is an optimisation; failing it would cost a usable session"
+fi
+errsays 'no container engine'
 
 echo
 printf '%s passed, %s failed\n' "${pass}" "${fail}"

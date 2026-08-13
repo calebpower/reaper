@@ -13,13 +13,29 @@
 # calls and cost a cross-build for every guest operating system.
 #
 # Usage:
-#   runner.sh firstboot     make the pool and datasets; idempotent
-#   runner.sh info          report what exists, as key=value
+#   runner.sh firstboot                     make the pool and datasets; idempotent
+#   runner.sh info                          report what exists, as key=value
+#   runner.sh workspace --project P         make the work and results directories
+#   runner.sh pull REF...                   fetch digest-pinned images
+#   runner.sh exec --project P --job PATH [--image REF] [--cache NAME]...
+#                                           run a delivered job script
 #
 # Exit 0 on success, 1 on failure, 2 on a usage error.
 set -eu
 
 POOL="${REAPER_POOL:-tank}"
+
+# Where the pool is mounted. `zpool create -m` below puts it here. Overridable
+# for the same reason SYSROOT is: the test suite points it at a scratch
+# directory so the suite never writes to the machine running it.
+POOL_MOUNT="${REAPER_POOL_MOUNT:-/${POOL}}"
+
+# Where a container sees its mounts. Fixed rather than configurable, because
+# these paths appear in a tenant's environment and a site that moved them would
+# quietly break every manifest written against the documented ones.
+MOUNT_WORK="/reaper/work"
+MOUNT_CACHE="/reaper/cache"
+MOUNT_JOB="/reaper/job.sh"
 ARC_MAX_MB="${REAPER_ARC_MAX_MB:-1536}"
 
 # Prefix for files written outside the pool. Empty in production; the test
@@ -34,6 +50,12 @@ DATASETS="images cache state work"
 
 log()  { printf 'runner: %s\n' "$*" >&2; }
 die()  { printf 'runner: %s\n' "$*" >&2; exit 1; }
+
+# A malformed argument, as distinct from something that went wrong. Exit 2, per
+# the contract at the top of this file: a caller can then tell "you asked me
+# wrongly" from "I could not do it", and the suite can tell a refusal from a
+# shell falling over one line later.
+usage() { printf 'runner: %s\n' "$*" >&2; exit 2; }
 
 # Announce anything destructive before doing it, so a log read afterwards says
 # what happened rather than what was intended.
@@ -217,14 +239,14 @@ point_engine_at_pool() {
         return 0
     fi
 
-    announce "point ${point_engine} at /${POOL}/images for its image store"
+    announce "point ${point_engine} at ${POOL_MOUNT}/images for its image store"
     mkdir -p "${SYSROOT}/etc/containers"
     cat > "${SYSROOT}/etc/containers/storage.conf" <<EOF
 # Written by the reaper runner. Images live on the pool so that they survive a
 # rollback of tenant state and are never copied by one.
 [storage]
 driver = "overlay"
-graphroot = "/${POOL}/images"
+graphroot = "${POOL_MOUNT}/images"
 runroot = "/run/containers/storage"
 EOF
 }
@@ -250,7 +272,7 @@ cmd_firstboot() {
         -o ashift=12 \
         -O compression=lz4 \
         -O atime=off \
-        -m "/${POOL}" \
+        -m "${POOL_MOUNT}" \
         "${POOL}" "${firstboot_disk}" \
         || die "could not create ${POOL} on ${firstboot_disk}"
 
@@ -287,14 +309,158 @@ cmd_info() {
     printf 'engine=%s\n' "$(engine)"
 }
 
+
+# ---------------------------------------------------------------------------
+# Running a tenant's work
+#
+# The job itself arrives as a script the CLI rendered and delivered over stdin:
+# every value in it is already quoted, and nothing a tenant wrote is ever
+# assembled into an argument here. What is decided here is only *where* the job
+# runs, which is the one question that differs between the execution modes.
+# ---------------------------------------------------------------------------
+
+# Defence in depth. The manifest schema already constrains these to the same
+# shapes, but this is the code that turns them into paths and into an argument
+# vector, so it checks for itself rather than trusting a caller it cannot see.
+valid_name() {
+    printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$'
+}
+
+valid_image() {
+    printf '%s' "$1" | grep -Eq '^[A-Za-z0-9._-]+(:[0-9]+)?(/[A-Za-z0-9._-]+)+@sha256:[0-9a-f]{64}$'
+}
+
+work_dir()  { printf '%s/work/%s\n' "${POOL_MOUNT}" "$1"; }
+cache_dir() { printf '%s/cache/%s\n' "${POOL_MOUNT}" "$1"; }
+
+# A cache name as an environment variable suffix. A manifest name may carry a
+# dot or a hyphen; an environment variable may not.
+cache_var() {
+    printf 'REAPER_CACHE_%s' "$(printf '%s' "$1" | tr 'a-z.-' 'A-Z__')"
+}
+
+cmd_workspace() {
+    [ "${1:-}" = "--project" ] || usage "workspace: expected --project"
+    [ $# -ge 2 ] || usage "workspace: --project needs a value"
+    valid_name "$2" || usage "workspace: $2 is not a usable project name"
+
+    workspace_work=$(work_dir "$2")
+    # Both, and both idempotent. The results directory has to exist before the
+    # first job runs or the reverse channel has nothing to read, and a failure
+    # there would read as though results had been lost rather than never made.
+    mkdir -p "${workspace_work}/out" || die "cannot make ${workspace_work}/out"
+    printf 'work=%s\nout=%s/out\n' "${workspace_work}" "${workspace_work}"
+}
+
+cmd_pull() {
+    [ $# -gt 0 ] || usage "pull: nothing to pull"
+
+    pull_engine=$(engine)
+    if [ -z "${pull_engine}" ]; then
+        # A host-execution guest may legitimately have no engine, and on some
+        # platforms one could not run these images anyway. Loud, and not fatal:
+        # a pre-pull is an optimisation, and refusing here would cost a session
+        # that is otherwise perfectly usable.
+        log "no container engine here; not pulling $# image(s)"
+        return 0
+    fi
+
+    for pull_ref in "$@"; do
+        valid_image "${pull_ref}" || usage "pull: ${pull_ref} is not a digest-pinned image"
+        announce "pull ${pull_ref}"
+        "${pull_engine}" pull "${pull_ref}" >&2 || die "could not pull ${pull_ref}"
+    done
+}
+
+cmd_exec() {
+    exec_project=""; exec_job=""; exec_image=""; exec_caches=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --project|--job|--image|--cache)
+                [ $# -ge 2 ] || usage "exec: $1 needs a value"
+                case "$1" in
+                    --project) exec_project=$2 ;;
+                    --job)     exec_job=$2 ;;
+                    --image)   exec_image=$2 ;;
+                    --cache)   exec_caches="${exec_caches} $2" ;;
+                esac
+                shift 2 ;;
+            *) usage "exec: unexpected argument $1" ;;
+        esac
+    done
+
+    [ -n "${exec_project}" ] || usage "exec: no --project"
+    [ -n "${exec_job}" ]     || usage "exec: no --job"
+    valid_name "${exec_project}" || usage "exec: ${exec_project} is not a usable project name"
+    [ -r "${exec_job}" ] || usage "exec: no job script at ${exec_job}"
+
+    exec_work=$(work_dir "${exec_project}")
+    [ -d "${exec_work}" ] || die "exec: no working tree at ${exec_work}; sync first"
+    mkdir -p "${exec_work}/out"
+
+    for exec_c in ${exec_caches}; do
+        valid_name "${exec_c}" || usage "exec: ${exec_c} is not a usable cache name"
+        mkdir -p "$(cache_dir "${exec_c}")" || die "cannot make the ${exec_c} cache"
+    done
+
+    if [ -n "${exec_image}" ]; then
+        exec_in_container
+    else
+        exec_on_host
+    fi
+}
+
+exec_in_container() {
+    valid_image "${exec_image}" || usage "exec: ${exec_image} is not a digest-pinned image"
+
+    exec_engine=$(engine)
+    [ -n "${exec_engine}" ] || die "exec: ${exec_image} was asked for, and there is
+       no container engine here. Either this guest's template is missing one, or
+       the manifest wants host execution for this verb"
+
+    # --rm because a session is disposable and a stopped container left behind
+    # would only accumulate. The job script is mounted read-only: nothing inside
+    # has any business rewriting what it was asked to run.
+    set -- run --rm \
+        -w "${MOUNT_WORK}" \
+        -v "${exec_work}:${MOUNT_WORK}" \
+        -v "${exec_job}:${MOUNT_JOB}:ro" \
+        -e "REAPER_WORK=${MOUNT_WORK}" \
+        -e "REAPER_OUT=${MOUNT_WORK}/out"
+
+    for exec_c in ${exec_caches}; do
+        set -- "$@" -v "$(cache_dir "${exec_c}"):${MOUNT_CACHE}/${exec_c}"
+        set -- "$@" -e "$(cache_var "${exec_c}")=${MOUNT_CACHE}/${exec_c}"
+    done
+
+    set -- "$@" "${exec_image}" /bin/sh "${MOUNT_JOB}"
+    "${exec_engine}" "$@"
+}
+
+exec_on_host() {
+    # env rather than exporting into this shell: the job gets exactly the
+    # variables it was promised, and nothing this script happens to be holding.
+    set -- "REAPER_WORK=${exec_work}" "REAPER_OUT=${exec_work}/out"
+    for exec_c in ${exec_caches}; do
+        set -- "$@" "$(cache_var "${exec_c}")=$(cache_dir "${exec_c}")"
+    done
+
+    cd "${exec_work}" || die "cannot enter ${exec_work}"
+    env "$@" /bin/sh "${exec_job}"
+}
+
 case "${1:-}" in
     firstboot) cmd_firstboot ;;
     info)      cmd_info ;;
+    workspace) shift; cmd_workspace "$@" ;;
+    pull)      shift; cmd_pull "$@" ;;
+    exec)      shift; cmd_exec "$@" ;;
     -h|--help)
         sed -n '2,/^set -eu/p' "$0" | sed 's/^# \{0,1\}//;$d'
         ;;
     *)
-        printf 'usage: %s {firstboot|info}\n' "$0" >&2
+        printf 'usage: %s {firstboot|info|workspace|pull|exec}\n' "$0" >&2
         exit 2
         ;;
 esac
