@@ -75,6 +75,33 @@ impl Proxmox {
         )
     }
 
+    fn is_running(&self, id: u32) -> Result<bool> {
+        let s = self
+            .client
+            .get(&format!("/nodes/{}/qemu/{id}/status/current", self.node()))?;
+        Ok(s.get("status").and_then(Value::as_str) == Some("running"))
+    }
+
+    /// Wait for a machine to actually be stopped.
+    ///
+    /// The stop task completing and the machine being stopped are not quite the
+    /// same instant, and deleting in the gap fails.
+    fn await_stopped(&self, id: u32) -> Result<()> {
+        let deadline = std::time::Instant::now() + self.config.task_timeout;
+        loop {
+            if !self.is_running(id)? {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(ProviderError::Timeout(format!(
+                    "machine {id} was still running {}s after being asked to stop",
+                    self.config.task_timeout.as_secs()
+                )));
+            }
+            std::thread::sleep(self.poll_interval);
+        }
+    }
+
     /// The machine's current tag string, or empty if it carries none.
     fn tags_of(&self, id: u32) -> Result<String> {
         let cfg = self
@@ -314,6 +341,16 @@ impl Provider for Proxmox {
 
     fn destroy(&self, machine: &MachineRef) -> Result<()> {
         let id = self.config.ids.check(machine)?;
+
+        // Stop first if it is running. The API refuses to delete a running
+        // machine, so a destroy that did not do this failed every time it was
+        // asked to clean up a live session -- which is every time it matters.
+        // The sweeper has always worked this way; the two now agree.
+        if self.is_running(id)? {
+            self.stop(machine)?;
+            self.await_stopped(id)?;
+        }
+
         // Same parameters the sweeper uses, deliberately. Disks named in the
         // configuration go either way, so this is not a leak being fixed --
         // but destroy-unreferenced-disks is what clears a disk left behind by

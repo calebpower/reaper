@@ -407,6 +407,17 @@ fn route(s: &mut State, method: &str, path: &str, body: &str) -> (u16, Value) {
             (200, json!({ "data": null }))
         }
 
+        ("GET", ["nodes", _node, "qemu", id, "status", "current"]) => match lookup(s, id) {
+            Some(vm) => (
+                200,
+                json!({"data": {
+                    "status": if vm.running { "running" } else { "stopped" },
+                    "vmid": id,
+                }}),
+            ),
+            None => (404, json!({"errors": "no such machine"})),
+        },
+
         ("POST", ["nodes", _node, "qemu", id, "status", action]) => {
             let Some(key) = id.parse::<u32>().ok() else {
                 return (404, json!({"errors": "no such machine"}));
@@ -428,9 +439,14 @@ fn route(s: &mut State, method: &str, path: &str, body: &str) -> (u16, Value) {
             let Some(key) = id.parse::<u32>().ok() else {
                 return (404, json!({"errors": "no such machine"}));
             };
-            // Refuses, as the real thing does.
+            // Refuses what the real thing refuses. A stand-in that is kinder
+            // than the API it stands in for tests only itself -- this one has
+            // already hidden two bugs that live use found immediately.
             if s.vms.get(&key).map(|v| v.protection).unwrap_or(false) {
                 return (500, json!({"errors": "protection mode enabled"}));
+            }
+            if s.vms.get(&key).map(|v| v.running).unwrap_or(false) {
+                return (500, json!({"message": "VM is running - destroy failed"}));
             }
             if s.vms.remove(&key).is_none() {
                 return (404, json!({"errors": "no such machine"}));

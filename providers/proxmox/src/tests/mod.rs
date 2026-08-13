@@ -717,3 +717,36 @@ fn the_template_itself_is_never_unprotected() {
     p.create(&request("a-session", 1)).expect("create");
     assert!(pve.is_protected("9000"), "the template must stay protected");
 }
+
+#[test]
+fn destroying_a_running_machine_stops_it_first() {
+    // The API refuses to delete a running machine. Without this, `down` failed
+    // on every live session -- which is the only kind that matters.
+    let pve = MockPve::start();
+    pve.with_state(|s| {
+        s.vms.insert(9001, Vm { name: "a-session".into(), running: true, pool: POOL.into(), ..Vm::default() });
+    });
+    let p = provider_for(&pve);
+
+    p.destroy(&MachineRef::new("9001")).expect("destroy must handle a running machine");
+    assert!(pve.vm(9001).is_none(), "the machine should be gone");
+
+    let paths = pve.paths();
+    let stopped = paths.iter().position(|x| x.contains("/status/stop")).expect("asked it to stop");
+    let deleted = paths.iter().rposition(|x| x.contains("/qemu/9001?")).expect("deleted");
+    assert!(stopped < deleted, "stop must precede delete: {paths:?}");
+}
+
+#[test]
+fn destroying_a_stopped_machine_does_not_bother_stopping_it() {
+    let pve = MockPve::start();
+    pve.with_state(|s| {
+        s.vms.insert(9001, Vm { name: "a-session".into(), running: false, pool: POOL.into(), ..Vm::default() });
+    });
+    let p = provider_for(&pve);
+    p.destroy(&MachineRef::new("9001")).unwrap();
+    assert!(
+        !pve.paths().iter().any(|x| x.contains("/status/stop")),
+        "no need to stop something already stopped"
+    );
+}

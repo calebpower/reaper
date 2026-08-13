@@ -260,13 +260,12 @@ fn down_keeps_a_session_it_could_not_destroy() {
         "the session must remain visible"
     );
 
-    // Retrying succeeds: the stand-in did carry out the deletion before its
-    // task stalled, so the machine is genuinely gone. That is the same shape as
-    // the case that matters in production -- the sweeper collected an expired
-    // machine first -- and destroy is idempotent so the session can be cleared.
+    // Retrying succeeds once operations complete again. Asserted on the
+    // outcome rather than the wording: what matters is that the machine is
+    // gone and the session is cleared, not which of the two paths got there.
     h.hypervisor.stall_operations(false);
-    let recovered = h.ok(&["down"]);
-    assert!(recovered.contains("already gone"), "{recovered}");
+    h.ok(&["down"]);
+    assert!(h.machines().is_empty(), "the machine should be gone");
     assert!(h.ok(&["list"]).contains("no sessions"));
 }
 
