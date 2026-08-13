@@ -5,6 +5,20 @@ system itself, and native binaries no container here can run.
 
 Roughly 30 minutes. The FreeBSD installer is terse and fast.
 
+**Most of what went wrong building the Ubuntu template does not apply here**,
+and it is worth knowing why rather than copying its cleanup blindly:
+
+| Ubuntu problem | Here |
+|---|---|
+| `cloud-init clean` destroyed the network configuration | No cloud-init. Networking is `rc.conf` and survives |
+| Host keys never regenerated (`ConditionFirstBoot`) | `rc.d/sshd` regenerates missing keys on **every** start, unconditionally. No custom unit needed |
+| Deleting host keys cut ssh off instantly | sshd is a persistent daemon, not socket-activated. Existing connections survive |
+| DHCP identity derived from `machine-id` | `dhclient` identifies by MAC already |
+
+What *does* still apply: clear the machine identity as the last act, stop the
+machine **hard** rather than shutting down, and let the provider attach the data
+disk rather than baking one in.
+
 > Screen wording drifts between releases. Where this runbook and the installer
 > disagree, the installer is right, and this document has a bug.
 
@@ -100,13 +114,14 @@ mkdir -p /root/.ssh && chmod 700 /root/.ssh
 echo 'ssh-ed25519 AAAA... your session key' >> /root/.ssh/authorized_keys
 chmod 600 /root/.ssh/authorized_keys
 
-sysrc -f /etc/ssh/sshd_config PermitRootLogin=prohibit-password 2>/dev/null || \
-    printf 'PermitRootLogin prohibit-password\n' >> /etc/ssh/sshd_config
+printf 'PermitRootLogin prohibit-password\n' >> /etc/ssh/sshd_config
 service sshd restart
 ```
 
-Unlike the other guest, this one refuses root over SSH by default, so that line
-is required. `prohibit-password` allows a key and still refuses a password.
+Required, and more strictly than on the other guest: FreeBSD ships
+`PermitRootLogin no`, refusing root entirely, where Ubuntu ships
+`prohibit-password` and already permits a key. `prohibit-password` allows a key
+and still refuses a password.
 
 reaper connects as root because a session is a whole disposable machine whose
 blast radius is the sandbox, and because an unprivileged user would mean an
@@ -125,24 +140,35 @@ Keep that output for the commit that registers the template.
 ## 6. Clean, so the clone is not a copy of this boot
 
 ```sh
-rm -f /etc/ssh/ssh_host_*        # rc.d/sshd regenerates missing keys at boot
-rm -f /etc/hostid                # regenerated at boot; two machines sharing one is trouble
+pkg clean -ay
 rm -rf /var/log/* /var/tmp/*
 rm -f /var/db/entropy/* /entropy
 rm -f /root/.history /home/reaper/.history
-pkg clean -ay
+rm -f /etc/ssh/ssh_host_*
+rm -f /etc/hostid /etc/machine-id
+sync
 ```
 
-Deleting the host keys is safe here: FreeBSD's `rc.d/sshd` generates any that
-are missing on the next boot, with no cloud-init involved. `hostid` matters for
-the same reason — ZFS records it on pool import, and two machines claiming one
-identity is a confusing failure much later.
+Then stop the machine **hard** -- a power-off from the hypervisor, not
+`shutdown` -- and do not reconnect.
 
-Then shut down, do not reboot:
+Why each of the last three lines:
 
-```sh
-shutdown -p now
-```
+**Host keys.** `rc.d/sshd` regenerates any that are missing on the next start,
+with no first-boot condition and no custom unit. Unlike the other guest, this
+does not sever the connection you are using, because sshd is a persistent daemon
+that already holds its keys -- but it is still last but one, out of habit and
+because habit is what survives a tired evening.
+
+**Both identity files.** FreeBSD 15 carries `/etc/hostid` *and*
+`/etc/machine-id`. `hostid` is derived from `kern.hostuuid` and regenerated at
+boot when absent; ZFS records it on pool import, so two machines claiming one
+identity is a confusing failure much later. Removing only one leaves the clone
+half-inheriting.
+
+**The hard stop.** For the same reason as the other guest: a graceful shutdown
+gives the running system an opportunity to write its identity back out, undoing
+the step. A power-off gives it none.
 
 ## 7. Convert and protect
 
