@@ -38,6 +38,9 @@
     "run": {
       "$ref": "#/$defs/runPartial"
     },
+    "sync": {
+      "$ref": "#/$defs/sync"
+    },
     "reset": {
       "$ref": "#/$defs/reset"
     },
@@ -109,6 +112,10 @@
         },
         "env": {
           "$ref": "#/$defs/env"
+        },
+        "exec": {
+          "description": "Overrides the guest's execution mode for this verb alone. A project may perfectly reasonably need a pinned toolchain to build and the guest's own container engine to run -- a toolchain image has no engine client inside it.",
+          "$ref": "#/$defs/execMode"
         }
       }
     },
@@ -132,6 +139,14 @@
         },
         "env": {
           "$ref": "#/$defs/env"
+        },
+        "exec": {
+          "description": "Overrides the guest's execution mode for this verb alone. A project may perfectly reasonably need a pinned toolchain to build and the guest's own container engine to run -- a toolchain image has no engine client inside it.",
+          "$ref": "#/$defs/execMode"
+        },
+        "image": {
+          "description": "The image `run.cmd` executes in. Under container execution this defaults to build.image, so a project whose build and run share one toolchain declares the digest once.",
+          "$ref": "#/$defs/imageRef"
         }
       }
     },
@@ -229,7 +244,7 @@
       ]
     },
     "resolvedGuest": {
-      "description": "One guest after top-level defaults have been merged with its own overrides. This is the form the runner actually acts on, and the only form in which execution-mode coherence can be checked -- a manifest may perfectly reasonably declare `exec` at the top level and `build.image` per guest, so neither key alone tells you whether the pair is coherent.",
+      "description": "One guest after top-level defaults have been merged with its own overrides, and after each verb's execution mode and image have been resolved. This is the form the runner actually acts on, and the only form in which execution-mode coherence can be checked -- a manifest may perfectly reasonably declare `exec` at the top level and `build.image` per guest, so neither key alone tells you whether the pair is coherent.",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -248,7 +263,8 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "cmd"
+            "cmd",
+            "exec"
           ],
           "properties": {
             "image": {
@@ -267,14 +283,59 @@
             },
             "env": {
               "$ref": "#/$defs/env"
+            },
+            "exec": {
+              "description": "This verb's execution mode, resolved: its own if it declared one, otherwise the guest's.",
+              "$ref": "#/$defs/execMode"
             }
-          }
+          },
+          "allOf": [
+            {
+              "description": "Container execution needs a toolchain image, and it must be declared rather than assumed.",
+              "if": {
+                "properties": {
+                  "exec": {
+                    "const": "container"
+                  }
+                },
+                "required": [
+                  "exec"
+                ]
+              },
+              "then": {
+                "required": [
+                  "image"
+                ]
+              }
+            },
+            {
+              "description": "Host execution has no image to run in. An image alongside host execution means one of the two is a mistake, and failing here is far kinder than failing deep inside a guest.",
+              "if": {
+                "properties": {
+                  "exec": {
+                    "const": "host"
+                  }
+                },
+                "required": [
+                  "exec"
+                ]
+              },
+              "then": {
+                "not": {
+                  "required": [
+                    "image"
+                  ]
+                }
+              }
+            }
+          ]
         },
         "run": {
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "cmd"
+            "cmd",
+            "exec"
           ],
           "properties": {
             "cmd": {
@@ -290,52 +351,47 @@
             },
             "env": {
               "$ref": "#/$defs/env"
-            }
-          }
-        },
-        "resources": {
-          "$ref": "#/$defs/resources"
-        }
-      },
-      "allOf": [
-        {
-          "description": "Container execution needs a toolchain image, and it must be declared rather than assumed.",
-          "if": {
-            "properties": {
-              "exec": {
-                "const": "container"
-              }
             },
-            "required": [
-              "exec",
-              "build"
-            ]
+            "exec": {
+              "description": "This verb's execution mode, resolved: its own if it declared one, otherwise the guest's.",
+              "$ref": "#/$defs/execMode"
+            },
+            "image": {
+              "$ref": "#/$defs/imageRef"
+            }
           },
-          "then": {
-            "properties": {
-              "build": {
+          "allOf": [
+            {
+              "description": "Container execution needs a toolchain image, and it must be declared rather than assumed. Resolution has already copied build.image across where run inherits it, so an absent image here means none was declared anywhere.",
+              "if": {
+                "properties": {
+                  "exec": {
+                    "const": "container"
+                  }
+                },
+                "required": [
+                  "exec"
+                ]
+              },
+              "then": {
                 "required": [
                   "image"
                 ]
               }
-            }
-          }
-        },
-        {
-          "description": "Host execution has no image to run in. A build.image alongside exec: host means one of the two is a mistake, and failing here is far kinder than failing deep inside a guest.",
-          "if": {
-            "properties": {
-              "exec": {
-                "const": "host"
-              }
             },
-            "required": [
-              "exec"
-            ]
-          },
-          "then": {
-            "properties": {
-              "build": {
+            {
+              "description": "Host execution has no image to run in. An image alongside host execution means one of the two is a mistake, and failing here is far kinder than failing deep inside a guest.",
+              "if": {
+                "properties": {
+                  "exec": {
+                    "const": "host"
+                  }
+                },
+                "required": [
+                  "exec"
+                ]
+              },
+              "then": {
                 "not": {
                   "required": [
                     "image"
@@ -343,9 +399,33 @@
                 }
               }
             }
+          ]
+        },
+        "resources": {
+          "$ref": "#/$defs/resources"
+        }
+      }
+    },
+    "sync": {
+      "description": "How the working tree is copied into a session. Optional; without it the whole tree goes.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "exclude"
+      ],
+      "properties": {
+        "exclude": {
+          "description": "rsync patterns kept out of the forward sync. `out/` at the top of the tree is always excluded whatever is written here: it is the channel results come back on, and mirroring deletions into it would destroy them. A leading slash anchors a pattern at the top of the tree.",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000-\\u001f]+$"
           }
         }
-      ]
+      }
     }
   }
 }

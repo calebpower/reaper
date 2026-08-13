@@ -1,0 +1,14 @@
+# The mirror image of the run case, on the verb that overrides in the other
+# direction: the guest defaults to container execution, the build opts out of
+# it, and then names a toolchain image it has nowhere to run.
+schema: 1
+project: host-build-with-image
+guests: [some-guest]
+exec: container
+build:
+  exec: host
+  image: docker.io/library/example@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+  cmd: make
+run:
+  image: docker.io/library/example@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+  cmd: make check

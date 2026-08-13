@@ -1,0 +1,14 @@
+# A run that executes on the host cannot also name an image to execute in. One
+# of the two lines is a mistake, and refusing is far kinder than silently
+# picking whichever the implementation happens to read first.
+schema: 1
+project: host-run-with-image
+guests: [some-guest]
+exec: container
+build:
+  image: docker.io/library/example@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+  cmd: ./build.sh
+run:
+  exec: host
+  image: docker.io/library/example@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+  cmd: e2e/run.sh

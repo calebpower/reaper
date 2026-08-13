@@ -1,0 +1,13 @@
+# Both verbs run in the same toolchain, and the digest is written once. The
+# resolver copies build.image into run before the second validation pass, so
+# the run is checked as the fully resolved thing the runner would act on.
+schema: 1
+project: one-toolchain
+guests: [some-guest]
+exec: container
+build:
+  image: docker.io/library/example@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+  cmd: cargo build --locked --tests
+  cache: [cargo]
+run:
+  cmd: cargo test --locked

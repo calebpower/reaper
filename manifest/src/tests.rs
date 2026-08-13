@@ -47,7 +47,24 @@ fn every_shipped_example_loads() {
 /// also a better test than asserting the fixture: it keeps holding when the
 /// examples change.
 #[test]
-fn every_example_guest_agrees_with_its_execution_mode() {
+fn every_example_verb_agrees_with_its_execution_mode() {
+    // Per verb, not per guest: the two verbs of one guest may legitimately
+    // differ, so checking the guest's default against the build's image -- as
+    // this once did -- would ask the wrong question of a manifest that splits
+    // them.
+    fn coherent(what: &str, exec: Exec, image: Option<&String>) {
+        match exec {
+            Exec::Container => assert!(
+                image.is_some(),
+                "{what}: container execution needs a toolchain image"
+            ),
+            Exec::Host => assert!(
+                image.is_none(),
+                "{what}: host execution has no image to run in"
+            ),
+        }
+    }
+
     let dir = fixture("examples");
     for entry in std::fs::read_dir(&dir).expect("examples directory") {
         let path = entry.expect("readable entry").path();
@@ -55,18 +72,10 @@ fn every_example_guest_agrees_with_its_execution_mode() {
             continue;
         }
         for g in &load(&path).expect("loads").guests {
-            match (g.exec, g.build.as_ref().and_then(|b| b.image.as_ref())) {
-                (Exec::Container, image) => assert!(
-                    image.is_some() || g.build.is_none(),
-                    "{}: container execution needs a toolchain image",
-                    g.name
-                ),
-                (Exec::Host, image) => assert!(
-                    image.is_none(),
-                    "{}: host execution has no image to run in",
-                    g.name
-                ),
+            if let Some(b) = &g.build {
+                coherent(&format!("{} build", g.name), b.exec, b.image.as_ref());
             }
+            coherent(&format!("{} run", g.name), g.run.exec, g.run.image.as_ref());
             assert!(!g.run.cmd.is_empty());
         }
     }
@@ -134,22 +143,27 @@ fn profiles_are_read_but_not_interpreted() {
 /// as an internal error, because the difference is what a user is told.
 #[test]
 fn invalid_fixtures_are_reported_as_invalid() {
-    for name in [
-        "container-exec-without-image",
-        "host-exec-with-image",
-        "no-guests",
-        "reset-work-dataset",
-        "tag-and-digest",
-        "tag-not-digest",
-        "unregistered-key",
-        "wrong-schema-version",
-    ] {
-        let e = load_err(&format!("test/invalid/{name}.yaml"));
+    // Discovered rather than listed. A remembered list is a list that goes stale
+    // the first time someone adds a fixture and does not think to come here.
+    let dir = fixture("test/invalid");
+    let mut seen = 0;
+    for entry in std::fs::read_dir(&dir).expect("invalid fixtures") {
+        let path = entry.expect("readable entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+            continue;
+        }
+        let e = match load(&path) {
+            Ok(_) => panic!("{} should have been rejected", path.display()),
+            Err(e) => e,
+        };
         assert!(
             matches!(e, Error::Invalid { .. }),
-            "{name} should be Invalid, got: {e}"
+            "{} should be Invalid, got: {e}",
+            path.display()
         );
+        seen += 1;
     }
+    assert!(seen >= 8, "expected the invalid fixtures, found {seen}");
 }
 
 #[test]
@@ -217,4 +231,87 @@ fn the_embedded_schema_compiles() {
     // reason.
     let schema: Value = serde_json::from_str(SCHEMA).expect("schema is JSON");
     jsonschema::validator_for(&schema).expect("schema compiles");
+}
+
+/// Execution mode is a property of a verb, and the guest's is only a default.
+///
+/// This is the case that made the change necessary: a project whose build needs
+/// a pinned toolchain and whose run drives the guest's own container engine.
+/// Running the second inside the first cannot work -- a toolchain image carries
+/// no engine client -- so the pair has to be expressible.
+#[test]
+fn a_verb_may_override_the_guests_execution_mode() {
+    let m = load_ok("test/valid/per-verb-exec.yaml");
+    let g = &m.guests[0];
+
+    assert_eq!(g.exec, Exec::Container, "the guest's default");
+    assert_eq!(g.build.as_ref().unwrap().exec, Exec::Container);
+    assert_eq!(g.run.exec, Exec::Host, "the run overrode it");
+
+    // And the override does not drag an image along with it.
+    assert!(g.build.as_ref().unwrap().image.is_some());
+    assert_eq!(
+        g.run.image, None,
+        "a host-execution run has nowhere to run an image, so it must not \
+         inherit one -- it would then be rejected for a key nobody wrote"
+    );
+}
+
+/// Two verbs in one toolchain declare the digest once.
+#[test]
+fn a_container_run_inherits_the_build_image() {
+    let m = load_ok("test/valid/run-inherits-the-build-image.yaml");
+    let g = &m.guests[0];
+    let build_image = g.build.as_ref().unwrap().image.clone();
+
+    assert!(build_image.is_some());
+    assert_eq!(
+        g.run.image, build_image,
+        "the run declared no image of its own, so it runs in the build's"
+    );
+}
+
+/// A run that names its own image keeps it. Inheritance is a fallback, not an
+/// overwrite -- the opposite would silently ignore what the tenant wrote.
+#[test]
+fn a_run_that_names_an_image_keeps_it() {
+    let text = "
+schema: 1
+project: two-images
+guests: [g]
+exec: container
+build:
+  image: docker.io/library/builder@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  cmd: make
+run:
+  image: docker.io/library/driver@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  cmd: make check
+";
+    let m = from_str(text, "<inline>").expect("valid");
+    assert!(m.guests[0].run.image.as_deref().unwrap().contains("driver"));
+}
+
+/// Sync exclusions are read and handed on uninterpreted. The framework does not
+/// know what any of these patterns mean, and must not learn.
+#[test]
+fn sync_exclusions_are_read_verbatim() {
+    let m = load_ok("test/valid/sync-excludes.yaml");
+    assert_eq!(m.sync_exclude, vec!["/target/", "*.tmp", ".venv/"]);
+
+    // A manifest with no sync block excludes nothing of its own.
+    assert!(load_ok("test/valid/minimal.yaml").sync_exclude.is_empty());
+}
+
+/// A verb cannot ask for container execution when no image exists to run in --
+/// including the case where there is no build block to inherit one from.
+#[test]
+fn a_container_verb_with_no_image_anywhere_is_refused() {
+    let e = load_err("test/invalid/container-run-without-any-image.yaml");
+    let Error::Invalid { problems, .. } = &e else {
+        panic!("expected Invalid, got {e}");
+    };
+    assert!(
+        problems.iter().any(|p| p.contains("/run") && p.contains("image")),
+        "the failure should name the run's missing image: {problems:?}"
+    );
 }

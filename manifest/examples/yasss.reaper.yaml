@@ -24,6 +24,14 @@ build:
   cache: [gradle]
 
 run:
+  # On the guest itself, not in the toolchain image above -- the one place this
+  # example needs execution mode to be a property of a verb rather than of a
+  # guest. This command brings up a pod, so it needs the guest's container
+  # engine; a JDK image has no engine client inside it, and running the command
+  # there would fail deep in the guest for a reason that reads like an engine
+  # fault rather than a manifest one.
+  exec: host
+
   # Opaque to reaper. That this string happens to name stages is the tenant's
   # business; the framework never learns what a stage is.
   cmd: e2e/run.sh --only ${STAGES:-journeys}

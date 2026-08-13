@@ -75,14 +75,21 @@ pub enum Exec {
     Host,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Build {
-    /// Present exactly when `exec` is `Container`; the schema enforces both
-    /// halves of that.
+    /// Resolved: this verb's own mode if it declared one, otherwise the
+    /// guest's. Execution mode belongs to a verb rather than to a guest,
+    /// because the two verbs may legitimately disagree -- a project can need a
+    /// pinned toolchain to build and the guest's own container engine to run.
+    pub exec: Exec,
+    /// Present exactly when this verb's `exec` is `Container`; the schema
+    /// enforces both halves of that.
     #[serde(default)]
     pub image: Option<String>,
     pub cmd: String,
+    /// The guest's caches. Declared here and mounted for every verb: a second
+    /// list under `run` would be a key that exists to be forgotten.
     #[serde(default)]
     pub cache: Vec<String>,
     #[serde(default)]
@@ -92,6 +99,11 @@ pub struct Build {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Run {
+    /// As [`Build::exec`].
+    pub exec: Exec,
+    /// Under container execution, `build.image` unless this verb named its own.
+    #[serde(default)]
+    pub image: Option<String>,
     /// Opaque. This crate does not know what a stage, a journey or a seed is.
     pub cmd: String,
     /// May be empty: a project that runs no containers declares no images.
@@ -145,6 +157,9 @@ pub struct Manifest {
     pub guests: Vec<Guest>,
     /// Dataset names `reset` rolls back. The schema restricts this to `state`.
     pub reset: Vec<String>,
+    /// rsync patterns the tenant keeps out of the forward sync. The results
+    /// directory is excluded whatever this says; see `docs/tenants.md`.
+    pub sync_exclude: Vec<String>,
     pub profiles: BTreeMap<String, Profile>,
 }
 
@@ -199,6 +214,17 @@ pub fn from_str(text: &str, origin: &str) -> Result<Manifest, Error> {
         reset: doc
             .get("reset")
             .and_then(|r| r.get("datasets"))
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        sync_exclude: doc
+            .get("sync")
+            .and_then(|s| s.get("exclude"))
             .and_then(Value::as_array)
             .map(|a| {
                 a.iter()
@@ -305,13 +331,46 @@ fn resolve_guests(doc: &Value) -> Result<Vec<Value>, String> {
         let mut resolved = Map::new();
         resolved.insert("name".into(), Value::String(name));
 
-        if let Some(exec) = over.get("exec").or_else(|| doc.get("exec")) {
-            resolved.insert("exec".into(), exec.clone());
+        // The guest's default execution mode. Each verb may override it.
+        let guest_exec = over.get("exec").or_else(|| doc.get("exec")).cloned();
+        if let Some(e) = &guest_exec {
+            resolved.insert("exec".into(), e.clone());
         }
-        for key in ["build", "run", "resources"] {
-            if let Some(merged) = merge(doc.get(key), over.get(key)) {
-                resolved.insert(key.into(), merged);
+        if let Some(merged) = merge(doc.get("resources"), over.get("resources")) {
+            resolved.insert("resources".into(), merged);
+        }
+
+        let mut build = merge(doc.get("build"), over.get("build"));
+        let mut run = merge(doc.get("run"), over.get("run"));
+
+        // Execution mode belongs to a verb, not to a guest. A project can
+        // perfectly reasonably need a pinned toolchain to build and the guest's
+        // own container engine to run -- a toolchain image has no engine client
+        // inside it -- so the guest's mode is only the default.
+        for block in [&mut build, &mut run] {
+            if let (Some(Value::Object(o)), Some(e)) = (block, &guest_exec) {
+                o.entry("exec").or_insert_with(|| e.clone());
             }
+        }
+
+        // A container-execution `run` with no image of its own runs in the
+        // toolchain the build declared, so a project whose two verbs share one
+        // image writes the digest once. Deliberately never for a
+        // host-execution run: it has nowhere to run an image, and inheriting
+        // one would earn a rejection for a key the tenant never wrote.
+        if let (Some(Value::Object(r)), Some(Value::Object(b))) = (&mut run, &build) {
+            if r.get("exec") == Some(&json!("container")) && !r.contains_key("image") {
+                if let Some(image) = b.get("image") {
+                    r.insert("image".into(), image.clone());
+                }
+            }
+        }
+
+        if let Some(b) = build {
+            resolved.insert("build".into(), b);
+        }
+        if let Some(r) = run {
+            resolved.insert("run".into(), r);
         }
 
         out.push(Value::Object(resolved));
