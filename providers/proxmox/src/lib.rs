@@ -302,9 +302,16 @@ impl Provider for Proxmox {
 
     fn destroy(&self, machine: &MachineRef) -> Result<()> {
         let id = self.config.ids.check(machine)?;
-        let task = self
-            .client
-            .delete(&format!("/nodes/{}/qemu/{id}", self.node()))?;
+        // Same parameters the sweeper uses, deliberately. Disks named in the
+        // configuration go either way, so this is not a leak being fixed --
+        // but destroy-unreferenced-disks is what clears a disk left behind by
+        // a create that failed between attaching one and recording it, and the
+        // backstop and the thing it backs up should not disagree about what
+        // destroying means.
+        let task = self.client.delete(&format!(
+            "/nodes/{}/qemu/{id}?purge=1&destroy-unreferenced-disks=1",
+            self.node()
+        ))?;
         self.wait(&task)
     }
 

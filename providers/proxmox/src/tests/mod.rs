@@ -644,3 +644,24 @@ fn the_disk_slot_is_configurable() {
     let disks = pve.attached_disks(m.as_str());
     assert_eq!(disks.get("scsi3").map(String::as_str), Some("s:64"), "{disks:?}");
 }
+
+#[test]
+fn destroying_also_clears_disks_a_failed_create_could_have_left() {
+    // Parity with the sweeper, which has always destroyed this way. The two
+    // should not disagree about what destroying a machine means.
+    let pve = MockPve::start();
+    pve.with_state(|s| {
+        s.vms.insert(9001, Vm { name: "a-session".into(), pool: POOL.into(), ..Vm::default() });
+    });
+    let p = provider_for(&pve);
+
+    p.destroy(&MachineRef::new("9001")).unwrap();
+
+    let paths = pve.paths();
+    let deletes: Vec<&String> = paths.iter().filter(|p| p.contains("/qemu/9001")).collect();
+    assert!(
+        deletes.iter().any(|p| p.contains("destroy-unreferenced-disks=1")),
+        "unreferenced disks must be cleared too: {deletes:?}"
+    );
+    assert!(pve.vm(9001).is_none(), "the machine should be gone");
+}
