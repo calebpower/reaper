@@ -1,0 +1,19 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Local session state and site configuration. The site registry lives outside
+# the repo by design (see docs/site-config.md) -- if one ever appears in here,
+# it is a mistake, and a mistake that may carry a token.
+/.reaper-state/
+*.local
+*.local.*
+reaper.toml
+token
+token.*
+
+# Editor and OS droppings
+*~
+.#*
+\#*#
+.DS_Store
