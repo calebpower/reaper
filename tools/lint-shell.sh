@@ -67,6 +67,6 @@ for engine in podman docker; do
 done
 
 echo "no shellcheck on PATH and no container engine to run the pinned image." >&2
-echo "Install it (FreeBSD: pkg install hs-ShellCheck -- note the capitals, a" >&2
-echo "lowercase search finds nothing) rather than skipping the check." >&2
+echo "Install it rather than skipping the check -- see the development" >&2
+echo "prerequisites in docs/README.md." >&2
 exit 2

@@ -55,3 +55,22 @@ describes an intended shape; `STATUS.md` describes the shape that exists.
 The sweeper in `cull/` has already had one incident of exactly the §2 shape: a
 swallowed error that made failures invisible. Its decision self-test exists
 because of it.
+
+## Development prerequisites
+
+Only two things are needed to run everything in `tools/check.sh`:
+
+**A Rust toolchain**, for the manifest validator. Build natively on whatever
+machine you are on; do not cross-compile. The project deliberately avoids
+`native-tls` in favour of `rustls` so that a build host's OpenSSL differences
+never become a portability problem.
+
+**`shellcheck`**, for the shell scripts. `tools/lint-shell.sh` prefers one on
+`PATH` and otherwise runs a digest-pinned container image; if it can find
+neither it fails rather than reporting a clean tree.
+
+One packaging trap worth recording, because it cost an hour: on FreeBSD the
+port is `hs-ShellCheck`, and `pkg search -q shellcheck` finds nothing at all
+because the search is case-sensitive. Use `pkg search -i shellcheck`, or install
+`hs-ShellCheck` by name. It is a different tool from `cargo-spellcheck`, which
+checks spelling in Rust doc comments and is not used here.
