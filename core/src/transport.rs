@@ -136,6 +136,14 @@ pub trait Transport {
     /// create places to forget.
     fn run(&self, command: &str, what: &str) -> Result<String>;
 
+    /// Run a command with its output going straight to the terminal.
+    ///
+    /// A build takes minutes, and a tenant watching a blank screen until it
+    /// finishes cannot tell a slow compile from a hung one. Output is not
+    /// captured, so nothing here can inspect it -- which is the right trade for
+    /// a command whose output belongs to the person who asked for it.
+    fn run_live(&self, command: &str, what: &str) -> Result<()>;
+
     /// Write bytes to a path, and make it executable.
     fn put_executable(&self, bytes: &[u8], dest: &str) -> Result<()>;
 
@@ -160,6 +168,28 @@ impl Transport for Ssh {
             });
         }
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+
+    fn run_live(&self, command: &str, what: &str) -> Result<()> {
+        let status = Command::new(&self.program)
+            .args(self.options())
+            .arg(command)
+            .status()
+            .map_err(|e| TransportError::Spawn {
+                program: self.program.clone(),
+                source: e,
+            })?;
+
+        if !status.success() {
+            return Err(TransportError::Failed {
+                what: what.to_string(),
+                status: status.code().unwrap_or(-1),
+                // Nothing was captured, so there is nothing to quote back. The
+                // output already went where it was wanted.
+                stderr: String::new(),
+            });
+        }
+        Ok(())
     }
 
     fn put_executable(&self, bytes: &[u8], dest: &str) -> Result<()> {

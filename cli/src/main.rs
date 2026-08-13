@@ -43,6 +43,34 @@ enum Command {
         manifest: Option<PathBuf>,
     },
 
+    /// Copy the working tree into a session, and results back out.
+    Sync {
+        /// Which session. Defaults to every session for this project.
+        session: Option<String>,
+        /// The manifest to read, and the tree to sync. Defaults to .reaper.yaml here.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+    },
+
+    /// Run this project's build command in a session.
+    Build {
+        session: Option<String>,
+        /// Take the environment and cache policy from this profile.
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+    },
+
+    /// Run this project's run command in a session.
+    Run {
+        session: Option<String>,
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+    },
+
     /// Show live sessions.
     List,
 
@@ -81,6 +109,17 @@ fn main() -> ExitCode {
             ttl,
             manifest,
         } => commands::up(guest, profile, ttl, manifest),
+        Command::Sync { session, manifest } => commands::sync(session, manifest),
+        Command::Build {
+            session,
+            profile,
+            manifest,
+        } => commands::exec(commands::Verb::Build, session, profile, manifest),
+        Command::Run {
+            session,
+            profile,
+            manifest,
+        } => commands::exec(commands::Verb::Run, session, profile, manifest),
         Command::List => commands::list(),
         Command::Renew { session, ttl } => commands::renew(session, ttl),
         Command::Down { session, all } => commands::down(session, all),

@@ -1,14 +1,18 @@
 //! The session verbs.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use reaper_core::config::Config;
 use reaper_core::provider::{CreateRequest, MachineRef, Provider};
 use reaper_core::session::{Session, Store};
+use reaper_core::sync;
 use reaper_core::transport::{Ssh, Transport};
-use reaper_core::{config, duration};
-use reaper_manifest::Manifest;
+use reaper_core::{config, duration, job};
+use reaper_manifest::{Exec, Manifest};
 
 use crate::proc;
 
@@ -21,6 +25,19 @@ fn load_config() -> Result<Config> {
 
 fn provider_for(cfg: &Config) -> Result<Box<dyn Provider>> {
     Ok(reaper_providers::build(&cfg.provider, cfg.provider_table())?)
+}
+
+/// A manifest, and the directory it sits in -- which is the tree that gets
+/// synced. Taken from the manifest rather than from the current directory, so
+/// `--manifest` points at a project rather than just at a file.
+fn load_manifest_at(explicit: Option<PathBuf>) -> Result<(Manifest, PathBuf)> {
+    let path = explicit.clone().unwrap_or_else(|| PathBuf::from(".reaper.yaml"));
+    let root = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    Ok((load_manifest(explicit)?, root))
 }
 
 fn load_manifest(explicit: Option<PathBuf>) -> Result<Manifest> {
@@ -183,7 +200,8 @@ pub fn up(
                 // A machine with an address is not yet a machine anyone can
                 // use: it has no pool. Firstboot is what makes it a session,
                 // so it happens before the session is called ready.
-                prepare(&cfg, &name, address)?;
+                let ssh = prepare(&cfg, &name, address)?;
+                prepull(&ssh, &name, &declared_images(g));
 
                 let ready_at = SystemTime::now();
                 provider.set_expiry(&machine, ready_at + ttl)?;
@@ -237,33 +255,97 @@ fn wait_for_address(
 /// a template in the first place.
 const RUNNER: &str = include_str!("../../runner/runner.sh");
 
-/// Deliver the runner and build the session's storage.
-fn prepare(cfg: &Config, session: &str, address: std::net::IpAddr) -> Result<()> {
+/// Where the runner lands, and where a rendered job lands beside it.
+const RUNNER_PATH: &str = "/tmp/reaper-runner.sh";
+const JOB_PATH: &str = "/tmp/reaper-job.sh";
+
+/// A file this session owns, beside the session store.
+fn state_file(session: &str, prefix: &str) -> Result<PathBuf> {
+    let path = Store::open()
+        .path()
+        .with_file_name(format!("{prefix}-{session}"));
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    Ok(path)
+}
+
+fn ssh_to(cfg: &Config, session: &str, address: std::net::IpAddr) -> Result<Ssh> {
     // Per-session, and thrown away with the session. A shared known-hosts file
     // would accumulate keys for addresses that get recycled, and then refuse to
     // connect at the least convenient moment.
-    let known_hosts = Store::open()
-        .path()
-        .with_file_name(format!("known-hosts-{session}"));
-    if let Some(dir) = known_hosts.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let _ = std::fs::remove_file(&known_hosts);
-
-    let ssh = Ssh::new(
+    Ok(Ssh::new(
         cfg.session.ssh_command.clone(),
         cfg.session.ssh_user.clone(),
         address,
         cfg.session.ssh_key.clone(),
-        known_hosts,
+        state_file(session, "known-hosts")?,
         cfg.session.ssh_connect_timeout,
-    );
+    ))
+}
 
-    let dest = "/tmp/reaper-runner.sh";
-    println!("{session}: preparing storage on {}", ssh.describe());
-    ssh.put_executable(RUNNER.as_bytes(), dest)?;
-    ssh.run(&format!("{dest} firstboot"), "firstboot")?;
+fn ssh_for(cfg: &Config, s: &Session) -> Result<Ssh> {
+    let address = s.address.ok_or_else(|| {
+        format!(
+            "{}: no address, so there is nothing to connect to. It may still be \
+             starting; `reaper list` will show one when it has",
+            s.name
+        )
+    })?;
+    ssh_to(cfg, &s.name, address)
+}
+
+/// Delivered before every remote operation, not once at creation.
+///
+/// It is a few kilobytes over an already-open connection, and it means the
+/// runner in a session can never be an older version of itself than the CLI
+/// driving it -- including in a session created before the CLI was upgraded.
+fn deliver_runner(ssh: &Ssh) -> Result<()> {
+    ssh.put_executable(RUNNER.as_bytes(), RUNNER_PATH)?;
     Ok(())
+}
+
+/// Ask the runner where this project's tree and results live.
+///
+/// The CLI deliberately does not compute these. Pool layout belongs to the
+/// runner, and a second opinion here would be a second thing to keep in step.
+fn workspace(ssh: &Ssh, project: &str) -> Result<(String, String)> {
+    let reply = ssh.run(
+        &format!("{RUNNER_PATH} workspace --project {project}"),
+        "making the workspace",
+    )?;
+
+    let mut work = None;
+    let mut results = None;
+    for line in reply.lines() {
+        if let Some(v) = line.strip_prefix("work=") {
+            work = Some(v.trim().to_string());
+        }
+        if let Some(v) = line.strip_prefix("out=") {
+            results = Some(v.trim().to_string());
+        }
+    }
+    match (work, results) {
+        (Some(w), Some(o)) => Ok((w, o)),
+        _ => Err(format!(
+            "the runner did not say where the workspace is; it replied: {reply:?}"
+        )
+        .into()),
+    }
+}
+
+/// Deliver the runner and build the session's storage.
+fn prepare(cfg: &Config, session: &str, address: std::net::IpAddr) -> Result<Ssh> {
+    let known_hosts = state_file(session, "known-hosts")?;
+    // A session starts with no history, so it cannot inherit a stale key from
+    // an address that has been recycled.
+    let _ = std::fs::remove_file(&known_hosts);
+
+    let ssh = ssh_to(cfg, session, address)?;
+    println!("{session}: preparing storage on {}", ssh.describe());
+    deliver_runner(&ssh)?;
+    ssh.run(&format!("{RUNNER_PATH} firstboot"), "firstboot")?;
+    Ok(ssh)
 }
 
 fn start_heartbeat(session: &str) -> Result<Option<u32>> {
@@ -421,7 +503,12 @@ pub fn down(session: Option<String>, all: bool) -> Result<()> {
 
     let mut failures = 0;
     for s in targets {
-        // Heartbeat first. A renewal landing between the destroy and the
+        // Results before anything else, and before the heartbeat stops: a
+        // collection of a large artifact takes time, and the expiry should keep
+        // moving while it does.
+        collect_last_results(&cfg, &s);
+
+        // Heartbeat next. A renewal landing between the destroy and the
         // forget would be harmless but confusing in the logs, and there is no
         // reason to leave the process running once its session is going.
         if let Some(pid) = s.heartbeat_pid {
@@ -495,5 +582,326 @@ pub fn heartbeat(name: &str) -> Result<()> {
         }
 
         std::thread::sleep(interval);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Getting work in, and results back out
+// ---------------------------------------------------------------------------
+
+/// Every image this guest declared, in one list and without duplicates.
+///
+/// Pre-pulling covers the toolchain as well as the tenant's own stack: both are
+/// declared, both are needed, and a digest already in the store costs nothing
+/// to ask for again.
+fn declared_images(g: &reaper_manifest::Guest) -> Vec<String> {
+    let mut all: Vec<String> = g
+        .build
+        .as_ref()
+        .and_then(|b| b.image.clone())
+        .into_iter()
+        .chain(g.run.image.clone())
+        .chain(g.run.images.iter().cloned())
+        .collect();
+    all.sort();
+    all.dedup();
+    all
+}
+
+/// Fetch what the manifest declared, and do not let a failure cost a session.
+///
+/// A pre-pull is an optimisation -- the engine would fetch on demand anyway --
+/// so a registry outage should cost a slow first build and never a machine that
+/// took nine minutes to clone.
+fn prepull(ssh: &Ssh, session: &str, images: &[String]) {
+    if images.is_empty() {
+        return;
+    }
+    println!("{session}: fetching {} declared image(s)", images.len());
+    let command = format!("{RUNNER_PATH} pull {}", images.join(" "));
+    if let Err(e) = ssh.run_live(&command, "pre-pulling images") {
+        eprintln!(
+            "{session}: could not pre-fetch images: {e}. The session is up and \
+             usable; the first build will fetch them itself."
+        );
+    }
+}
+
+/// The tree that belongs to a session, if we are standing in it.
+///
+/// `down` may be run from anywhere, and results have nowhere to land unless
+/// the project they belong to is here. Saying so beats writing them somewhere
+/// arbitrary.
+fn tree_for(s: &Session) -> Option<PathBuf> {
+    let here = Path::new(".reaper.yaml");
+    let project = reaper_manifest::load(here).ok()?.project;
+    (project == s.project).then(|| PathBuf::from("."))
+}
+
+/// One reverse-sync, built ready to run repeatedly.
+fn results_plan(
+    cfg: &Config,
+    ssh: &Ssh,
+    rsh: &Path,
+    remote_results: &str,
+    tree: &Path,
+) -> Result<sync::Plan> {
+    let local = tree.join(sync::RESULTS);
+    std::fs::create_dir_all(&local)?;
+    Ok(sync::pull(
+        &cfg.session.rsync_command,
+        rsh,
+        ssh,
+        remote_results,
+        &local,
+    ))
+}
+
+pub fn sync(session: Option<String>, manifest_path: Option<PathBuf>) -> Result<()> {
+    let cfg = load_config()?;
+    let (manifest, tree) = load_manifest_at(manifest_path)?;
+    let store = Store::open();
+
+    for s in implied_sessions(&store, session)? {
+        let ssh = ssh_for(&cfg, &s)?;
+        deliver_runner(&ssh)?;
+        let (work, results) = workspace(&ssh, &manifest.project)?;
+        let rsh = sync::rsh_wrapper(&ssh, &state_file(&s.name, "rsh")?)?;
+
+        println!("{}: {} -> {}", s.name, tree.display(), ssh.describe());
+        sync::push(
+            &cfg.session.rsync_command,
+            &rsh,
+            &ssh,
+            &tree,
+            &work,
+            &manifest.sync_exclude,
+        )
+        .run()?;
+        store.update(&s.name, |st| st.synced_at = Some(SystemTime::now()))?;
+
+        // And straight back, so a session that already holds results hands them
+        // over on the first sync rather than waiting for a run.
+        results_plan(&cfg, &ssh, &rsh, &results, &tree)?.run()?;
+        println!("{}: synced", s.name);
+    }
+    Ok(())
+}
+
+/// Which of a guest's two commands to run. They differ in what they execute
+/// and in nothing else, which is why they share a path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Verb {
+    Build,
+    Run,
+}
+
+impl Verb {
+    fn label(self) -> &'static str {
+        match self {
+            Verb::Build => "build",
+            Verb::Run => "run",
+        }
+    }
+}
+
+pub fn exec(
+    which: Verb,
+    session: Option<String>,
+    profile: Option<String>,
+    manifest_path: Option<PathBuf>,
+) -> Result<()> {
+    let cfg = load_config()?;
+    let (manifest, tree) = load_manifest_at(manifest_path)?;
+    let store = Store::open();
+
+    let profile = match &profile {
+        Some(name) => Some(manifest.profiles.get(name).ok_or_else(|| {
+            let known: Vec<&str> = manifest.profiles.keys().map(String::as_str).collect();
+            format!(
+                "the manifest has no profile {name:?}; it defines: {}",
+                if known.is_empty() {
+                    "none".to_string()
+                } else {
+                    known.join(", ")
+                }
+            )
+        })?),
+        None => None,
+    };
+
+    for s in implied_sessions(&store, session)? {
+        let g = manifest.guest(&s.guest).ok_or_else(|| {
+            format!(
+                "this session runs on {:?}, and the manifest no longer names that \
+                 guest. Take the session down, or put the guest back",
+                s.guest
+            )
+        })?;
+
+        let (cmd, verb_env, image, mode) = match which {
+            Verb::Build => {
+                let b = g.build.as_ref().ok_or_else(|| {
+                    format!(
+                        "{} declares no build for {}, so there is nothing to build. \
+                         A project whose test command needs no build step is ordinary; \
+                         run it instead",
+                        manifest.project, g.name
+                    )
+                })?;
+                (&b.cmd, &b.env, b.image.as_ref(), b.exec)
+            }
+            Verb::Run => (&g.run.cmd, &g.run.env, g.run.image.as_ref(), g.run.exec),
+        };
+
+        // The schema guarantees these agree, having checked the resolved form.
+        // Asserting it here costs a line and turns an impossible state into a
+        // sentence rather than into an argument the runner would refuse.
+        let image = match mode {
+            Exec::Container => Some(image.ok_or_else(|| {
+                format!("{}: container execution with no image", g.name)
+            })?),
+            Exec::Host => None,
+        };
+
+        // A cold profile mounts nothing. That is the whole of determinism mode:
+        // if a run passes here, a warm cache was not the reason.
+        let warm = profile.and_then(|p| p.warm_cache) != Some(false);
+        let caches: Vec<String> = if warm {
+            g.build.as_ref().map(|b| b.cache.clone()).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let env: BTreeMap<String, String> = job::overlay(verb_env, profile.map(|p| &p.env));
+        let script = job::render(cmd, &env);
+
+        let ssh = ssh_for(&cfg, &s)?;
+        deliver_runner(&ssh)?;
+        let (_, results) = workspace(&ssh, &manifest.project)?;
+        // Over stdin, as a file. Never as a quoted argument: a command
+        // containing an apostrophe passed inline closes the quote, and the rest
+        // of it then runs somewhere nobody intended.
+        ssh.put_executable(script.as_bytes(), JOB_PATH)?;
+
+        let mut command = format!(
+            "{RUNNER_PATH} exec --project {} --job {JOB_PATH}",
+            manifest.project
+        );
+        if let Some(i) = image {
+            command.push_str(&format!(" --image {i}"));
+        }
+        for c in &caches {
+            command.push_str(&format!(" --cache {c}"));
+        }
+
+        let rsh = sync::rsh_wrapper(&ssh, &state_file(&s.name, "rsh")?)?;
+        let plan = results_plan(&cfg, &ssh, &rsh, &results, &tree)?;
+
+        println!(
+            "{}: {} on {}{}",
+            s.name,
+            which.label(),
+            g.name,
+            if warm { "" } else { " (cold)" }
+        );
+
+        // Results flow while the command runs, not after it. A failure trace
+        // must never exist only on a machine scheduled for destruction, and the
+        // interesting failures are the ones that end with the operator giving
+        // up and running `down`.
+        let stop = Arc::new(AtomicBool::new(false));
+        let collector = {
+            let plan = plan.clone();
+            let stop = Arc::clone(&stop);
+            let interval = cfg.session.results_interval;
+            let name = s.name.clone();
+            std::thread::spawn(move || {
+                let mut complained = false;
+                while !stop.load(Ordering::Relaxed) {
+                    // Slept in slices so that stopping is prompt: the interval
+                    // is minutes-scale in some configurations, and a command
+                    // that finished should not wait one out.
+                    let slice = Duration::from_millis(200);
+                    let mut waited = Duration::ZERO;
+                    while waited < interval && !stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(slice);
+                        waited += slice;
+                    }
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if let Err(e) = plan.run() {
+                        // Once. A broken channel would otherwise print on every
+                        // tick and bury the output of the command itself.
+                        if !complained {
+                            eprintln!("{name}: results are not coming back: {e}");
+                            complained = true;
+                        }
+                    }
+                }
+            })
+        };
+
+        let outcome = ssh.run_live(&command, which.label());
+        stop.store(true, Ordering::Relaxed);
+        let _ = collector.join();
+
+        // The last pass happens whatever the command did, and before its
+        // failure is reported: a failed run is exactly when its trace matters.
+        let collected = plan.run();
+
+        match (outcome, collected) {
+            (Err(e), pulled) => {
+                if let Err(p) = pulled {
+                    eprintln!("{}: results could not be collected: {p}", s.name);
+                }
+                return Err(e.into());
+            }
+            (Ok(()), Err(p)) => return Err(p.into()),
+            (Ok(()), Ok(_)) => println!("{}: {} finished", s.name, which.label()),
+        }
+    }
+    Ok(())
+}
+
+/// One last reverse-sync before a machine is destroyed.
+///
+/// Best-effort throughout, and never allowed to stop a destroy: a machine that
+/// cannot be reached is exactly the machine most in need of being taken down,
+/// and refusing to remove it because its results could not be fetched would
+/// leave the operator with a session they cannot get rid of.
+fn collect_last_results(cfg: &Config, s: &Session) {
+    // Nothing was ever pushed, so there is no workspace to read and nothing
+    // could have been written. Attempting it would fail on a directory that was
+    // never made, and read as though results had been lost.
+    if s.synced_at.is_none() {
+        return;
+    }
+
+    let Some(tree) = tree_for(s) else {
+        eprintln!(
+            "{}: not standing in {}, so its results have nowhere to land. \
+             Run `reaper sync` from the project before taking it down if you want them",
+            s.name, s.project
+        );
+        return;
+    };
+
+    let attempt = || -> Result<()> {
+        let ssh = ssh_for(cfg, s)?;
+        deliver_runner(&ssh)?;
+        let (_, results) = workspace(&ssh, &s.project)?;
+        let rsh = sync::rsh_wrapper(&ssh, &state_file(&s.name, "rsh")?)?;
+        results_plan(cfg, &ssh, &rsh, &results, &tree)?.run()?;
+        Ok(())
+    };
+
+    match attempt() {
+        Ok(()) => println!("{}: results collected", s.name),
+        Err(e) => eprintln!(
+            "{}: could not collect results before destroying it: {e}",
+            s.name
+        ),
     }
 }

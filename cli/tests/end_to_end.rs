@@ -43,11 +43,17 @@ impl Harness {
 # Stands in for ssh. Records the invocation; captures an upload's stdin; fails
 # on demand. It deliberately does not run the runner -- the runner has its own
 # suite, and re-testing it through here would only make failures harder to read.
+here=$(dirname "$0")
 printf '%s
-' "$*" >> "$(dirname "$0")/ssh.log"
+' "$*" >> "${here}/ssh.log"
 for a in "$@"; do
     case "${a}" in
-        *"cat > "*) cat > "$(dirname "$0")/uploaded" ;;
+        *"cat > /tmp/reaper-job.sh"*) cat > "${here}/job" ;;
+        *"cat > "*) cat > "${here}/uploaded" ;;
+        # The one runner reply the CLI reads rather than ignores: where the
+        # workspace is. Answered here so the CLI's own use of it is exercised.
+        *workspace*)
+            printf 'work=/a-pool/work/a-project\nout=/a-pool/work/a-project/out\n' ;;
     esac
 done
 # Fails only for commands matching the pattern it was given, so a test can
@@ -67,6 +73,18 @@ exit 0
             Some(0o755),
         );
         write(
+            &dir.join("fake-rsync"),
+            r#"#!/bin/sh
+# Stands in for rsync. Records the invocation and copies nothing: what the real
+# flags do is proved against real rsync in reaper-core, and repeating it here
+# would only test rsync twice.
+printf '%s
+' "$*" >> "$(dirname "$0")/rsync.log"
+exit 0
+"#,
+            Some(0o755),
+        );
+        write(
             &dir.join("config.toml"),
             &format!(
                 "{provider}\n\
@@ -76,11 +94,14 @@ exit 0
                  ready_grace = \"30m\"\n\
                  max_concurrent = 2\n\
                  ssh_command = \"{ssh}\"\n\
-                 ssh_user = \"root\"\n\n\
+                 ssh_user = \"root\"\n\
+                 rsync_command = \"{rsync}\"\n\
+                 results_interval = \"1s\"\n\n\
                  [guests.\"a-guest\"]\n\
                  template = \"{template}\"\n",
                 provider = hypervisor.site_config(&dir.join("token"), POOL),
                 ssh = dir.join("fake-ssh").display(),
+                rsync = dir.join("fake-rsync").display(),
             ),
             None,
         );
@@ -130,6 +151,21 @@ run:
     /// The session machines the stand-in holds, templates excluded.
     fn machines(&self) -> Vec<String> {
         self.hypervisor.session_machines()
+    }
+
+    fn log(&self, which: &str) -> String {
+        std::fs::read_to_string(self.dir.join(which)).unwrap_or_default()
+    }
+
+    fn forget_logs(&self) {
+        for f in ["ssh.log", "rsync.log"] {
+            let _ = std::fs::remove_file(self.dir.join(f));
+        }
+    }
+
+    /// The job script the CLI delivered, as the guest would have received it.
+    fn job(&self) -> String {
+        std::fs::read_to_string(self.dir.join("job")).expect("no job was delivered")
     }
 }
 
@@ -429,5 +465,272 @@ fn a_session_whose_storage_cannot_be_built_is_not_reported_as_ready() {
     assert!(h.ok(&["list"]).contains("a-project"));
 
     std::fs::remove_file(h.dir.join("ssh.fail")).unwrap();
+    h.ok(&["down"]);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: getting work in, and results back out
+// ---------------------------------------------------------------------------
+
+/// A manifest with both verbs, two caches, a sync exclusion and a cold profile.
+const FULL: &str = r#"
+schema: 1
+project: a-project
+guests: [a-guest]
+exec: container
+build:
+  image: docker.io/library/toolchain@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  cmd: make build
+  cache: [deps, build-dir]
+  env:
+    SHARED: from-the-build
+    ONLY_BUILD: "1"
+run:
+  exec: host
+  cmd: make check
+  images:
+    - docker.io/library/db@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+sync:
+  exclude: [/scratch/]
+profiles:
+  nightly:
+    warm_cache: false
+    env:
+      SHARED: from-the-profile
+"#;
+
+#[test]
+fn a_sync_pushes_the_tree_and_brings_results_back() {
+    let h = Harness::new("sync");
+    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    h.ok(&["up"]);
+    h.forget_logs();
+
+    let out = h.ok(&["sync"]);
+    assert!(out.contains("synced"), "{out}");
+
+    let rsync = h.log("rsync.log");
+    let lines: Vec<&str> = rsync.lines().collect();
+    assert_eq!(lines.len(), 2, "one push and one pull: {rsync}");
+
+    // Forward. The destination is the path the *runner* reported, not one the
+    // CLI worked out for itself -- pool layout is the runner's business.
+    let push = lines[0];
+    assert!(push.contains("--delete"), "{push}");
+    assert!(push.contains("--exclude=/out/"), "{push}");
+    assert!(push.contains("--exclude=/scratch/"), "the tenant's own: {push}");
+    assert!(
+        push.contains("192.0.2.42:/a-pool/work/a-project/"),
+        "the runner said where the workspace is: {push}"
+    );
+
+    // And back, with no --delete: the guest is not authoritative for what was
+    // in the operator's results directory beforehand.
+    let pull = lines[1];
+    assert!(
+        !pull.contains("--delete"),
+        "the results channel must never delete: {pull}"
+    );
+    assert!(pull.contains("192.0.2.42:/a-pool/work/a-project/out/"), "{pull}");
+
+    h.ok(&["down"]);
+}
+
+#[test]
+fn a_build_runs_in_the_declared_image_with_its_caches() {
+    let h = Harness::new("build");
+    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    h.ok(&["up"]);
+    h.ok(&["sync"]);
+    h.forget_logs();
+
+    h.ok(&["build"]);
+
+    let ssh = h.log("ssh.log");
+    assert!(
+        ssh.contains("exec --project a-project --job /tmp/reaper-job.sh"),
+        "{ssh}"
+    );
+    assert!(
+        ssh.contains("--image docker.io/library/toolchain@sha256:aaaa"),
+        "{ssh}"
+    );
+    assert!(ssh.contains("--cache deps"), "{ssh}");
+    assert!(ssh.contains("--cache build-dir"), "{ssh}");
+
+    // The command reached the guest as a delivered file, not as an argument.
+    let job = h.job();
+    assert!(job.contains("make build"), "{job}");
+    assert!(job.contains("ONLY_BUILD='1'"), "{job}");
+    assert!(
+        !ssh.contains("make build"),
+        "a tenant's command must never appear in an argument list: {ssh}"
+    );
+
+    h.ok(&["down"]);
+}
+
+#[test]
+fn a_run_may_execute_on_the_host_of_a_container_guest() {
+    let h = Harness::new("run-host");
+    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    h.ok(&["up"]);
+    h.ok(&["sync"]);
+    h.forget_logs();
+
+    h.ok(&["run"]);
+
+    let ssh = h.log("ssh.log");
+    assert!(ssh.contains("exec --project a-project"), "{ssh}");
+    // The guest defaults to container execution and this verb overrode it. The
+    // absence of an image is the whole assertion.
+    assert!(
+        !ssh.contains("--image"),
+        "a host-execution run must not be given an image: {ssh}"
+    );
+    assert!(h.job().contains("make check"));
+
+    h.ok(&["down"]);
+}
+
+#[test]
+fn a_cold_profile_mounts_no_cache_and_wins_on_environment() {
+    let h = Harness::new("cold");
+    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    h.ok(&["up"]);
+    h.ok(&["sync"]);
+    h.forget_logs();
+
+    let out = h.ok(&["build", "--profile", "nightly"]);
+    assert!(out.contains("cold"), "the operator should be told: {out}");
+
+    let ssh = h.log("ssh.log");
+    assert!(
+        !ssh.contains("--cache"),
+        "determinism mode mounts nothing: {ssh}"
+    );
+
+    // A profile changes how a session is run, so it wins where both name the
+    // same variable -- otherwise the nightly profile could not change anything.
+    let job = h.job();
+    assert!(job.contains("SHARED='from-the-profile'"), "{job}");
+    assert!(!job.contains("from-the-build"), "{job}");
+
+    h.ok(&["down"]);
+}
+
+#[test]
+fn an_unknown_profile_is_refused_by_name() {
+    let h = Harness::new("bad-profile");
+    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    h.ok(&["up"]);
+
+    let err = h.fails(&["build", "--profile", "does-not-exist"]);
+    assert!(err.contains("does-not-exist"), "{err}");
+    assert!(err.contains("nightly"), "should say what does exist: {err}");
+
+    h.ok(&["down"]);
+}
+
+#[test]
+fn a_project_with_no_build_is_told_so_rather_than_failing_in_the_guest() {
+    let h = Harness::new("no-build");
+    h.ok(&["up"]);
+
+    let err = h.fails(&["build"]);
+    assert!(err.contains("no build"), "{err}");
+
+    h.ok(&["down"]);
+}
+
+#[test]
+fn every_declared_image_is_fetched_when_a_session_first_comes_up() {
+    let h = Harness::new("prepull");
+    write(&h.dir.join(".reaper.yaml"), FULL, None);
+
+    h.ok(&["up"]);
+    let ssh = h.log("ssh.log");
+    // The toolchain as well as the tenant's own stack: both were declared, both
+    // are needed, and a digest already in the store costs nothing to ask for.
+    assert!(ssh.contains("pull docker.io/library/db@sha256:bbbb"), "{ssh}");
+    assert!(ssh.contains("docker.io/library/toolchain@sha256:aaaa"), "{ssh}");
+
+    h.ok(&["down"]);
+}
+
+#[test]
+fn a_session_that_cannot_pre_fetch_is_still_a_usable_session() {
+    // A registry outage must cost a slow first build, never a machine that
+    // took nine minutes to clone.
+    let h = Harness::new("prefetch-refused");
+    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    // Narrow on purpose: the stand-in fails any invocation whose arguments
+    // contain this, and every invocation carries the session directory in a
+    // path, so a loose pattern breaks steps it was never meant to touch.
+    write(&h.dir.join("ssh.fail"), "reaper-runner.sh pull", None);
+
+    let out = h.ok(&["up"]);
+    assert!(out.contains("192.0.2.42"), "the session must still come up: {out}");
+    assert_eq!(h.machines().len(), 1);
+
+    let _ = std::fs::remove_file(h.dir.join("ssh.fail"));
+    h.ok(&["down"]);
+}
+
+#[test]
+fn results_are_collected_before_a_machine_is_destroyed() {
+    let h = Harness::new("down-collects");
+    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    h.ok(&["up"]);
+    h.ok(&["sync"]);
+    h.forget_logs();
+
+    let out = h.ok(&["down"]);
+    assert!(out.contains("results collected"), "{out}");
+
+    let rsync = h.log("rsync.log");
+    assert_eq!(rsync.lines().count(), 1, "one last pull: {rsync}");
+    assert!(
+        !rsync.contains("--delete"),
+        "and still not a mirror: {rsync}"
+    );
+    assert!(h.machines().is_empty());
+}
+
+#[test]
+fn a_session_that_was_never_synced_is_not_asked_for_results() {
+    // The workspace was never made, so a pull would fail on a directory that
+    // never existed -- and read as though results had been lost.
+    let h = Harness::new("down-never-synced");
+    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    h.ok(&["up"]);
+    h.forget_logs();
+
+    h.ok(&["down"]);
+    assert_eq!(h.log("rsync.log"), "", "nothing to collect, so nothing tried");
+    assert!(h.machines().is_empty());
+}
+
+#[test]
+fn a_failed_command_still_gets_its_results_out() {
+    // The interesting failures are the ones that end with somebody giving up
+    // and running `down`, so the trace has to leave before the failure is
+    // reported rather than after.
+    let h = Harness::new("failure-collects");
+    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    h.ok(&["up"]);
+    h.ok(&["sync"]);
+    h.forget_logs();
+    write(&h.dir.join("ssh.fail"), "exec --project", None);
+
+    h.fails(&["build"]);
+
+    let rsync = h.log("rsync.log");
+    assert!(
+        rsync.contains("/a-pool/work/a-project/out/"),
+        "a failing build must still hand its results over: {rsync}"
+    );
+
+    let _ = std::fs::remove_file(h.dir.join("ssh.fail"));
     h.ok(&["down"]);
 }
