@@ -32,7 +32,11 @@ WORK=""
 # A PATH holding only stubs and the handful of real tools the runner needs.
 # Isolating it is what makes "is there a container engine?" a question the test
 # controls, rather than one answered by whatever this machine happens to have.
-REAL_TOOLS="awk sed grep tr sort cat mkdir rm chmod cut head wc printf ln env sh basename dirname"
+# The isolation exists so the suite controls the *decisions* -- which disk,
+# which engine, which snapshot exists -- not so it second-guesses `cp`. These
+# are ordinary file utilities whose behaviour nothing here asserts.
+REAL_TOOLS="awk sed grep tr sort cat mkdir rm chmod cut head wc printf ln env sh
+            basename dirname cp mv ls sleep nohup hostname date touch"
 
 new_case() {
     CASE="$1"
@@ -104,7 +108,19 @@ zpool)
     esac ;;
 zfs)
     case "$1" in
+        snapshot|rollback) exit 0 ;;
         list)
+            # `zfs list -t snapshot` asks whether a named snapshot exists; the
+            # fixture decides, so a test can model both answers.
+            for a in "$@"; do
+                case "${a}" in
+                    snapshot) for b in "$@"; do
+                                  case "${b}" in
+                                      *@*) grep -qx "${b}" "${FIX}/zfs_snapshots" 2>/dev/null && exit 0 || exit 1 ;;
+                                  esac
+                              done ;;
+                esac
+            done
             for a in "$@"; do
                 case "${a}" in
                     */*) grep -qx "${a}" "${FIX}/zfs_datasets" 2>/dev/null && exit 0 || exit 1 ;;
@@ -115,7 +131,9 @@ zfs)
         *) : ;;
     esac ;;
 podman)
-    printf 'podman stub\n' ;;
+    # `ps -q` has to answer with plausible ids, because the reset path iterates
+    # over them. Anything else just records the call.
+    if [ "$1" = ps ]; then fix running_containers; else printf 'podman stub\n'; fi ;;
 *)
     # An unstubbed tool must be loud. Answering "fine" to a call nobody
     # modelled is how a suite ends up asserting nothing at all.
@@ -451,6 +469,12 @@ log_has "${WORK}/pool/work/a-project:/reaper/work"
 log_has "${WORK}/job.sh:/reaper/job.sh:ro"
 log_has 'REAPER_WORK=/reaper/work'
 log_has 'REAPER_OUT=/reaper/work/out'
+# State is the dataset reset rolls back, and until Phase 4 it was created by
+# firstboot and then reachable by nothing at all.
+log_has "${WORK}/pool/state:/reaper/state"
+log_has 'REAPER_STATE=/reaper/state'
+log_has "${WORK}/pool/control/a-project:/reaper/control"
+log_has 'REAPER_CONTROL=/reaper/control'
 log_has "${WORK}/pool/cache/cargo:/reaper/cache/cargo"
 log_has 'REAPER_CACHE_CARGO=/reaper/cache/cargo'
 # A manifest name may carry a hyphen; an environment variable may not.
@@ -495,6 +519,9 @@ log_lacks 'podman'
 saw "^${WORK}/pool/work/a-project\$"
 saw "REAPER_WORK=${WORK}/pool/work/a-project"
 saw "REAPER_OUT=${WORK}/pool/work/a-project/out"
+# Same names in both modes, so a tenant's command need not know which it got.
+saw "REAPER_STATE=${WORK}/pool/state"
+saw "REAPER_CONTROL=${WORK}/pool/control/a-project"
 
 new_case "host execution still hands over the caches, by their host paths"
 FAKE_PLATFORM=Linux
@@ -576,6 +603,152 @@ else
     bad "a pre-pull is an optimisation; failing it would cost a usable session"
 fi
 errsays 'no container engine'
+
+echo
+echo "snapshots, and rolling back to one"
+
+new_case "snapshot takes one, by its full dataset path"
+FAKE_PLATFORM=Linux
+: > "${WORK}/fix/zfs_snapshots"
+if run_runner snapshot --dataset state --name pristine; then :; else bad "snapshot should have succeeded"; fi
+log_has 'zfs snapshot tank/state@pristine'
+outsays 'snapshot=tank/state@pristine'
+
+new_case "--if-absent keeps the snapshot that is already there"
+FAKE_PLATFORM=Linux
+printf 'tank/state@pristine\n' > "${WORK}/fix/zfs_snapshots"
+if run_runner snapshot --dataset state --name pristine --if-absent; then :; else bad "should have succeeded"; fi
+# The point of a named point is that it does not move under you.
+log_lacks 'zfs snapshot'
+errsays 'already exists'
+
+new_case "without --if-absent, an existing snapshot is refused rather than replaced"
+FAKE_PLATFORM=Linux
+printf 'tank/state@pristine\n' > "${WORK}/fix/zfs_snapshots"
+if run_runner snapshot --dataset state --name pristine; then bad "should have refused"; else ok "refused"; fi
+exited 1
+log_lacks 'zfs snapshot'
+
+new_case "only state may be snapshotted or rolled back"
+FAKE_PLATFORM=Linux
+: > "${WORK}/fix/zfs_snapshots"
+for ds in work cache images tank; do
+    if run_runner snapshot --dataset "${ds}" --name pristine; then
+        bad "should have refused ${ds}"
+    else
+        ok "refused ${ds}"
+    fi
+done
+# work carries results outward; cache and images are what make the next
+# iteration fast. Rolling either back would destroy the reason they are split.
+log_lacks 'zfs snapshot'
+exited 2
+
+new_case "rollback rolls back, after stopping what is running"
+FAKE_PLATFORM=Linux
+with_engine
+printf 'tank/state@pristine\n' > "${WORK}/fix/zfs_snapshots"
+printf 'aaa111\nbbb222\n' > "${WORK}/fix/running_containers"
+if run_runner rollback --dataset state --name pristine; then :; else bad "rollback should have succeeded"; fi
+log_has 'podman stop aaa111'
+log_has 'podman stop bbb222'
+log_has 'zfs rollback -r tank/state@pristine'
+outsays 'rolled_back=tank/state@pristine'
+
+new_case "the container that asked for the reset is not the one stopped"
+FAKE_PLATFORM=Linux
+with_engine
+printf 'tank/state@pristine\n' > "${WORK}/fix/zfs_snapshots"
+printf 'aaa111\nbbb222\n' > "${WORK}/fix/running_containers"
+if run_runner rollback --dataset state --name pristine --except-container bbb222; then :; else bad "should have succeeded"; fi
+log_has 'podman stop aaa111'
+# Stopping the caller would look exactly like the reset having crashed.
+log_lacks 'podman stop bbb222'
+log_has 'zfs rollback'
+
+new_case "the caller is spared whether it names itself long or short"
+FAKE_PLATFORM=Linux
+with_engine
+printf 'tank/state@pristine\n' > "${WORK}/fix/zfs_snapshots"
+# An engine reports short ids; a container asked for its own hostname may give
+# either. Both directions have to match, and an exact-match test alone cannot
+# tell that -- either comparison would pass it.
+printf 'aaa111\nbbb222\n' > "${WORK}/fix/running_containers"
+run_runner rollback --dataset state --name pristine \
+    --except-container bbb2223333444455556666777788889999
+log_has 'podman stop aaa111'
+log_lacks 'podman stop bbb222'
+
+new_case "and the other way round, when the engine reports the long form"
+FAKE_PLATFORM=Linux
+with_engine
+printf 'tank/state@pristine\n' > "${WORK}/fix/zfs_snapshots"
+printf 'aaa111\nbbb2223333444455556666777788889999\n' > "${WORK}/fix/running_containers"
+run_runner rollback --dataset state --name pristine --except-container bbb222
+log_has 'podman stop aaa111'
+log_lacks 'podman stop bbb222'
+
+new_case "rollback to a snapshot that does not exist is refused, and stops nothing"
+FAKE_PLATFORM=Linux
+with_engine
+: > "${WORK}/fix/zfs_snapshots"
+printf 'aaa111\n' > "${WORK}/fix/running_containers"
+if run_runner rollback --dataset state --name pristine; then bad "should have refused"; else ok "refused"; fi
+errsays 'there is no tank/state@pristine'
+# Nothing may be torn down on the way to discovering there was nothing to roll
+# back to.
+log_lacks 'podman stop'
+log_lacks 'zfs rollback'
+
+new_case "a snapshot name that is not one is refused"
+FAKE_PLATFORM=Linux
+if run_runner snapshot --dataset state --name '../../etc'; then bad "should have refused"; else ok "refused"; fi
+errsays 'not a usable snapshot name'
+exited 2
+log_lacks 'zfs snapshot'
+
+echo
+echo "the in-guest trigger"
+
+new_case "control start leaves a wrapper a tenant can run, and a loop watching"
+FAKE_PLATFORM=Linux
+if run_runner control --project a-project start; then :; else bad "control start should have succeeded"; fi
+ctl="${WORK}/pool/control/a-project"
+if [ -x "${ctl}/reset" ]; then ok "wrapper is there and executable"; else bad "no wrapper at ${ctl}/reset"; fi
+if [ -x "${ctl}/runner.sh" ]; then ok "a private copy of the runner"; else bad "no runner copy"; fi
+if [ -f "${ctl}/loop.pid" ]; then ok "recorded a pid"; else bad "no pid file"; fi
+outsays 'control='
+run_runner control --project a-project stop
+
+new_case "control start twice does not start a second loop"
+FAKE_PLATFORM=Linux
+run_runner control --project a-project start
+first=$(cat "${WORK}/pool/control/a-project/loop.pid")
+if run_runner control --project a-project start; then :; else bad "should have succeeded"; fi
+second=$(cat "${WORK}/pool/control/a-project/loop.pid")
+if [ "${first}" = "${second}" ]; then ok "same loop, not a second one"; else bad "started a second loop"; fi
+errsays 'already running'
+run_runner control --project a-project stop
+
+new_case "the wrapper and the loop agree: a request gets served and answered"
+FAKE_PLATFORM=Linux
+with_engine
+printf 'tank/state@pristine\n' > "${WORK}/fix/zfs_snapshots"
+: > "${WORK}/fix/running_containers"
+run_runner control --project a-project start
+ctl="${WORK}/pool/control/a-project"
+# Run the wrapper exactly as a tenant would, with the same stubbed PATH.
+if ( PATH="${WORK}/bin:$PATH" FIX="${WORK}/fix" FIXLOG="${WORK}/log" \
+     FAKE_PLATFORM=Linux REAPER_SYSROOT="${WORK}/sysroot" \
+     REAPER_POOL_MOUNT="${WORK}/pool" REAPER_RESET_TIMEOUT=20 "${ctl}/reset" ) ; then
+    ok "the wrapper returned success"
+else
+    bad "the wrapper failed"
+fi
+log_has 'zfs rollback -r tank/state@pristine'
+if ls "${ctl}"/req.* >/dev/null 2>&1; then bad "a request was left behind"; else ok "no request left behind"; fi
+if ls "${ctl}"/res.* >/dev/null 2>&1; then bad "a reply was left behind"; else ok "no reply left behind"; fi
+run_runner control --project a-project stop
 
 echo
 printf '%s passed, %s failed\n' "${pass}" "${fail}"

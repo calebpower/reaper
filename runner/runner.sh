@@ -19,6 +19,10 @@
 #   runner.sh pull REF...                   fetch digest-pinned images
 #   runner.sh exec --project P --job PATH [--image REF] [--cache NAME]...
 #                                           run a delivered job script
+#   runner.sh snapshot --dataset D --name N [--if-absent]
+#   runner.sh rollback --dataset D --name N [--except-container ID]
+#   runner.sh control --project P {start|stop}
+#                                           the in-guest reset trigger
 #
 # Exit 0 on success, 1 on failure, 2 on a usage error.
 set -eu
@@ -35,6 +39,8 @@ POOL_MOUNT="${REAPER_POOL_MOUNT:-/${POOL}}"
 # quietly break every manifest written against the documented ones.
 MOUNT_WORK="/reaper/work"
 MOUNT_CACHE="/reaper/cache"
+MOUNT_STATE="/reaper/state"
+MOUNT_CONTROL="/reaper/control"
 MOUNT_JOB="/reaper/job.sh"
 ARC_MAX_MB="${REAPER_ARC_MAX_MB:-1536}"
 
@@ -47,6 +53,12 @@ SYSROOT="${REAPER_SYSROOT:-}"
 # back; state is the only rollback target, which is the whole reason they are
 # separate.
 DATASETS="images cache state work"
+
+# The only dataset `reset` may roll back, and it is checked here as well as in
+# the manifest schema. work carries results outward and cache and images are
+# what make the next iteration fast; rolling either of those back would destroy
+# the thing the split exists to protect.
+ROLLBACKABLE="state"
 
 log()  { printf 'runner: %s\n' "$*" >&2; }
 die()  { printf 'runner: %s\n' "$*" >&2; exit 1; }
@@ -330,7 +342,9 @@ valid_image() {
     printf '%s' "$1" | grep -Eq '^[A-Za-z0-9._-]+(:[0-9]+)?(/[A-Za-z0-9._-]+)+@sha256:[0-9a-f]{64}$'
 }
 
-work_dir()  { printf '%s/work/%s\n' "${POOL_MOUNT}" "$1"; }
+work_dir()    { printf '%s/work/%s\n' "${POOL_MOUNT}" "$1"; }
+state_dir()   { printf '%s/state\n' "${POOL_MOUNT}"; }
+control_dir() { printf '%s/control/%s\n' "${POOL_MOUNT}" "$1"; }
 
 # Warm caches persist between runs and are never rolled back. A cold run gets
 # the same variable and the same path inside a container, pointing at a
@@ -433,6 +447,10 @@ cmd_exec() {
     exec_work=$(work_dir "${exec_project}")
     [ -d "${exec_work}" ] || die "exec: no working tree at ${exec_work}; sync first"
     mkdir -p "${exec_work}/out"
+    # State is a dataset firstboot made; control is per project. Both have to
+    # exist before a container tries to mount them, or the engine creates a
+    # directory owned by nobody in their place.
+    mkdir -p "$(state_dir)" "$(control_dir "${exec_project}")"
 
     for exec_c in ${exec_caches}; do
         valid_name "${exec_c}" || usage "exec: ${exec_c} is not a usable cache name"
@@ -469,8 +487,12 @@ exec_in_container() {
         -w "${MOUNT_WORK}" \
         -v "${exec_work}:${MOUNT_WORK}" \
         -v "${exec_job}:${MOUNT_JOB}:ro" \
+        -v "$(state_dir):${MOUNT_STATE}" \
+        -v "$(control_dir "${exec_project}"):${MOUNT_CONTROL}" \
         -e "REAPER_WORK=${MOUNT_WORK}" \
-        -e "REAPER_OUT=${MOUNT_WORK}/out"
+        -e "REAPER_OUT=${MOUNT_WORK}/out" \
+        -e "REAPER_STATE=${MOUNT_STATE}" \
+        -e "REAPER_CONTROL=${MOUNT_CONTROL}"
 
     for exec_c in ${exec_caches}; do
         set -- "$@" -v "$(cache_dir "${exec_c}"):${MOUNT_CACHE}/${exec_c}"
@@ -484,7 +506,8 @@ exec_in_container() {
 exec_on_host() {
     # env rather than exporting into this shell: the job gets exactly the
     # variables it was promised, and nothing this script happens to be holding.
-    set -- "REAPER_WORK=${exec_work}" "REAPER_OUT=${exec_work}/out"
+    set -- "REAPER_WORK=${exec_work}" "REAPER_OUT=${exec_work}/out" \
+        "REAPER_STATE=$(state_dir)" "REAPER_CONTROL=$(control_dir "${exec_project}")"
     for exec_c in ${exec_caches}; do
         set -- "$@" "$(cache_var "${exec_c}")=$(cache_dir "${exec_c}")"
     done
@@ -493,17 +516,328 @@ exec_on_host() {
     env "$@" /bin/sh "${exec_job}"
 }
 
+
+# ---------------------------------------------------------------------------
+# Snapshots, and rolling back to one
+#
+# The rule that must hold forever: **nothing here ever constructs or seeds
+# tenant state.** A snapshot is whatever the tenant's own stack-up produced,
+# hostility included -- a database deliberately started in an awkward charset
+# stays that way. Rollback-to-pristine is legitimate exactly because the
+# snapshot was earned through the real path once, and a convenience here that
+# pre-seeded something friendly would silently destroy that.
+# ---------------------------------------------------------------------------
+
+valid_snapname() {
+    printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$'
+}
+
+# A dataset a caller is allowed to name, resolved to its full path.
+rollback_target() {
+    for _r in ${ROLLBACKABLE}; do
+        if [ "$1" = "${_r}" ]; then
+            printf '%s/%s\n' "${POOL}" "$1"
+            return 0
+        fi
+    done
+    return 1
+}
+
+snapshot_exists() {
+    zfs list -t snapshot -H -o name "$1@$2" >/dev/null 2>&1
+}
+
+cmd_snapshot() {
+    snap_dataset=""; snap_name=""; snap_if_absent=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --if-absent) snap_if_absent=1; shift ;;
+            --dataset|--name)
+                [ $# -ge 2 ] || usage "snapshot: $1 needs a value"
+                case "$1" in
+                    --dataset) snap_dataset=$2 ;;
+                    --name)    snap_name=$2 ;;
+                esac
+                shift 2 ;;
+            *) usage "snapshot: unexpected argument $1" ;;
+        esac
+    done
+
+    [ -n "${snap_dataset}" ] || usage "snapshot: no --dataset"
+    [ -n "${snap_name}" ]    || usage "snapshot: no --name"
+    valid_snapname "${snap_name}" || usage "snapshot: ${snap_name} is not a usable snapshot name"
+    snap_target=$(rollback_target "${snap_dataset}") \
+        || usage "snapshot: ${snap_dataset} is not a dataset this may snapshot (only: ${ROLLBACKABLE})"
+
+    if snapshot_exists "${snap_target}" "${snap_name}"; then
+        if [ -n "${snap_if_absent}" ]; then
+            log "${snap_target}@${snap_name} already exists; keeping the one that is there"
+            return 0
+        fi
+        die "${snap_target}@${snap_name} already exists. Snapshots are not
+       overwritten here: the whole value of a named point is that it does not
+       move under you. Pick another name"
+    fi
+
+    announce "snapshot ${snap_target}@${snap_name}"
+    zfs snapshot "${snap_target}@${snap_name}" \
+        || die "could not snapshot ${snap_target}@${snap_name}"
+    printf 'snapshot=%s@%s\n' "${snap_target}" "${snap_name}"
+}
+
+# Stop the tenant's containers, optionally sparing one.
+#
+# The exception is for the in-guest trigger: a driver container that asks for a
+# reset has to survive it, and stopping the caller would look exactly like the
+# reset having crashed.
+stop_containers() {
+    stop_except=${1:-}
+    stop_engine=$(engine)
+    [ -n "${stop_engine}" ] || return 0
+
+    for stop_id in $("${stop_engine}" ps -q 2>/dev/null); do
+        # Compared both ways: `ps -q` gives a short id and a caller reporting
+        # its own hostname gives a short one too, but neither is guaranteed.
+        if [ -n "${stop_except}" ]; then
+            case "${stop_except}" in
+                "${stop_id}"*) continue ;;
+            esac
+            case "${stop_id}" in
+                "${stop_except}"*) continue ;;
+            esac
+        fi
+        announce "stop container ${stop_id}"
+        "${stop_engine}" stop "${stop_id}" >&2 || log "could not stop ${stop_id}"
+    done
+}
+
+cmd_rollback() {
+    roll_dataset=""; roll_name=""; roll_except=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dataset|--name|--except-container)
+                [ $# -ge 2 ] || usage "rollback: $1 needs a value"
+                case "$1" in
+                    --dataset)          roll_dataset=$2 ;;
+                    --name)             roll_name=$2 ;;
+                    --except-container) roll_except=$2 ;;
+                esac
+                shift 2 ;;
+            *) usage "rollback: unexpected argument $1" ;;
+        esac
+    done
+
+    [ -n "${roll_dataset}" ] || usage "rollback: no --dataset"
+    [ -n "${roll_name}" ]    || usage "rollback: no --name"
+    valid_snapname "${roll_name}" || usage "rollback: ${roll_name} is not a usable snapshot name"
+    roll_target=$(rollback_target "${roll_dataset}") \
+        || usage "rollback: ${roll_dataset} is not a dataset this may roll back (only: ${ROLLBACKABLE})"
+
+    snapshot_exists "${roll_target}" "${roll_name}" \
+        || die "there is no ${roll_target}@${roll_name} to roll back to. A session
+       takes @pristine after its first successful run, and 'reaper snapshot'
+       names one whenever you like"
+
+    # Stop first. The contract is that the next run restarts the stack, because
+    # a process holding credentials or sessions from before the rollback must
+    # never survive it.
+    stop_containers "${roll_except}"
+
+    # -r discards snapshots taken after this one. That is ZFS's behaviour rather
+    # than a choice made here, and it is worth saying out loud because it
+    # silently removes named checkpoints.
+    announce "roll ${roll_target} back to @${roll_name}, discarding anything since"
+    if ! zfs rollback -r "${roll_target}@${roll_name}"; then
+        die "could not roll ${roll_target} back to @${roll_name}. If it says the
+       dataset is busy, something still has files open on it -- which is the
+       refusal working: rolling the filesystem out from under a live process is
+       the one outcome worse than not resetting at all"
+    fi
+    printf 'rolled_back=%s@%s\n' "${roll_target}" "${roll_name}"
+}
+
+# ---------------------------------------------------------------------------
+# The in-guest trigger
+#
+# A driver container has to be able to ask for a reset without knowing that ZFS
+# exists, and it cannot run commands on the guest. So something in the guest
+# listens -- the first resident process this design allows inside one, confined
+# to a single directory and a single verb.
+#
+# Request files and rename, rather than a socket or a FIFO: neither template
+# ships netcat, and a FIFO handshake in shell is delicate about who opens what
+# and in which order. A rename is atomic and needs nothing but sh.
+# ---------------------------------------------------------------------------
+
+cmd_control() {
+    ctl_project=""; ctl_action=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --project)
+                [ $# -ge 2 ] || usage "control: --project needs a value"
+                ctl_project=$2; shift 2 ;;
+            start|stop|serve) ctl_action=$1; shift ;;
+            *) usage "control: unexpected argument $1" ;;
+        esac
+    done
+
+    [ -n "${ctl_project}" ] || usage "control: no --project"
+    valid_name "${ctl_project}" || usage "control: ${ctl_project} is not a usable project name"
+    [ -n "${ctl_action}" ] || usage "control: expected start, stop or serve"
+
+    ctl_dir=$(control_dir "${ctl_project}")
+    ctl_pid="${ctl_dir}/loop.pid"
+    # Set for every action, not only for start. `serve` runs as its own
+    # process and reaches this function the same way -- when only start set
+    # this, the loop died under `set -u` on its first request, and the only
+    # thing that noticed was the wrapper's timeout five minutes later.
+    ctl_runner="${ctl_dir}/runner.sh"
+
+    case "${ctl_action}" in
+        start) control_start ;;
+        stop)  control_stop ;;
+        serve) control_serve ;;
+    esac
+}
+
+control_running() {
+    [ -f "${ctl_pid}" ] || return 1
+    kill -0 "$(cat "${ctl_pid}" 2>/dev/null)" 2>/dev/null
+}
+
+control_start() {
+    mkdir -p "${ctl_dir}" || die "cannot make ${ctl_dir}"
+
+    if control_running; then
+        log "the control loop is already running as $(cat "${ctl_pid}")"
+        return 0
+    fi
+
+    # A copy of this script, taken now. The CLI re-delivers the runner before
+    # every remote operation, and rewriting a file a running shell is still
+    # reading from is a good way to make it behave unaccountably.
+    cp "$0" "${ctl_runner}" || die "cannot copy the runner to ${ctl_runner}"
+    chmod 0755 "${ctl_runner}"
+
+    # The wrapper a tenant actually runs. It hides the protocol so that nothing
+    # inside a container needs to know any of this.
+    cat > "${ctl_dir}/reset" <<'WRAPPER'
+#!/bin/sh
+# Ask the guest to roll this project's state back, and wait for it.
+#
+#   reset [snapshot-name]      default: pristine
+#
+# Exits with the status of the rollback. Run it from anywhere that can see this
+# directory -- inside a container it is mounted at /reaper/control.
+set -eu
+dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+name=${1:-pristine}
+# Bounded wait, in seconds. Overridable so a test suite need not sit through
+# the production default.
+limit=${REAPER_RESET_TIMEOUT:-300}
+
+# Whatever identifies this caller. Under a container engine the hostname is the
+# container's own id, which is what stops the reset from stopping the thing
+# that asked for it.
+caller=$(hostname 2>/dev/null || echo unknown)
+id="${caller}-$$"
+
+printf '%s\n%s\n%s\n' reset "${name}" "${caller}" > "${dir}/req.${id}.tmp"
+mv "${dir}/req.${id}.tmp" "${dir}/req.${id}"
+
+# Bounded. A wrapper that waits forever on a loop that has died is worse than
+# one that gives up and says so.
+waited=0
+while [ ! -f "${dir}/res.${id}" ]; do
+    sleep 1
+    waited=$((waited + 1))
+    if [ "${waited}" -gt "${limit}" ]; then
+        rm -f "${dir}/req.${id}"
+        echo "reset: no answer from the guest in ${limit}s; is the control loop running?" >&2
+        exit 1
+    fi
+done
+
+rc=$(cat "${dir}/res.${id}")
+rm -f "${dir}/res.${id}"
+exit "${rc}"
+WRAPPER
+    chmod 0755 "${ctl_dir}/reset"
+
+    # Detached, so it outlives the connection that started it.
+    nohup "${ctl_runner}" control --project "${ctl_project}" serve \
+        >> "${ctl_dir}/loop.log" 2>&1 &
+    printf '%s\n' "$!" > "${ctl_pid}"
+    log "control loop started as $(cat "${ctl_pid}"), watching ${ctl_dir}"
+    printf 'control=%s\n' "${ctl_dir}"
+}
+
+control_stop() {
+    if control_running; then
+        announce "stop the control loop $(cat "${ctl_pid}")"
+        kill "$(cat "${ctl_pid}")" 2>/dev/null || true
+    fi
+    rm -f "${ctl_pid}"
+}
+
+control_serve() {
+    log "serving ${ctl_dir}"
+    while :; do
+        for control_req in "${ctl_dir}"/req.*; do
+            [ -e "${control_req}" ] || continue
+            case "${control_req}" in *.tmp) continue ;; esac
+
+            control_id=${control_req##*/req.}
+            control_verb=$(sed -n 1p "${control_req}" 2>/dev/null)
+            control_snap=$(sed -n 2p "${control_req}" 2>/dev/null)
+            control_from=$(sed -n 3p "${control_req}" 2>/dev/null)
+
+            # Removed before it is acted on. A request that kills the loop
+            # would otherwise be retried on every pass, forever.
+            rm -f "${control_req}"
+
+            control_rc=0
+            if [ ! -x "${ctl_runner}" ]; then
+                log "control: ${ctl_runner} is gone; cannot serve"
+                control_verb=""
+            fi
+            case "${control_verb}" in
+                reset)
+                    "${ctl_runner}" rollback \
+                        --dataset state \
+                        --name "${control_snap:-pristine}" \
+                        --except-container "${control_from}" || control_rc=$?
+                    ;;
+                *)
+                    log "control: ignoring an unknown request ${control_verb:-<empty>}"
+                    control_rc=2
+                    ;;
+            esac
+
+            printf '%s\n' "${control_rc}" > "${ctl_dir}/res.${control_id}.tmp"
+            mv "${ctl_dir}/res.${control_id}.tmp" "${ctl_dir}/res.${control_id}"
+        done
+        sleep 1
+    done
+}
+
 case "${1:-}" in
     firstboot) cmd_firstboot ;;
     info)      cmd_info ;;
     workspace) shift; cmd_workspace "$@" ;;
     pull)      shift; cmd_pull "$@" ;;
     exec)      shift; cmd_exec "$@" ;;
+    snapshot)  shift; cmd_snapshot "$@" ;;
+    rollback)  shift; cmd_rollback "$@" ;;
+    control)   shift; cmd_control "$@" ;;
     -h|--help)
         sed -n '2,/^set -eu/p' "$0" | sed 's/^# \{0,1\}//;$d'
         ;;
     *)
-        printf 'usage: %s {firstboot|info|workspace|pull|exec}\n' "$0" >&2
+        printf 'usage: %s {firstboot|info|workspace|pull|exec|snapshot|rollback|control}\n' "$0" >&2
         exit 2
         ;;
 esac
