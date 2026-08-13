@@ -43,6 +43,20 @@ Decide two things first, because both runbooks ask for them:
    user. Have the public half of that key to hand; you will paste it during the
    install.
 
+## Two things the hypervisor does to clones
+
+Neither is obvious, and both broke this project before being found.
+
+**Protection is inherited.** A clone of a protected template is itself
+protected, and a protected machine cannot be destroyed — not by `reaper down`,
+not by the sweeper. reaper therefore clears it explicitly on every session it
+creates. Keep Protection on the template regardless: that is what stops a stray
+destroy taking the thing every session is made from.
+
+**A running machine cannot be deleted.** Anything that destroys a session has to
+stop it first and wait for it to actually be stopped. Both reaper and the
+sweeper do.
+
 ## After you finish either one
 
 Record what you actually built. A hand-made template is a pet, and the only
