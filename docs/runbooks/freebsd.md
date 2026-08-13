@@ -137,28 +137,61 @@ freebsd-version -kru; uname -a
 
 Keep that output for the commit that registers the template.
 
+## 6a. Known bug: host keys are not regenerated at boot
+
+**This template ships with its host keys, and every clone shares them.** That is
+a deviation from the other guest, which regenerates properly, and it is a wart
+rather than a decision.
+
+What is known, so nobody repeats the search:
+
+- `/var/log/messages` records `failed precmd routine for sshd` on **every** boot.
+  `sshd_precmd` runs keygen then configtest, and its failure is why sshd never
+  starts -- the machine boots fine and answers its guest agent, but port 22 is
+  closed.
+- Run by hand, `/etc/rc.d/sshd keygen` works perfectly and generates all three
+  key types in a second.
+- `sshd -t` passes, with and without keys present.
+- `sshd_enable="YES"` is set.
+- Entropy is not the cause. A virtio-rng device was attached and the driver was
+  confirmed loaded (`random: registering fast source VirtIO Entropy Adapter`) on
+  a boot that still failed. An earlier check appeared to show the driver absent;
+  that was a bad grep -- the kernel prints `VirtIO Entropy Adapter`, not
+  `virtio_random`.
+
+So: the code path works, the config is valid, the service is enabled, and
+randomness is available -- but it fails when rc runs it at boot. The most
+promising untried lead is that `sshd_precmd` calls `run_rc_command` recursively
+for `keygen` and `configtest`, and that nested invocation may behave differently
+in the boot context than from an interactive shell.
+
+**Why shipping anyway is acceptable, and what it costs.** reaper generates a
+fresh per-session `known_hosts` and connects with `accept-new`, so it never
+carries a key from one session to the next -- shared host keys do not weaken
+anything reaper itself does. The residual risk is a person who SSHes to sessions
+by hand with a shared `known_hosts`: they will not be warned when the key
+changes, because it never does. If that matters to you, generate keys per
+session yourself after `up`.
+
 ## 6. Clean, so the clone is not a copy of this boot
 
 ```sh
 pkg clean -ay
 rm -rf /var/log/* /var/tmp/*
-rm -f /var/db/entropy/* /entropy
 rm -f /root/.history /home/reaper/.history
-rm -f /etc/ssh/ssh_host_*
 rm -f /etc/hostid /etc/machine-id
 sync
 ```
+
+**Host keys are not deleted here**, unlike the other guest -- see the section
+above. And the entropy seed is left alone: removing it was tried while chasing
+that bug and made no difference, so there is no reason to strip randomness a
+clone could use.
 
 Then stop the machine **hard** -- a power-off from the hypervisor, not
 `shutdown` -- and do not reconnect.
 
 Why each of the last three lines:
-
-**Host keys.** `rc.d/sshd` regenerates any that are missing on the next start,
-with no first-boot condition and no custom unit. Unlike the other guest, this
-does not sever the connection you are using, because sshd is a persistent daemon
-that already holds its keys -- but it is still last but one, out of habit and
-because habit is what survives a tired evening.
 
 **Both identity files.** FreeBSD 15 carries `/etc/hostid` *and*
 `/etc/machine-id`. `hostid` is derived from `kern.hostuuid` and regenerated at

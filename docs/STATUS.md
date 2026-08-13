@@ -86,6 +86,32 @@ including its refusal path: with no spare disk it declined to build a pool and
 said why, and `info` reported `platform=FreeBSD` with no engine. Both platform
 branches are now proven against real systems rather than fixtures.
 
+### The sweeper proved itself in production, unplanned
+
+A template-in-progress was left carrying the expiry tag it had been given as a
+session. Its TTL passed while nobody was watching, and the **deployed** sweeper
+collected it on its own cron -- no involvement from this project at all. That is
+the backstop working exactly as designed, and it is the one thing that had not
+been demonstrated in production rather than in a test.
+
+It also cost an evening of template work, and the mistake was ours: **an expiry
+tag must be cleared the moment a machine stops being a session.** The Ubuntu
+template had this done; the FreeBSD one did not. Rebuilding it now uses a direct
+clone that is never tagged at all, so the failure cannot recur -- an untagged
+machine in the pool is reported by the sweeper and never destroyed, which is the
+correct state for work in progress.
+
+### One open bug, in the FreeBSD guest
+
+Clones share host keys, because boot-time regeneration fails for reasons that
+resisted diagnosis. Three hypotheses were tested and refuted; the evidence and
+the most promising untried lead are recorded in `docs/runbooks/freebsd.md`.
+
+It is shipped rather than blocked because reaper uses a fresh per-session
+`known_hosts` with `accept-new` and never carries a key between sessions, so
+this does not weaken anything reaper does. The two guests differing is a wart,
+not a design choice, and it is written down as such.
+
 ### An extra privilege PVE 9 requires
 
 The original plan's list of token privileges predates PVE 9 and is incomplete.
