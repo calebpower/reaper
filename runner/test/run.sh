@@ -473,7 +473,10 @@ log_has 'REAPER_OUT=/reaper/work/out'
 # firstboot and then reachable by nothing at all.
 log_has "${WORK}/pool/state:/reaper/state"
 log_has 'REAPER_STATE=/reaper/state'
-log_has "${WORK}/pool/control/a-project:/reaper/control"
+# Split deliberately: the writable half a container can reach, and the
+# read-only wrapper. Nothing the host executes is inside either.
+log_has "${WORK}/pool/control/a-project/io:/reaper/control/io"
+log_has "${WORK}/pool/control/a-project/reset:/reaper/control/reset:ro"
 log_has 'REAPER_CONTROL=/reaper/control'
 log_has "${WORK}/pool/cache/cargo:/reaper/cache/cargo"
 log_has 'REAPER_CACHE_CARGO=/reaper/cache/cargo'
@@ -716,8 +719,43 @@ if run_runner control --project a-project start; then :; else bad "control start
 ctl="${WORK}/pool/control/a-project"
 if [ -x "${ctl}/reset" ]; then ok "wrapper is there and executable"; else bad "no wrapper at ${ctl}/reset"; fi
 if [ -x "${ctl}/runner.sh" ]; then ok "a private copy of the runner"; else bad "no runner copy"; fi
+# The security boundary, asserted rather than assumed: the only thing mounted
+# into a container is io/ and the read-only wrapper, and the script the host
+# runs as root is in neither.
+if [ -e "${ctl}/io/runner.sh" ]; then
+    bad "the root-executed runner is inside the directory containers can write"
+else
+    ok "the runner copy is outside the container-writable directory"
+fi
+# find rather than parsing ls: the mode is what is being asserted, so read it
+# as a number rather than as formatted text.
+mode=$(find "${ctl}" -maxdepth 1 -name runner.sh -exec stat -f '%Lp' {} + 2>/dev/null \
+       || find "${ctl}" -maxdepth 1 -name runner.sh -printf '%m\n' 2>/dev/null)
+case "${mode}" in
+    700) ok "runner copy is root-only (${mode})" ;;
+    *)   bad "runner copy is mode ${mode}, expected 700" ;;
+esac
 if [ -f "${ctl}/loop.pid" ]; then ok "recorded a pid"; else bad "no pid file"; fi
 outsays 'control='
+run_runner control --project a-project stop
+
+new_case "a caller id that is not one is refused, and nothing is rolled back"
+FAKE_PLATFORM=Linux
+with_engine
+printf 'tank/state@pristine\n' > "${WORK}/fix/zfs_snapshots"
+printf 'aaa111\nbbb222\n' > "${WORK}/fix/running_containers"
+run_runner control --project a-project start
+ctl="${WORK}/pool/control/a-project"
+# A glob as the caller id would spare every container, so the rollback would
+# run with the stack still live. It arrives from inside a container, so it is
+# not something to take on trust.
+printf 'reset\npristine\n*\n' > "${ctl}/io/req.evil.tmp"
+mv "${ctl}/io/req.evil.tmp" "${ctl}/io/req.evil"
+waited=0
+while [ ! -f "${ctl}/io/res.evil" ] && [ "${waited}" -lt 15 ]; do sleep 1; waited=$((waited + 1)); done
+if [ -f "${ctl}/io/res.evil" ]; then ok "answered rather than hanging"; else bad "no answer"; fi
+log_lacks 'zfs rollback'
+if grep -q "refusing a caller id" "${ctl}/loop.log"; then ok "said why"; else bad "should have said why"; fi
 run_runner control --project a-project stop
 
 new_case "control start twice does not start a second loop"
@@ -746,8 +784,8 @@ else
     bad "the wrapper failed"
 fi
 log_has 'zfs rollback -r tank/state@pristine'
-if ls "${ctl}"/req.* >/dev/null 2>&1; then bad "a request was left behind"; else ok "no request left behind"; fi
-if ls "${ctl}"/res.* >/dev/null 2>&1; then bad "a reply was left behind"; else ok "no reply left behind"; fi
+if ls "${ctl}"/io/req.* >/dev/null 2>&1; then bad "a request was left behind"; else ok "no request left behind"; fi
+if ls "${ctl}"/io/res.* >/dev/null 2>&1; then bad "a reply was left behind"; else ok "no reply left behind"; fi
 run_runner control --project a-project stop
 
 echo

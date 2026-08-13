@@ -202,6 +202,9 @@ pub fn up(
                 // happens before the session is called ready.
                 prepare(&name, &ssh)?;
                 prepull(&ssh, &name, &declared_images(g));
+                if !manifest.reset.is_empty() {
+                    start_control(&ssh, &manifest.project)?;
+                }
 
                 let ready_at = SystemTime::now();
                 provider.set_expiry(&machine, ready_at + ttl)?;
@@ -292,6 +295,10 @@ const RUNNER: &str = include_str!("../../runner/runner.sh");
 
 /// Where the runner lands, and where a rendered job lands beside it.
 const RUNNER_PATH: &str = "/tmp/reaper-runner.sh";
+
+/// The snapshot a session takes for itself, and the one `reset` returns to
+/// unless told otherwise.
+const PRISTINE: &str = "pristine";
 const JOB_PATH: &str = "/tmp/reaper-job.sh";
 
 /// A file this session owns, beside the session store.
@@ -751,6 +758,135 @@ pub fn sync(session: Option<String>, manifest_path: Option<PathBuf>) -> Result<(
     Ok(())
 }
 
+
+/// Take `@pristine` after a run, if the tenant wants resets and has none yet.
+///
+/// Be exact about what this captures: the state *after* the whole run, test
+/// residue included -- not the state right after the stack came up, which is
+/// what a runner would take if it could tell the difference. It cannot: a
+/// tenant's command is opaque, and "the stack is up now" is that tenant's
+/// vocabulary. A project that wants a tighter point calls `reaper snapshot` at
+/// the moment it chooses.
+///
+/// Reset is deterministic either way. Every reset returns to the same place; it
+/// is just a slightly later place than the plan first imagined.
+fn take_pristine(ssh: &Ssh, session: &str, manifest: &Manifest) {
+    if manifest.reset.is_empty() {
+        return;
+    }
+    for d in &manifest.reset {
+        match ssh.run(
+            &format!("{RUNNER_PATH} snapshot --dataset {d} --name {PRISTINE} --if-absent"),
+            "taking the pristine snapshot",
+        ) {
+            // The runner says so only when it actually took one, so a second
+            // run does not repeat the explanation.
+            Ok(out) if out.contains("snapshot=") => println!(
+                "{session}: {d} snapshotted as {PRISTINE} -- as it stands now, after this run. \
+                 `reaper snapshot` names an earlier point if you want one"
+            ),
+            Ok(_) => {}
+            // Not fatal. The run succeeded, and that is what was asked for.
+            Err(e) => eprintln!("{session}: could not take {PRISTINE}: {e}"),
+        }
+    }
+}
+
+/// Start the in-guest reset trigger, idempotently.
+///
+/// Started with the session and again before anything that might need it, for
+/// the same reason the runner is re-delivered: it is one cheap call over an
+/// open connection, and a session whose loop died for any reason repairs
+/// itself rather than failing a tenant's reset much later.
+fn start_control(ssh: &Ssh, project: &str) -> Result<()> {
+    ssh.run(
+        &format!("{RUNNER_PATH} control --project {project} start"),
+        "starting the reset trigger",
+    )?;
+    Ok(())
+}
+
+/// The datasets a manifest asks to be able to roll back.
+fn reset_datasets(manifest: &Manifest) -> &[String] {
+    &manifest.reset
+}
+
+pub fn snapshot(
+    name: String,
+    session: Option<String>,
+    manifest_path: Option<PathBuf>,
+) -> Result<()> {
+    let cfg = load_config()?;
+    let (manifest, _) = load_manifest_at(manifest_path)?;
+    let store = Store::open();
+
+    let datasets = reset_datasets(&manifest);
+    if datasets.is_empty() {
+        return Err(format!(
+            "{} declares no reset datasets, so there is no state to name a point in. \
+             Add `reset: {{ datasets: [state] }}` to the manifest",
+            manifest.project
+        )
+        .into());
+    }
+
+    for s in implied_sessions(&store, session, Some(&manifest.project))? {
+        let ssh = ssh_for(&cfg, &s)?;
+        deliver_runner(&ssh)?;
+        for d in datasets {
+            ssh.run(
+                &format!("{RUNNER_PATH} snapshot --dataset {d} --name {name}"),
+                "taking a snapshot",
+            )?;
+        }
+        println!("{}: {} snapshotted as {name}", s.name, datasets.join(", "));
+    }
+    Ok(())
+}
+
+pub fn reset(
+    to: Option<String>,
+    session: Option<String>,
+    manifest_path: Option<PathBuf>,
+) -> Result<()> {
+    let cfg = load_config()?;
+    let (manifest, _) = load_manifest_at(manifest_path)?;
+    let store = Store::open();
+
+    let datasets = reset_datasets(&manifest);
+    if datasets.is_empty() {
+        return Err(format!(
+            "{} declares no reset datasets, so there is nothing to roll back. \
+             Add `reset: {{ datasets: [state] }}` to the manifest",
+            manifest.project
+        )
+        .into());
+    }
+    let name = to.unwrap_or_else(|| PRISTINE.to_string());
+
+    for s in implied_sessions(&store, session, Some(&manifest.project))? {
+        let ssh = ssh_for(&cfg, &s)?;
+        deliver_runner(&ssh)?;
+
+        let started = SystemTime::now();
+        for d in datasets {
+            // Output goes straight through: the runner announces what it stops
+            // and what it rolls back, and that is exactly what somebody
+            // watching a reset wants to see.
+            ssh.run_live(
+                &format!("{RUNNER_PATH} rollback --dataset {d} --name {name}"),
+                "rolling back",
+            )?;
+        }
+        println!(
+            "{}: rolled back to {name} in {}",
+            s.name,
+            duration::format_rough(started.elapsed().unwrap_or_default())
+        );
+    }
+    Ok(())
+}
+
 /// Which of a guest's two commands to run. They differ in what they execute
 /// and in nothing else, which is why they share a path.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -925,7 +1061,12 @@ pub fn exec(
                 return Err(e.into());
             }
             (Ok(()), Err(p)) => return Err(p.into()),
-            (Ok(()), Ok(_)) => println!("{}: {} finished", s.name, which.label()),
+            (Ok(()), Ok(_)) => {
+                println!("{}: {} finished", s.name, which.label());
+                if which == Verb::Run {
+                    take_pristine(&ssh, &s.name, &manifest);
+                }
+            }
         }
     }
     Ok(())

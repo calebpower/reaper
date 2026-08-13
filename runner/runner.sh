@@ -344,7 +344,18 @@ valid_image() {
 
 work_dir()    { printf '%s/work/%s\n' "${POOL_MOUNT}" "$1"; }
 state_dir()   { printf '%s/state\n' "${POOL_MOUNT}"; }
+# Two directories, and the split is a security boundary rather than tidiness.
+#
+# control_dir holds things the *host* executes as root -- the runner copy, the
+# pid file. It is never mounted anywhere.
+#
+# control_io is the only part a container sees, and it is writable because
+# requests have to land somewhere. Nothing in it is ever executed by the host.
+# The job script is already mounted read-only for exactly this reason; putting
+# a root-executed script inside a container-writable directory would have
+# handed any toolchain image root on the guest.
 control_dir() { printf '%s/control/%s\n' "${POOL_MOUNT}" "$1"; }
+control_io()  { printf '%s/control/%s/io\n' "${POOL_MOUNT}" "$1"; }
 
 # Warm caches persist between runs and are never rolled back. A cold run gets
 # the same variable and the same path inside a container, pointing at a
@@ -450,7 +461,10 @@ cmd_exec() {
     # State is a dataset firstboot made; control is per project. Both have to
     # exist before a container tries to mount them, or the engine creates a
     # directory owned by nobody in their place.
-    mkdir -p "$(state_dir)" "$(control_dir "${exec_project}")"
+    mkdir -p "$(state_dir)" "$(control_io "${exec_project}")"
+    # The wrapper is mounted as a file, so it has to exist before a container
+    # starts or the engine invents a directory in its place.
+    [ -e "$(control_dir "${exec_project}")/reset" ] || cmd_control --project "${exec_project}" start
 
     for exec_c in ${exec_caches}; do
         valid_name "${exec_c}" || usage "exec: ${exec_c} is not a usable cache name"
@@ -488,7 +502,8 @@ exec_in_container() {
         -v "${exec_work}:${MOUNT_WORK}" \
         -v "${exec_job}:${MOUNT_JOB}:ro" \
         -v "$(state_dir):${MOUNT_STATE}" \
-        -v "$(control_dir "${exec_project}"):${MOUNT_CONTROL}" \
+        -v "$(control_io "${exec_project}"):${MOUNT_CONTROL}/io" \
+        -v "$(control_dir "${exec_project}")/reset:${MOUNT_CONTROL}/reset:ro" \
         -e "REAPER_WORK=${MOUNT_WORK}" \
         -e "REAPER_OUT=${MOUNT_WORK}/out" \
         -e "REAPER_STATE=${MOUNT_STATE}" \
@@ -689,6 +704,7 @@ cmd_control() {
     [ -n "${ctl_action}" ] || usage "control: expected start, stop or serve"
 
     ctl_dir=$(control_dir "${ctl_project}")
+    ctl_io=$(control_io "${ctl_project}")
     ctl_pid="${ctl_dir}/loop.pid"
     # Set for every action, not only for start. `serve` runs as its own
     # process and reaches this function the same way -- when only start set
@@ -709,7 +725,7 @@ control_running() {
 }
 
 control_start() {
-    mkdir -p "${ctl_dir}" || die "cannot make ${ctl_dir}"
+    mkdir -p "${ctl_io}" || die "cannot make ${ctl_io}"
 
     if control_running; then
         log "the control loop is already running as $(cat "${ctl_pid}")"
@@ -720,7 +736,9 @@ control_start() {
     # every remote operation, and rewriting a file a running shell is still
     # reading from is a good way to make it behave unaccountably.
     cp "$0" "${ctl_runner}" || die "cannot copy the runner to ${ctl_runner}"
-    chmod 0755 "${ctl_runner}"
+    # Root-executable and root-only. It lives outside ${ctl_io} deliberately;
+    # see the comment on control_dir.
+    chmod 0700 "${ctl_runner}"
 
     # The wrapper a tenant actually runs. It hides the protocol so that nothing
     # inside a container needs to know any of this.
@@ -745,24 +763,25 @@ limit=${REAPER_RESET_TIMEOUT:-300}
 caller=$(hostname 2>/dev/null || echo unknown)
 id="${caller}-$$"
 
-printf '%s\n%s\n%s\n' reset "${name}" "${caller}" > "${dir}/req.${id}.tmp"
-mv "${dir}/req.${id}.tmp" "${dir}/req.${id}"
+io="${dir}/io"
+printf '%s\n%s\n%s\n' reset "${name}" "${caller}" > "${io}/req.${id}.tmp"
+mv "${io}/req.${id}.tmp" "${io}/req.${id}"
 
 # Bounded. A wrapper that waits forever on a loop that has died is worse than
 # one that gives up and says so.
 waited=0
-while [ ! -f "${dir}/res.${id}" ]; do
+while [ ! -f "${io}/res.${id}" ]; do
     sleep 1
     waited=$((waited + 1))
     if [ "${waited}" -gt "${limit}" ]; then
-        rm -f "${dir}/req.${id}"
+        rm -f "${io}/req.${id}"
         echo "reset: no answer from the guest in ${limit}s; is the control loop running?" >&2
         exit 1
     fi
 done
 
-rc=$(cat "${dir}/res.${id}")
-rm -f "${dir}/res.${id}"
+rc=$(cat "${io}/res.${id}")
+rm -f "${io}/res.${id}"
 exit "${rc}"
 WRAPPER
     chmod 0755 "${ctl_dir}/reset"
@@ -771,8 +790,8 @@ WRAPPER
     nohup "${ctl_runner}" control --project "${ctl_project}" serve \
         >> "${ctl_dir}/loop.log" 2>&1 &
     printf '%s\n' "$!" > "${ctl_pid}"
-    log "control loop started as $(cat "${ctl_pid}"), watching ${ctl_dir}"
-    printf 'control=%s\n' "${ctl_dir}"
+    log "control loop started as $(cat "${ctl_pid}"), watching ${ctl_io}"
+    printf 'control=%s\n' "${ctl_io}"
 }
 
 control_stop() {
@@ -784,9 +803,9 @@ control_stop() {
 }
 
 control_serve() {
-    log "serving ${ctl_dir}"
+    log "serving ${ctl_io}"
     while :; do
-        for control_req in "${ctl_dir}"/req.*; do
+        for control_req in "${ctl_io}"/req.*; do
             [ -e "${control_req}" ] || continue
             case "${control_req}" in *.tmp) continue ;; esac
 
@@ -798,6 +817,17 @@ control_serve() {
             # Removed before it is acted on. A request that kills the loop
             # would otherwise be retried on every pass, forever.
             rm -f "${control_req}"
+
+            # The caller id comes from inside a container and is used as a
+            # `case` pattern when deciding what not to stop. A value of `*`
+            # would match every container and spare the lot, so the rollback
+            # would then run with the stack still live and fail on a busy
+            # dataset -- a confusing way to discover an unvalidated string.
+            if [ -n "${control_from}" ] && ! printf '%s' "${control_from}" \
+                | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$'; then
+                log "control: refusing a caller id that is not one: ${control_from}"
+                control_verb=""
+            fi
 
             control_rc=0
             if [ ! -x "${ctl_runner}" ]; then
@@ -817,8 +847,8 @@ control_serve() {
                     ;;
             esac
 
-            printf '%s\n' "${control_rc}" > "${ctl_dir}/res.${control_id}.tmp"
-            mv "${ctl_dir}/res.${control_id}.tmp" "${ctl_dir}/res.${control_id}"
+            printf '%s\n' "${control_rc}" > "${ctl_io}/res.${control_id}.tmp"
+            mv "${ctl_io}/res.${control_id}.tmp" "${ctl_io}/res.${control_id}"
         done
         sleep 1
     done

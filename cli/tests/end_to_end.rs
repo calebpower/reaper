@@ -54,6 +54,11 @@ for a in "$@"; do
         # workspace is. Answered here so the CLI's own use of it is exercised.
         *workspace*)
             printf 'work=/a-pool/work/a-project\nout=/a-pool/work/a-project/out\n' ;;
+        # The other reply the CLI reads rather than ignores: whether a snapshot
+        # was actually taken. Deciding that is the runner's job and is tested
+        # there; what is tested here is what the CLI does with the answer.
+        *"runner.sh snapshot"*)
+            printf 'snapshot=tank/state@pristine\n' ;;
     esac
 done
 # Refuses the first N invocations and then works, so a test can model a machine
@@ -520,6 +525,8 @@ run:
     - docker.io/library/db@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 sync:
   exclude: [/scratch/]
+reset:
+  datasets: [state]
 profiles:
   nightly:
     warm_cache: false
@@ -871,4 +878,145 @@ run:
     h.ok(&["renew", "--manifest", "other.yaml"]);
     h.ok(&["down", "--manifest", "other.yaml"]);
     assert!(h.machines().is_empty(), "down must have acted on the right project");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: rolling state back
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_run_takes_the_pristine_snapshot_and_says_what_it_captured() {
+    let h = Harness::new("pristine");
+    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    h.ok(&["up"]);
+    h.ok(&["sync"]);
+    h.forget_logs();
+
+    let out = h.ok(&["run"]);
+
+    // --if-absent, because whether a snapshot already exists is the runner's
+    // decision and not one to duplicate here.
+    let ssh = h.log("ssh.log");
+    assert!(
+        ssh.contains("snapshot --dataset state --name pristine --if-absent"),
+        "{ssh}"
+    );
+
+    // And when the runner reports it took one, say what it captured --
+    // "pristine" reads like the state before anything happened, and this is
+    // the state after a whole run.
+    assert!(out.contains("after this run"), "{out}");
+
+    h.ok(&["down"]);
+}
+
+#[test]
+fn a_failed_run_takes_no_snapshot() {
+    // Pristine has to be a point the tenant's own stack reached successfully.
+    // Snapshotting a failed run would make every later reset return to a
+    // broken state, which is far worse than having no pristine at all.
+    let h = Harness::new("pristine-not-after-failure");
+    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    h.ok(&["up"]);
+    h.ok(&["sync"]);
+    h.forget_logs();
+    write(&h.dir.join("ssh.fail"), "exec --project", None);
+
+    h.fails(&["run"]);
+    assert!(
+        !h.log("ssh.log").contains("snapshot"),
+        "no snapshot may be taken after a failed run: {}",
+        h.log("ssh.log")
+    );
+
+    let _ = std::fs::remove_file(h.dir.join("ssh.fail"));
+    h.ok(&["down"]);
+}
+
+#[test]
+fn reset_rolls_back_every_declared_dataset() {
+    let h = Harness::new("reset");
+    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    h.ok(&["up"]);
+    h.forget_logs();
+
+    let out = h.ok(&["reset"]);
+    let ssh = h.log("ssh.log");
+    assert!(
+        ssh.contains("rollback --dataset state --name pristine"),
+        "{ssh}"
+    );
+    assert!(out.contains("rolled back to pristine"), "{out}");
+
+    // And to a named point when asked.
+    h.forget_logs();
+    h.ok(&["reset", "--to", "before-the-bad-step"]);
+    assert!(
+        h.log("ssh.log").contains("--name before-the-bad-step"),
+        "{}",
+        h.log("ssh.log")
+    );
+
+    h.ok(&["down"]);
+}
+
+#[test]
+fn snapshot_names_a_point() {
+    let h = Harness::new("snapshot");
+    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    h.ok(&["up"]);
+    h.forget_logs();
+
+    h.ok(&["snapshot", "mid"]);
+    let ssh = h.log("ssh.log");
+    assert!(ssh.contains("snapshot --dataset state --name mid"), "{ssh}");
+    // Not --if-absent: an explicit name is a deliberate act, and silently
+    // keeping an older point of the same name would be the wrong answer.
+    assert!(!ssh.contains("--if-absent"), "{ssh}");
+
+    h.ok(&["down"]);
+}
+
+#[test]
+fn a_project_with_no_reset_datasets_is_told_so() {
+    // The minimal manifest declares none. Reset would otherwise be a no-op
+    // that looked like it had done something.
+    let h = Harness::new("no-reset");
+    h.ok(&["up"]);
+
+    let err = h.fails(&["reset"]);
+    assert!(err.contains("nothing to roll back"), "{err}");
+    let err = h.fails(&["snapshot", "mid"]);
+    assert!(err.contains("no state"), "{err}");
+
+    h.ok(&["down"]);
+}
+
+#[test]
+fn the_reset_trigger_is_started_with_a_session_that_wants_one() {
+    let h = Harness::new("trigger");
+    write(&h.dir.join(".reaper.yaml"), FULL, None);
+
+    h.ok(&["up"]);
+    assert!(
+        h.log("ssh.log").contains("control --project a-project start"),
+        "{}",
+        h.log("ssh.log")
+    );
+
+    h.ok(&["down"]);
+}
+
+#[test]
+fn a_session_that_cannot_roll_anything_back_starts_no_trigger() {
+    // The minimal manifest declares no reset datasets, so there is nothing for
+    // a trigger to do and no reason to leave a process running in the guest.
+    let h = Harness::new("no-trigger");
+    h.ok(&["up"]);
+    assert!(
+        !h.log("ssh.log").contains("control --project"),
+        "{}",
+        h.log("ssh.log")
+    );
+    h.ok(&["down"]);
 }

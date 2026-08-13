@@ -71,6 +71,24 @@ enum Command {
         manifest: Option<PathBuf>,
     },
 
+    /// Roll this project's state back.
+    Reset {
+        session: Option<String>,
+        /// A named snapshot. Defaults to the session's pristine.
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+    },
+
+    /// Name a point this project's state can be rolled back to.
+    Snapshot {
+        name: String,
+        session: Option<String>,
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+    },
+
     /// Show live sessions.
     List,
 
@@ -126,6 +144,16 @@ fn main() -> ExitCode {
             profile,
             manifest,
         } => commands::exec(commands::Verb::Run, session, profile, manifest),
+        Command::Reset {
+            session,
+            to,
+            manifest,
+        } => commands::reset(to, session, manifest),
+        Command::Snapshot {
+            name,
+            session,
+            manifest,
+        } => commands::snapshot(name, session, manifest),
         Command::List => commands::list(),
         Command::Renew {
             session,
