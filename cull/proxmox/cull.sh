@@ -80,6 +80,15 @@ now=$(date +%s)
 reaped=0
 skipped=0
 
+# Templates are excluded, not merely left alone.
+#
+# A template has to live in the pool -- the credential's right to clone is
+# scoped to it, so a template outside would be unusable. But a template carries
+# no expiry tag, and reporting one as untagged on every run would bury the
+# report that matters: a real untagged guest means a create failed part-way
+# through. An alarm that fires every five minutes forever is an alarm nobody
+# reads.
+#
 # Fetched, checked, and only then iterated.
 #
 # This used to be one pipeline: api | jq | while ... done. A pipeline takes its
@@ -100,6 +109,7 @@ fi
 if ! rows=$(printf '%s' "$resources" | jq -r --arg pool "$PVE_POOL" '
 		.data[]
 		| select(.pool == $pool)
+		| select((.template // 0) != 1)
 		| [.vmid, .node, (.status // "unknown"), (.tags // "")]
 		| @tsv'); then
 	err "the API answered with something that is not the guest list we expected"

@@ -217,6 +217,31 @@ run_cull || bad "should have succeeded"
 untouched 9005
 nothing_destroyed
 
+new_case "a template in the pool is not reported as untagged"
+# Templates must live in the pool to be cloneable, and they carry no expiry.
+# Reporting one every run would drown the report that means something.
+resources <<JSON
+{"data":[{"vmid":9000,"node":"n1","status":"stopped","pool":"a/pool","tags":"","template":1}]}
+JSON
+run_cull || bad "should have succeeded"
+untouched 9000
+nothing_destroyed
+if grep -qi "no valid expires- tag" "${WORK}/err"; then
+    bad "a template must not be reported as untagged"
+else
+    ok "said nothing about the template"
+fi
+says "reaped 0, skipped 0"
+
+new_case "an expired template is still never destroyed"
+# Belt and braces: even if something contrived tagged one.
+resources <<JSON
+{"data":[{"vmid":9000,"node":"n1","status":"stopped","pool":"a/pool","tags":"${expired}","template":1}]}
+JSON
+run_cull || bad "should have succeeded"
+untouched 9000
+nothing_destroyed
+
 echo
 echo "when the API is not answering"
 
