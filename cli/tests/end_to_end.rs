@@ -56,6 +56,16 @@ for a in "$@"; do
             printf 'work=/a-pool/work/a-project\nout=/a-pool/work/a-project/out\n' ;;
     esac
 done
+# Refuses the first N invocations and then works, so a test can model a machine
+# that is not reachable yet without making it permanently unreachable.
+if [ -f "${here}/ssh.refuse-times" ]; then
+    n=$(cat "${here}/ssh.refuse-times")
+    if [ "${n}" -gt 0 ]; then
+        printf '%s' "$((n - 1))" > "${here}/ssh.refuse-times"
+        echo "stand-in ssh: no route to host" >&2
+        exit 255
+    fi
+fi
 # Fails only for commands matching the pattern it was given, so a test can
 # break one step without breaking the ones before it.
 if [ -f "$(dirname "$0")/ssh.fail" ]; then
@@ -755,4 +765,60 @@ fn a_failed_command_still_gets_its_results_out() {
 
     let _ = std::fs::remove_file(h.dir.join("ssh.fail"));
     h.ok(&["down"]);
+}
+
+/// Having an address and being reachable at it are different claims.
+///
+/// A dual-stacked guest autoconfigures IPv6 in a second or two and takes
+/// several more to get a DHCP lease, so the first address it reports is often
+/// one nothing here can route to. Accepting it made every later step fail with
+/// `No route to host` against a machine that was working perfectly -- which is
+/// exactly what happened on the cluster, and what this reproduces.
+#[test]
+fn up_waits_for_a_machine_that_answers_not_merely_one_with_an_address() {
+    let h = Harness::new("unreachable-at-first");
+    // Three refusals, then the machine starts answering.
+    write(&h.dir.join("ssh.refuse-times"), "3", None);
+
+    let out = h.ok(&["up"]);
+    assert!(out.contains("192.0.2.42"), "it should get there in the end: {out}");
+    assert!(
+        out.contains("waiting"),
+        "and should say what it is waiting on rather than sitting silent: {out}"
+    );
+    assert_eq!(h.machines().len(), 1, "and must not create a second machine");
+
+    // The refusals were consumed rather than ignored.
+    let left = std::fs::read_to_string(h.dir.join("ssh.refuse-times")).unwrap();
+    assert_eq!(left.trim(), "0");
+
+    h.ok(&["down"]);
+}
+
+/// And a machine that never answers is reported, not destroyed.
+#[test]
+fn a_machine_that_never_answers_is_left_tagged_rather_than_torn_down() {
+    let h = Harness::new("never-answers");
+    // More refusals than the grace period allows attempts.
+    write(&h.dir.join("ssh.refuse-times"), "100000", None);
+    write(
+        &h.dir.join("config.toml"),
+        &std::fs::read_to_string(h.dir.join("config.toml"))
+            .unwrap()
+            .replace("ready_grace = \"30m\"", "ready_grace = \"4s\""),
+        None,
+    );
+
+    let out = h.ok(&["up"]);
+    assert!(out.contains("nothing answered"), "{out}");
+    // Nothing is leaked: it exists, it carries an expiry, and `down` can find
+    // it. Destroying it here would throw away the one machine somebody might
+    // want to look at.
+    assert_eq!(h.machines().len(), 1);
+    let tags = h.hypervisor.tags_of(&h.machines()[0]);
+    assert!(tags.contains("expires-"), "must still be collectable: {tags:?}");
+
+    let _ = std::fs::remove_file(h.dir.join("ssh.refuse-times"));
+    h.ok(&["down"]);
+    assert!(h.machines().is_empty());
 }

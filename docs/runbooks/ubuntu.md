@@ -77,23 +77,36 @@ Let it finish, then reboot and log in at the console.
 ```sh
 sudo apt-get update
 sudo apt-get install --no-install-recommends -y \
-    zfsutils-linux podman nftables qemu-guest-agent rsync
+    zfsutils-linux podman qemu-guest-agent rsync \
+    nftables aardvark-dns catatonit
 ```
 
-Five packages, and each is in the guest contract for a reason: ZFS is the
-rollback mechanism, podman runs the toolchains, the guest agent is how the
-address is discovered, and rsync is how a working tree gets in and results get
-out.
+The first four are the guest contract: ZFS is the rollback mechanism, podman
+runs the toolchains, the guest agent is how the address is discovered, and rsync
+is how a working tree gets in and results get out.
 
-**`nftables` is the one this runbook originally missed**, and it is worth
-knowing why. `--no-install-recommends` is right -- it is what keeps a template
-from acquiring a package set nobody chose -- but podman only *recommends* the
-packet-filter tooling its network backend drives. Without it podman installs,
-starts, reports itself healthy, and pulls images perfectly. It fails the first
-time anything tries to *run* a container, minutes into a build, with an error
-about a missing `nft` binary that reads like a fault in the tenant's toolchain.
+**The last three are what makes podman actually work**, and the first build of
+this template shipped without any of them. They are worth understanding rather
+than copying.
 
-The check in step 9 exists because of that, and so does the one the runner now
+`--no-install-recommends` is right: it is what keeps a template from acquiring a
+package set nobody chose. But podman *depends* on `netavark`, and netavark only
+*recommends* `nftables` and `aardvark-dns`. Both are therefore skipped, and both
+are load-bearing.
+
+| Package | Without it |
+|---|---|
+| `nftables` | **Every `podman run` fails**, even for a container that needs no network: `netavark: nftables error: unable to execute "nft"`. Installing, starting and pulling images all work perfectly first |
+| `aardvark-dns` | **Containers on a user-defined network cannot resolve each other by name.** Worse than the above, because it only *warns* -- a multi-container tenant gets silently broken DNS, and container removal errors too |
+| `catatonit` | `podman run --init` fails with `lookup init binary` |
+
+`aardvark-dns` is the one to take seriously. A missing `nft` is loud and stops
+everything; a missing DNS server produces a warning nobody reads and a stack
+that half-works. It was found only by deliberately looking for siblings of the
+first fault, which is the general lesson: these came from one line, so they were
+never going to arrive one at a time.
+
+The checks in step 9 exist because of all three, and so does the one the runner
 performs after a pre-pull.
 
 **Do not install a language toolchain.** Not a JDK, not Node, not Rust. On a
@@ -138,6 +151,21 @@ lsb_release -ds; uname -r
 
 Keep that output. It goes in the commit that registers the template, and it is
 the only thing that makes a rebuild reproducible.
+
+What the current template was built from, recorded 2026-08-13:
+
+```
+Ubuntu 26.04 LTS, kernel 7.0.0-29-generic
+aardvark-dns      1.16.0-3
+catatonit         0.2.1-2build1
+netavark          1.16.1-3.1
+nftables          1.1.6-1
+openssh-server    1:10.2p1-2ubuntu3.5
+podman            5.7.0+ds2-3build1
+qemu-guest-agent  1:10.2.1+ds-1ubuntu3.2
+rsync             3.4.1+ds1-7ubuntu0.3
+zfsutils-linux    2.4.1-1ubuntu5
+```
 
 ## 6. Clean, so the clone is not a copy of this boot
 
@@ -275,8 +303,24 @@ Do not trust the build; test it. The phase's acceptance criteria are:
    check that let a template ship unable to start a container at all. `info`
    inspects configuration; it exercises no part of the runtime or the network
    backend.
-4. **A second clone works too.** This is the one people skip. It proves the
+4. **Two containers on a user-defined network find each other by name.** This is
+   a separate claim from the one above and fails separately:
+
+   ```sh
+   podman network create t
+   podman run -d --rm --network t --name db <image> sleep 60
+   podman run --rm --network t <image> getent hosts db   # must resolve
+   podman network rm t
+   ```
+
+   Watch the output for `aardvark-dns binary not found`. It is a warning, so the
+   commands still "succeed" -- the assertion is that the name resolves, not that
+   podman exited zero.
+5. **Nothing you pulled while testing is still there.** `podman rmi -af` before
+   the clean sequence. An image left behind is baked into every clone for the
+   life of the template; the test image here was 1.7 GB on an 8 GB disk.
+6. **A second clone works too.** This is the one people skip. It proves the
    first boot did not dirty the template — if machine-id or host keys survived
    step 6, two clones will collide and you want to find that now.
-5. Note how long the clone took. That number decides whether the storage
+7. Note how long the clone took. That number decides whether the storage
    fallback in the original plan is needed, so it belongs in the README.

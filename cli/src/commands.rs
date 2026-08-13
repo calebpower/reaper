@@ -195,12 +195,12 @@ pub fn up(
 
         provider.start(&machine)?;
 
-        match wait_for_address(provider.as_ref(), &machine, cfg.session.ready_grace)? {
-            Some(address) => {
-                // A machine with an address is not yet a machine anyone can
-                // use: it has no pool. Firstboot is what makes it a session,
-                // so it happens before the session is called ready.
-                let ssh = prepare(&cfg, &name, address)?;
+        match wait_until_reachable(provider.as_ref(), &machine, &cfg, &name)? {
+            Some((address, ssh)) => {
+                // A machine we can reach is not yet a machine anyone can use:
+                // it has no pool. Firstboot is what makes it a session, so it
+                // happens before the session is called ready.
+                prepare(&name, &ssh)?;
                 prepull(&ssh, &name, &declared_images(g));
 
                 let ready_at = SystemTime::now();
@@ -221,7 +221,7 @@ pub fn up(
                 // The machine exists and carries its grace expiry, so nothing
                 // is leaked whatever happens next.
                 println!(
-                    "{name}: created, but it has not reported an address within {}. \
+                    "{name}: created, but nothing answered on it within {}. \
                      It is tagged to expire; `reaper list` will show it, and \
                      `reaper down {name}` will remove it.",
                     duration::format(cfg.session.ready_grace)
@@ -233,15 +233,50 @@ pub fn up(
     Ok(())
 }
 
-fn wait_for_address(
+/// Wait until the machine has an address that actually answers.
+///
+/// Having an address and being reachable at it are different claims, and this
+/// used to make only the first. A dual-stacked guest configures IPv6 by
+/// autoconfiguration in a second or two and takes several more to get a DHCP
+/// lease, so the first address it reports is often a v6 one -- and if the path
+/// from here carries no v6, every later step fails with `No route to host` on a
+/// machine that was working perfectly.
+///
+/// So the address is re-asked for on every attempt rather than fixed on the
+/// first sighting, and the test is a real connection over the real transport.
+/// Not a TCP probe of port 22: the transport is configurable, nothing else here
+/// assumes a port, and "the daemon is listening" is a weaker claim than "a
+/// command ran" in any case.
+fn wait_until_reachable(
     provider: &dyn Provider,
     machine: &MachineRef,
-    limit: Duration,
-) -> Result<Option<std::net::IpAddr>> {
-    let deadline = SystemTime::now() + limit;
+    cfg: &Config,
+    session: &str,
+) -> Result<Option<(std::net::IpAddr, Ssh)>> {
+    // Cleared once, here. A session starts with no history, so it cannot
+    // inherit a stale key from an address that has been recycled -- and the
+    // loop below may legitimately try more than one address for one machine.
+    let _ = std::fs::remove_file(state_file(session, "known-hosts")?);
+
+    let deadline = SystemTime::now() + cfg.session.ready_grace;
+    let mut said: Option<String> = None;
+
     loop {
-        if let Some(addr) = provider.address(machine)? {
-            return Ok(Some(addr));
+        if let Some(address) = provider.address(machine)? {
+            let ssh = ssh_to(cfg, session, address)?;
+            match ssh.run("true", "reaching the machine") {
+                Ok(_) => return Ok(Some((address, ssh))),
+                Err(e) => {
+                    // Said once per distinct reason. A machine that is still
+                    // booting produces the same refusal every three seconds,
+                    // and repeating it would bury anything else.
+                    let note = format!("{address}: {e}");
+                    if said.as_deref() != Some(&note) {
+                        println!("{session}: waiting -- {note}");
+                        said = Some(note);
+                    }
+                }
+            }
         }
         if SystemTime::now() >= deadline {
             return Ok(None);
@@ -335,17 +370,11 @@ fn workspace(ssh: &Ssh, project: &str) -> Result<(String, String)> {
 }
 
 /// Deliver the runner and build the session's storage.
-fn prepare(cfg: &Config, session: &str, address: std::net::IpAddr) -> Result<Ssh> {
-    let known_hosts = state_file(session, "known-hosts")?;
-    // A session starts with no history, so it cannot inherit a stale key from
-    // an address that has been recycled.
-    let _ = std::fs::remove_file(&known_hosts);
-
-    let ssh = ssh_to(cfg, session, address)?;
+fn prepare(session: &str, ssh: &Ssh) -> Result<()> {
     println!("{session}: preparing storage on {}", ssh.describe());
-    deliver_runner(&ssh)?;
+    deliver_runner(ssh)?;
     ssh.run(&format!("{RUNNER_PATH} firstboot"), "firstboot")?;
-    Ok(ssh)
+    Ok(())
 }
 
 fn start_heartbeat(session: &str) -> Result<Option<u32>> {

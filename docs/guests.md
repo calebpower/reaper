@@ -36,6 +36,15 @@ password. Templates may still carry an ordinary user for console debugging.
 **A discoverable address.** The provider must be able to learn it without DNS or
 mDNS -- a guest agent is the usual mechanism.
 
+Note what a *reported* address is and is not. A dual-stacked guest configures
+IPv6 by autoconfiguration within a second or two and takes several more to get a
+DHCP lease, so the first address it reports is often one the workstation has no
+route to. reaper therefore waits until something actually answers over the
+transport rather than until an address exists, and re-asks on every attempt
+instead of fixing on the first sighting. A template does not have to do anything
+about this; it is written down because "it has an address" reads like
+"it is reachable" and is not the same claim.
+
 **`rsync`**, which is how a working tree gets in and results get out.
 
 **A container engine**, if and only if the template is intended for

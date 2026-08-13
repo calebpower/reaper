@@ -12,7 +12,7 @@ Last updated: 2026-08-13.
 |---|---|---|
 | **0** | Repo bootstrap: docs, manifest schema, seam guards, sweeper | **Complete.** Sweeper imported, hardened, self-tested, and dry-run against the live API |
 | 1 | Provider seam + session core (`up`/`list`/`renew`/`down`) | **Accepted live.** up, list, renew and down all run against the real cluster |
-| 2 | Guest templates + the runner | **Ubuntu proven, and now known to need one more package.** FreeBSD unresolved and unregistered |
+| 2 | Guest templates + the runner | **Ubuntu rebuilt and proven.** FreeBSD unresolved and unregistered |
 | 3 | Sync, build, execution | **Accepted live.** sync, build and run against the real cluster, results flowing continuously |
 | 4 | `reset` and the `@pristine` snapshot | Not started |
 | 5 | Tenant onboarding | Not started |
@@ -88,7 +88,7 @@ only the boot disk is copied, and never the session's 64 GiB of storage.
 
 | Name | Template | Execution | Notes |
 |---|---|---|---|
-| `ubuntu-26.04` | 9001 | `container` | ZFS, podman, rsync, guest agent. No language toolchains. **Missing `nftables`, so container execution does not work until the template is rebuilt** |
+| `ubuntu-26.04` | 9001 | `container` | ZFS, podman, rsync, guest agent. No language toolchains. Rebuilt 2026-08-13 to add the three packages podman needs to work |
 | `freebsd-15.1` | 9000 | `host` | ZFS in base, rsync, guest agent. No container engine, and none wanted -- the engine here runs only foreign-format images under emulation |
 
 The FreeBSD template ships a C compiler because FreeBSD base includes one. It
@@ -159,16 +159,16 @@ recorded and worth recording again rather than assuming it was learned.
 | Found | Why nothing offline saw it |
 |---|---|
 | The engine can pull images but cannot start one -- no `nftables` | Nothing offline runs a container, and `podman info` does not either |
+| Containers cannot resolve each other by name -- no `aardvark-dns` | As above, and it only *warns*, so nothing fails loudly enough to notice |
+| An address a machine reports is not an address anything can reach | Both ends of an offline test are the same machine, and the stand-in has one address |
 | Determinism mode broke every command that named a cache | The stand-in never expanded a variable |
 | rsync carried uids across machines with no shared user database | Both ends of an offline test are the same machine |
 | `manifest/test` ignored `CARGO_TARGET_DIR`, which a session always sets | Nothing here redirects the build output |
 | `mktemp -d -t <name>` is a prefix on one system and a template on another | The suites had only ever run on one of them |
 
-The first is a template defect and is **not fixed**: template 9001 needs
-`nftables` and a rebuild, which is the sysadmin's to do. Until it is, a session
-on `ubuntu-26.04` can build and run only under host execution; container
-execution works in a session only after the package is installed by hand, which
-is how the rest of Phase 3's acceptance was completed.
+The first two are template defects and were fixed by **rebuilding template 9001**
+on 2026-08-13, with Cal's explicit authorisation to replace it in place. See
+below.
 
 The second is worth stating as a rule rather than a bug. `warm_cache: false`
 means *the cache is not warm*. It never meant "the tenant's command must be
@@ -195,6 +195,34 @@ day of it.
 | Reverse sync | Never `--delete`. The guest is authoritative for what it produced, not for what was in the operator's results directory beforehand |
 | `.git` | Synced by default. Never needing a commit is the point, and deltas make it cheap after the first |
 | Pre-fetch failure | Warns, never fatal. The engine would fetch on demand anyway, and a registry blip must not cost a machine that took two minutes to clone |
+
+### Rebuilding a template through the API alone
+
+The Ubuntu template was rebuilt on 2026-08-13 without touching the web
+interface, which settles a question the Phase 1 plan left open: the harness
+token can do it. `VM.Allocate` and `VM.Config.Options` come with the pool grant,
+and `POST /nodes/{node}/qemu/{id}/template` accepts them by inheritance -- the
+permissions endpoint reports `/vms/9001` with an empty *direct* set, so this had
+to be established by doing it rather than by reading.
+
+The sequence, which is the one to repeat:
+
+1. Clone the template to a spare identifier. Reads the original, writes nothing
+   to it. **Leave the clone untagged** -- an untagged machine in the pool is
+   reported by the sweeper and never destroyed, which is the correct state for
+   work in progress. A tagged one gets collected while you are asleep, which has
+   happened here once already.
+2. Clear the protection the clone inherited, start it, do the work.
+3. `podman rmi -af` before sealing. A test image left behind is baked into every
+   clone for the life of the template; the one here was 1.7 GB on an 8 GB disk.
+4. Runbook step 6d, then a **hard** stop from the hypervisor.
+5. Convert, then prove it with two clones before believing it -- distinct
+   machine-ids and distinct host keys, or the template is carrying an identity.
+6. Only then replace the original.
+
+Doing it in that order meant the original template still existed at every point
+up to the last one, which is the only reason replacing it in place was a
+reasonable thing to agree to.
 
 ### An extra privilege PVE 9 requires
 
@@ -267,13 +295,7 @@ there is something reaper put there.
 
 ### What is blocked
 
-**The templates themselves.** Not blocked by anything reaper owns -- they are
-built in the web interface, which needs no token. `docs/runbooks/` is the
-deliverable; follow it and record what you actually built.
-
-**Container execution on `ubuntu-26.04`**, until template 9001 is rebuilt with
-`nftables`. Everything else works on it; a container simply cannot start. Host
-execution is unaffected and was exercised live.
+**The FreeBSD template.** Not blocked by anything reaper owns. See above.
 
 **The sweeper's live dry run**, from this workstation. Its credential file lives
 on the sweeper's own VM, which is deliberately not a deploy target for anything
