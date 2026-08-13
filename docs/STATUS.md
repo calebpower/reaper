@@ -14,7 +14,7 @@ Last updated: 2026-08-13.
 | 1 | Provider seam + session core (`up`/`list`/`renew`/`down`) | **Accepted live.** up, list, renew and down all run against the real cluster |
 | 2 | Guest templates + the runner | **Complete.** Both guests rebuilt, registered and proven live |
 | 3 | Sync, build, execution | **Accepted live.** sync, build and run against the real cluster, results flowing continuously |
-| 4 | `reset` and the `@pristine` snapshot | Not started |
+| 4 | `reset` and the `@pristine` snapshot | **Accepted live.** Reset, named checkpoints, and an in-guest trigger a container can call |
 | 5 | Tenant onboarding | Not started |
 | 6 | Hardening, `doctor`, third-tenant proof | Not started |
 
@@ -258,6 +258,70 @@ reaper became its own tenant and tried to run them somewhere that was not this
 workstation. That is the whole argument for dogfooding, arriving on the first
 day of it.
 
+### Phase 4, and the number that justifies the whole design
+
+`reset` rolls tenant state back in **2.9 seconds** -- and the same 2.9 seconds
+whether there is 104 KB of state or 801 MB, because ZFS discards blocks rather
+than rewriting them. The cost is two SSH round trips, not the data. That is the
+argument for this design over rebuilding a stack per test, and it is now
+measured rather than asserted.
+
+Proven live, with a tenant that accumulates state:
+
+| | |
+|---|---|
+| `@pristine` | taken automatically after the first successful run |
+| Rollback | rows written after the snapshot gone, earlier ones back, exactly |
+| `tank/work`, `tank/cache` | byte-identical across a reset |
+| `tank/images` | image still present, no re-pull; only the engine's own bookkeeping moves |
+| Idempotence | two consecutive resets leave the same state |
+| Named checkpoints | `snapshot mid` -> change -> `reset --to mid` returns to `mid` |
+| Stop-first | a live container is stopped (SIGTERM, SIGKILL after 10s) and the rollback proceeds |
+| The in-guest trigger | a container called `$REAPER_CONTROL/reset`, the reset happened, **and the container survived to keep working** |
+
+### Three things Phase 4 got wrong before it got them right
+
+**A safety promise that was not kept.** `docs/tenants.md` said reset "never
+rolls the filesystem out from under a running process", on the assumption that
+ZFS refuses a rollback on a busy dataset. It does not. Measured on a live guest
+with a descriptor verifiably open inside the dataset -- `/proc/<pid>/fd/6 ->
+/tank/state/db/held` -- `zfs rollback -r` succeeded, the file vanished, and the
+holder carried on reading an inode with no name. The runner now looks for
+holders itself and refuses, naming them; a process holding an *already unlinked*
+file is the one exception, since a rollback cannot reach it and counting it
+would let one leaked process veto every reset for the session's life.
+
+**A root-executed script inside a container-writable mount.** The control loop's
+copy of the runner was placed in the directory bind-mounted into containers. Any
+toolchain image could have replaced it and had root on the guest -- and from
+there the results channel runs back to the workstation. Caught by the automated
+security review of the commit, and the galling part is that the job script two
+functions away is mounted read-only with a comment saying exactly why. The
+control directory is now split: what the host executes lives outside anything
+mounted, mode 0700, and containers see a writable queue and a read-only wrapper.
+The same review caught the caller id, which arrives from inside a container and
+is used as a shell pattern -- `*` would have spared every container and left the
+rollback running against a live stack.
+
+**A disk that was never used, and was not blank.** The first session after some
+volumes were destroyed failed with "corrupt primary EFI label" on a freshly
+created 64 GiB disk. The storage recycles space without zeroing it, so a *backup*
+partition-table header survived in the final sector of a volume deleted long ago
+-- invisible to every check the runner makes, and fatal to `zpool create`. The
+answer was not `-f`: the runner now zeroes the first and last mebibyte of a disk
+it has already accepted as unused, and lets ZFS check again with its veto
+intact.
+
+### Phase 4 decisions
+
+| Question | Answer |
+|---|---|
+| When `@pristine` is taken | After the first successful run, never after a failed one. It captures post-run state, which is said plainly at the time, and `reaper snapshot` names an earlier point |
+| Where state lives | `tank/state`, reachable as `REAPER_STATE` in both execution modes. It was created by firstboot and exposed to nothing at all until now |
+| The in-guest trigger | Request files and rename, not a socket or FIFO -- neither template ships netcat, and a FIFO handshake in shell is delicate about who opens what and when |
+| Named checkpoints | Shipped. `snapshot <name>` and `reset --to <name>`, which is what makes checkpoint-and-replay shrinking possible |
+| What may be rolled back | `state`, and only `state` -- enforced in the schema and again in the runner |
+
 ### Phase 3 decisions
 
 | Question | Answer |
@@ -408,8 +472,8 @@ Each is deliberately deferred to the phase that first needs it, per
 |---|---|
 | Heartbeat cadence and per-profile TTL defaults (strawman: renew every 10 min to now+2h for dev) | Phase 1 |
 | Whether `resources.cores`/`ram_gb` apply at clone time or are fixed per template | Phase 1 or 2 |
+| ~~`reset --to <name>` and `snapshot <name>` in v1~~ | **Shipped in Phase 4.** Cheap once rollback works, and what makes checkpoint-and-replay shrinking possible |
 | ~~Registry strategy for image pulls~~ | **Decided in Phase 3: direct.** A 912 MB image pulled inside a two-minute `up`, so availability is the only thing a LAN cache would buy and digest pinning already rules out getting the wrong bytes. Revisit when a registry outage first stings |
-| `reset --to <name>` and `snapshot <name>` in v1, or deferred | Phase 4 |
 | Storage fallback if full-copy clone latency proves intolerable | **Not needed.** `up` measured at 1m56s; see the numbers above, and the unexplained gap from Phase 1's 9m20s |
 
 ## Environment facts

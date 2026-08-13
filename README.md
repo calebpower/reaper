@@ -12,10 +12,10 @@ The purpose is the tight `edit -> test` cycle *before* commit and push. It is
 deliberately **not** a CI platform. CI remains the independent re-proof after
 you push, and nothing here replaces it.
 
-> **Status: Phase 3.** A session can be brought up, listed, renewed and taken
-> down; a guest template exists and is proven; and a working tree can be synced
-> in, built, run, and its results collected back out. `reset` and the
-> `@pristine` snapshot are Phase 4. See [`docs/STATUS.md`](docs/STATUS.md) for
+> **Status: Phase 4.** A session can be brought up, listed, renewed and taken
+> down; two guest templates exist and are proven; a working tree can be synced
+> in, built, run, and its results collected back out; and tenant state rolls
+> back in under three seconds. See [`docs/STATUS.md`](docs/STATUS.md) for
 > where the work actually stands, which is the document to trust over this one
 > when they disagree.
 
@@ -139,11 +139,12 @@ reaper up      # a machine of your own, with your images already fetched
 reaper sync    # your uncommitted tree in, results back out
 reaper build   # your build command, in your pinned toolchain
 reaper run     # your run command; traces arrive while it runs
+reaper reset   # your state back to pristine, in seconds
 reaper down    # gone, and gone anyway if you vanish
 ```
 
-`reset` is Phase 4, and `reaper test` -- sync, build, reset, run as one verb --
-arrives with it. See [`docs/STATUS.md`](docs/STATUS.md).
+`reaper test` -- sync, build, reset and run as one verb -- is Phase 5, with the
+first real tenant. See [`docs/STATUS.md`](docs/STATUS.md).
 
 This repository is its own first tenant: the `.reaper.yaml` at the root is real,
 and `reaper run` here runs reaper's whole battery inside a session.

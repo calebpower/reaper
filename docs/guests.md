@@ -122,6 +122,23 @@ gets chosen never varies.
 
 If the pool already exists and is healthy, firstboot does nothing and succeeds.
 
+## Residue on a disk that was never used
+
+A provider hands out volumes on storage that recycles space without zeroing it,
+so a disk created seconds ago can carry a **backup partition-table header in its
+final sector** from a volume deleted long ago. Nothing above sees it: the first
+sectors are blank, there are no partitions, no filesystem and no mount. Then
+`zpool create` finds a backup label with no primary and refuses the disk as
+having a corrupt one. This happened on the first session that ran after some
+volumes were destroyed, and it is not rare.
+
+The answer is **not** `zpool create -f`. That would tell ZFS to ignore whatever
+it finds, whatever it is, and the second opinion is worth keeping. Instead the
+runner zeroes the first and last mebibyte of the disk it has *already accepted*
+as unused -- removing residue the rules above have established is not data --
+and then lets `zpool create` check again, veto intact. If it still objects after
+that, the refusal stands.
+
 ## Host keys, and what is being trusted
 
 A freshly cloned machine has a host key nothing has ever seen, so strict
@@ -163,6 +180,7 @@ The runner makes two more layers, on demand rather than up front:
 | `tank/work/<project>` | one project's synced tree |
 | `tank/work/<project>/out` | where that project's results are collected from |
 | `tank/cache/<name>` | one directory per cache the tenant declared |
+| `tank/control/<project>` | the reset trigger: a loop, its runner copy, and a queue |
 
 Directories rather than datasets, deliberately. A dataset per cache would buy
 per-cache `zfs list` figures and nothing else, since `reset` never touches
@@ -177,11 +195,21 @@ existed, and that failure reads as though results had been lost.
 Under container execution the runner mounts three things, at paths that are
 fixed and documented rather than configurable:
 
-| Inside | From |
-|---|---|
-| `/reaper/work` | `tank/work/<project>` |
-| `/reaper/cache/<name>` | `tank/cache/<name>` |
-| `/reaper/job.sh` | the rendered job, read-only |
+| Inside | From | |
+|---|---|---|
+| `/reaper/work` | `tank/work/<project>` | |
+| `/reaper/state` | `tank/state` | the only thing `reset` rolls back |
+| `/reaper/cache/<name>` | `tank/cache/<name>` | |
+| `/reaper/control/io` | `tank/control/<project>/io` | the reset trigger's request queue |
+| `/reaper/control/reset` | the wrapper | **read-only** |
+| `/reaper/job.sh` | the rendered job | **read-only** |
+
+The two read-only entries are a boundary rather than tidiness. Anything a
+container can write, a container can replace -- so nothing the *guest* executes
+may live where a container can reach it. The control directory is split for
+exactly this reason: the loop's own copy of the runner, which runs as root, sits
+outside everything mounted and is mode 0700, while containers see only a
+writable queue and a wrapper they cannot rewrite.
 
 Fixed because these paths reach a tenant's environment as `REAPER_WORK` and
 `REAPER_CACHE_*`, and a site that moved them would quietly break every manifest

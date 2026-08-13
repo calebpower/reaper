@@ -195,7 +195,12 @@ which one they got:
 |---|---|
 | `REAPER_WORK` | your tree |
 | `REAPER_OUT` | where results are collected from |
+| `REAPER_STATE` | your state -- the only thing `reset` rolls back |
+| `REAPER_CONTROL` | where the reset trigger lives |
 | `REAPER_CACHE_<NAME>` | one per name in `build.cache`, uppercased, `-` and `.` becoming `_` |
+
+Put anything you want `reset` to undo under `REAPER_STATE`, and nothing else
+there. A database's data directory belongs in it; your build output does not.
 
 Your `cmd` is handed to a shell, so it may use those:
 
@@ -224,17 +229,85 @@ thing.
 
 ## What `reset` actually does
 
-1. Stop your stack.
-2. `zfs rollback` each dataset you named under `reset.datasets`.
-3. Exit. The next `run` restarts your stack.
+```sh
+reaper reset                       # back to pristine
+reaper snapshot before-the-change  # name a point
+reaper reset --to before-the-change
+```
+
+1. Stop your containers.
+2. Refuse if anything still has the dataset open.
+3. `zfs rollback` each dataset you named under `reset.datasets`.
+4. Exit. The next `run` restarts your stack.
 
 Restarting rather than resuming is deliberate: a long-lived process holding
 credentials, sessions or caches from *before* the rollback must never survive
 it. If your stack replays migrations on boot, that replay is part of what you
 are testing, and you want it.
 
-`reset` refuses to roll back underneath a live stack. It stops first, or it
-fails -- it never rolls the filesystem out from under a running process.
+**Step 2 is done here rather than left to ZFS**, and that is worth knowing
+because the opposite was assumed while building this. ZFS does *not* refuse a
+rollback on a dataset with open files: measured on a live guest, with a
+descriptor verifiably open on a file inside the dataset, `zfs rollback`
+succeeded, the file vanished, and the holder carried on reading an inode that
+no longer had a name. So reset looks for holders itself and refuses, naming
+them. A process holding a file that is *already* unlinked is the one exception:
+a rollback cannot reach it, and counting it would let one leaked process veto
+every reset for the life of the session.
+
+### How long it takes
+
+**Under three seconds**, and -- the part that matters -- the same three seconds
+whether there is 100 KB of state or 800 MB. Measured on a live session:
+
+| State rolled back | Wall time |
+|---|---|
+| 104 KB | 2.9s |
+| 801 MB | 2.9s |
+
+ZFS discards blocks rather than rewriting them, so the cost is in the two SSH
+round trips and not in your data. That is the whole argument for this design
+over rebuilding a stack per test.
+
+### `@pristine`, and when it is taken
+
+A session takes `@pristine` automatically after its **first successful run**,
+and never after a failed one -- a pristine that returns you to a broken state
+is worse than having none.
+
+Be clear about what that captures: the state after the *whole* run, test
+residue included, not the state right after your stack came up. Nothing here
+can tell those apart, because your `run.cmd` is opaque and "the stack is up
+now" is your vocabulary rather than the framework's. If you want a tighter
+point, call `reaper snapshot <name>` at the moment you choose and reset to that
+instead.
+
+Rolling back to a snapshot discards snapshots taken after it, named ones
+included. That is ZFS's behaviour rather than a choice made here.
+
+## Resetting from inside your own stack
+
+A driver container that runs journeys usually wants to reset *between* passes,
+without knowing that ZFS exists or being able to run commands on the guest. So
+the guest listens:
+
+```sh
+"$REAPER_CONTROL/reset"            # blocks until the rollback is done
+"$REAPER_CONTROL/reset" some-name  # or to a named point
+```
+
+`REAPER_CONTROL` is set for you, and under container execution it is mounted.
+Mount it into your own containers if they need it.
+
+**The caller survives.** Stopping the container that asked for the reset would
+look exactly like the reset having crashed, so it is spared -- identified by
+its hostname, which a container engine sets to the container's id.
+
+Two things to know. Only one request is served at a time, and the wrapper gives
+up after five minutes rather than waiting forever on a guest that has stopped
+listening. And anything that can reach that directory can trigger a rollback of
+your state: inside a single-tenant disposable machine that is the point, but it
+is worth knowing rather than discovering.
 
 ## What belongs in a session, and what does not
 

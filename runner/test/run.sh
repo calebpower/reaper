@@ -36,7 +36,8 @@ WORK=""
 # which engine, which snapshot exists -- not so it second-guesses `cp`. These
 # are ordinary file utilities whose behaviour nothing here asserts.
 REAL_TOOLS="awk sed grep tr sort cat mkdir rm chmod cut head wc printf ln env sh
-            basename dirname cp mv ls sleep nohup hostname date touch"
+            basename dirname cp mv ls sleep nohup hostname date touch tail
+            readlink"
 
 new_case() {
     CASE="$1"
@@ -45,13 +46,22 @@ new_case() {
     # end in X's, and there it fails outright. A full template works on both,
     # and this suite has to run on the systems it tests.
     WORK=$(mktemp -d "${TMPDIR:-/tmp}/reaper-runner.XXXXXXXX")
-    mkdir -p "${WORK}/bin" "${WORK}/fix" "${WORK}/sysroot" "${WORK}/pool"
+    mkdir -p "${WORK}/bin" "${WORK}/fix" "${WORK}/sysroot" "${WORK}/pool" "${WORK}/proc"
     : > "${WORK}/log"
 
     for t in ${REAL_TOOLS}; do
         p=$(command -v "${t}" 2>/dev/null) || continue
         ln -sf "${p}" "${WORK}/bin/${t}"
     done
+
+    # A plausible disk size by default, so every firstboot case need not
+    # restate one. 64 GiB, which is the site default for a session's pool.
+    printf '68719476736\n' > "${WORK}/fix/disk_bytes"
+    # An empty directory nothing is holding open, so a rollback case has to opt
+    # in to being blocked rather than tripping over the suite's own files.
+    mkdir -p "${WORK}/idle"
+    printf '%s\n' "${WORK}/idle" > "${WORK}/fix/zfs_mountpoint"
+    printf 'somedisk 512 68719476736 134217728\n' > "${WORK}/fix/diskinfo"
 
     cat > "${WORK}/bin/_stub" <<'STUB'
 #!/bin/sh
@@ -95,6 +105,14 @@ fstyp)
     rc "fstyp_${arg##*/}.rc" 1 ;;
 mount)
     fix mount ;;
+dd)
+    # Recorded and refused. A suite that really ran dd against a device would
+    # be one keystroke from destroying the machine running it.
+    exit 0 ;;
+blockdev)
+    fix disk_bytes ;;
+diskinfo)
+    fix diskinfo ;;
 zpool)
     case "$1" in
         list)
@@ -109,6 +127,7 @@ zpool)
 zfs)
     case "$1" in
         snapshot|rollback) exit 0 ;;
+        get) fix zfs_mountpoint ;;
         list)
             # `zfs list -t snapshot` asks whether a named snapshot exists; the
             # fixture decides, so a test can model both answers.
@@ -143,7 +162,7 @@ esac
 exit 0
 STUB
     chmod +x "${WORK}/bin/_stub"
-    for t in uname lsblk sysctl gpart fstyp mount zpool zfs; do
+    for t in uname lsblk sysctl gpart fstyp mount zpool zfs blockdev diskinfo dd; do
         ln -sf "${WORK}/bin/_stub" "${WORK}/bin/${t}"
     done
 }
@@ -161,6 +180,7 @@ run_runner() {
       FAKE_PLATFORM="${FAKE_PLATFORM:-Linux}" \
       REAPER_SYSROOT="${WORK}/sysroot" \
       REAPER_POOL_MOUNT="${WORK}/pool" \
+      REAPER_PROC="${WORK}/proc" \
       "${runner}" "$@" ) > "${WORK}/out" 2> "${WORK}/err" || run_rc=$?
     printf '%s\n' "${run_rc}" > "${WORK}/status"
     return "${run_rc}"
@@ -231,6 +251,13 @@ printf 'vdb\n'        > "${WORK}/fix/lsblk_vdb_NAME"
 fixture_rc pool_exists.rc 1
 with_engine
 if run_runner firstboot; then :; else bad "firstboot should have succeeded"; fi
+# Residue is cleared at both ends before the pool is made. A provider hands out
+# recycled space, so a backup partition-table header can outlive the volume it
+# belonged to and nothing but zpool will see it.
+log_has 'dd if=/dev/zero of=/dev/vdb bs=1048576 count=1 conv=notrunc'
+log_has 'dd if=/dev/zero of=/dev/vdb bs=1048576 count=1 seek=65535 conv=notrunc'
+# And zpool keeps its veto: no -f anywhere.
+log_lacks 'zpool create -f'
 log_has 'zpool create .* vdb'
 log_lacks 'zpool create .* vda'
 log_has 'zfs create tank/images'
@@ -668,6 +695,63 @@ log_has 'podman stop aaa111'
 # Stopping the caller would look exactly like the reset having crashed.
 log_lacks 'podman stop bbb222'
 log_has 'zfs rollback'
+
+new_case "a live process on the dataset stops the rollback, whatever ZFS would allow"
+FAKE_PLATFORM=Linux
+with_engine
+printf 'tank/state@pristine\n' > "${WORK}/fix/zfs_snapshots"
+: > "${WORK}/fix/running_containers"
+# The mountpoint is a scratch directory, and process 4242 holds a descriptor
+# onto a file inside it -- exactly the shape /proc gives for a tenant that
+# daemonised something.
+mkdir -p "${WORK}/held" "${WORK}/proc/4242/fd"
+printf '%s\n' "${WORK}/held" > "${WORK}/fix/zfs_mountpoint"
+: > "${WORK}/held/file"
+ln -sf "${WORK}/held/file" "${WORK}/proc/4242/fd/6"
+# And one holding a file that is already unlinked, which must NOT block: it is
+# reading an inode a rollback cannot reach, and counting it would let a single
+# leaked process veto every reset for the life of the session.
+mkdir -p "${WORK}/proc/4243/fd"
+ln -sf "${WORK}/held/gone (deleted)" "${WORK}/proc/4243/fd/6"
+if run_runner rollback --dataset state --name pristine; then
+    bad "should have refused while a process held the dataset"
+else
+    ok "refused"
+fi
+errsays 'have files open'
+# Named, so an operator can go and look. And the deleted-file holder is not
+# among them.
+errsays '4242'
+if grep -q '4243' "${WORK}/err"; then bad "a deleted-file holder must not block"; else ok "deleted-file holder ignored"; fi
+# ZFS itself would have gone ahead: this was tested on a live guest, and the
+# holder was left reading data that no longer existed. So the refusal has to
+# happen before the call, not be hoped for from it.
+log_lacks 'zfs rollback'
+
+new_case "a process merely sitting in the dataset blocks it too"
+FAKE_PLATFORM=Linux
+with_engine
+printf 'tank/state@pristine\n' > "${WORK}/fix/zfs_snapshots"
+: > "${WORK}/fix/running_containers"
+# No open descriptor at all -- just a working directory inside the dataset,
+# which is every bit as much a live view of it.
+mkdir -p "${WORK}/held" "${WORK}/proc/4244"
+printf '%s\n' "${WORK}/held" > "${WORK}/fix/zfs_mountpoint"
+ln -sf "${WORK}/held" "${WORK}/proc/4244/cwd"
+if run_runner rollback --dataset state --name pristine; then bad "should have refused"; else ok "refused"; fi
+errsays '4244'
+log_lacks 'zfs rollback'
+
+new_case "a process holding only an unlinked file does not block a rollback"
+FAKE_PLATFORM=Linux
+with_engine
+printf 'tank/state@pristine\n' > "${WORK}/fix/zfs_snapshots"
+: > "${WORK}/fix/running_containers"
+mkdir -p "${WORK}/held" "${WORK}/proc/4243/fd"
+printf '%s\n' "${WORK}/held" > "${WORK}/fix/zfs_mountpoint"
+ln -sf "${WORK}/held/gone (deleted)" "${WORK}/proc/4243/fd/6"
+if run_runner rollback --dataset state --name pristine; then ok "rolled back"; else bad "should not have been blocked"; fi
+log_has 'zfs rollback -r tank/state@pristine'
 
 new_case "the caller is spared whether it names itself long or short"
 FAKE_PLATFORM=Linux

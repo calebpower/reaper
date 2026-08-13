@@ -49,6 +49,12 @@ ARC_MAX_MB="${REAPER_ARC_MAX_MB:-1536}"
 # machine running it.
 SYSROOT="${REAPER_SYSROOT:-}"
 
+# Where process information lives. Overridable for the same reason as SYSROOT
+# and POOL_MOUNT: this suite runs on one platform while exercising another's
+# code path, and a function that reads the real /proc cannot be tested at all
+# from a system that has none.
+PROC="${REAPER_PROC:-/proc}"
+
 # The datasets from the guest contract. images, cache and work are never rolled
 # back; state is the only rollback target, which is the whole reason they are
 # separate.
@@ -203,6 +209,55 @@ select_disk() {
     printf '%s\n' "${select_found}"
 }
 
+# Zero the first and last mebibyte of a disk that selection has already
+# accepted.
+#
+# Not the same thing as `zpool create -f`, and the difference matters. A
+# provider hands out volumes on storage that recycles space without zeroing it,
+# so a disk created seconds ago can carry a *backup* GPT header in its final
+# sector from a volume deleted long ago. Nothing sees it: the first sectors are
+# blank, lsblk reports no partitions, no filesystem and no mount -- and then
+# zpool finds a backup label with no primary and refuses the disk as having "a
+# corrupt primary EFI label".
+#
+# `-f` would answer that by telling zpool to ignore whatever it finds, whatever
+# it is. This instead removes the residue that the rules above have *already*
+# established is not data, and then lets zpool check again from a clean slate
+# with its veto intact. If it still objects after this, that refusal stands.
+#
+# First and last, because that is where a partition table keeps its two copies;
+# a mebibyte because filesystem superblocks live near the front.
+clear_residue() {
+    announce "zero the first and last MiB of $1, which selection has accepted as unused"
+
+    dd if=/dev/zero of="/dev/$1" bs=1048576 count=1 conv=notrunc 2>/dev/null \
+        || die "could not clear the start of $1"
+
+    # Seek in mebibytes to the last one. A disk whose size cannot be read is a
+    # disk to leave alone rather than guess at.
+    clear_mib=$(disk_mib "$1") || die "could not size $1"
+    if [ "${clear_mib}" -gt 1 ]; then
+        dd if=/dev/zero of="/dev/$1" bs=1048576 count=1 \
+            seek=$((clear_mib - 1)) conv=notrunc 2>/dev/null \
+            || die "could not clear the end of $1"
+    fi
+}
+
+# A disk's size in whole mebibytes.
+disk_mib() {
+    case "$(platform)" in
+        Linux)
+            # blockdev reports bytes and is in util-linux, which is where
+            # lsblk comes from, so it is present wherever the rest of this is.
+            _bytes=$(blockdev --getsize64 "/dev/$1" 2>/dev/null) || return 1 ;;
+        FreeBSD)
+            _bytes=$(diskinfo "$1" 2>/dev/null | awk '{print $3}') || return 1 ;;
+        *) return 1 ;;
+    esac
+    [ -n "${_bytes}" ] || return 1
+    printf '%s\n' $((_bytes / 1048576))
+}
+
 # ---------------------------------------------------------------------------
 # Pool and datasets
 # ---------------------------------------------------------------------------
@@ -276,6 +331,8 @@ cmd_firstboot() {
     announce "create pool ${POOL} on ${firstboot_disk}, destroying anything on it"
     log "chosen because it is the only disk here with no partitions, no"
     log "filesystem, no mount and no pool membership"
+
+    clear_residue "${firstboot_disk}"
 
     # No -f. Without it zpool refuses a disk that still looks like it holds
     # something, which is a second opinion on the check above from code that
@@ -627,6 +684,44 @@ stop_containers() {
     done
 }
 
+# Every process holding something open under a mountpoint.
+#
+# This exists because ZFS does not refuse. It was assumed here that a rollback
+# would fail on a busy dataset and that the refusal was the guarantee; it was
+# tested on a live guest and it is not so. With a file verifiably open --
+# `/proc/<pid>/fd/6 -> /tank/state/db/held` -- `zfs rollback -r` succeeded, the
+# file vanished, and the holder carried on with a descriptor onto data that no
+# longer exists.
+#
+# So the promise in docs/tenants.md, that reset never rolls the filesystem out
+# from under a running process, has to be kept here or not at all.
+holders() {
+    case "$(platform)" in
+        Linux)
+            # Descriptors and working directories both. A process sitting in
+            # the dataset is as much a problem as one reading from it.
+            for holders_l in "${PROC}"/[0-9]*/fd/* "${PROC}"/[0-9]*/cwd; do
+                holders_t=$(readlink "${holders_l}" 2>/dev/null) || continue
+                # A descriptor onto a file that has already been unlinked is
+                # excluded, and only that. Such a process is reading an inode
+                # ZFS keeps alive until it closes; a rollback removes directory
+                # entries and cannot reach it. Counting them would mean one
+                # leaked process blocking every reset for the life of the
+                # session, which is a worse failure than the one being avoided.
+                case "${holders_t}" in
+                    *" (deleted)") continue ;;
+                esac
+                case "${holders_t}" in
+                    "$1"|"$1"/*)
+                        holders_p=${holders_l#"${PROC}"/}
+                        printf '%s\n' "${holders_p%%/*}" ;;
+                esac
+            done | sort -u ;;
+        FreeBSD)
+            fstat -f "$1" 2>/dev/null | awk 'NR > 1 { print $3 }' | sort -u ;;
+    esac
+}
+
 cmd_rollback() {
     roll_dataset=""; roll_name=""; roll_except=""
 
@@ -660,15 +755,27 @@ cmd_rollback() {
     # never survive it.
     stop_containers "${roll_except}"
 
+    # Then check, because stopping containers is not the same as the dataset
+    # being idle -- a host-execution tenant that daemonised something has
+    # nothing for the step above to stop.
+    roll_mount=$(zfs get -H -o value mountpoint "${roll_target}" 2>/dev/null)
+    if [ -n "${roll_mount}" ] && [ "${roll_mount}" != "-" ]; then
+        roll_held=$(holders "${roll_mount}")
+        if [ -n "${roll_held}" ]; then
+            die "refusing to roll ${roll_target} back: process(es) $(printf '%s' "${roll_held}" | tr '\n' ' ') still
+       have files open under ${roll_mount}. Rolling the filesystem out from
+       under a running process leaves it reading data that no longer exists,
+       which is the one outcome worse than not resetting. Stop them and try
+       again"
+        fi
+    fi
+
     # -r discards snapshots taken after this one. That is ZFS's behaviour rather
     # than a choice made here, and it is worth saying out loud because it
     # silently removes named checkpoints.
     announce "roll ${roll_target} back to @${roll_name}, discarding anything since"
     if ! zfs rollback -r "${roll_target}@${roll_name}"; then
-        die "could not roll ${roll_target} back to @${roll_name}. If it says the
-       dataset is busy, something still has files open on it -- which is the
-       refusal working: rolling the filesystem out from under a live process is
-       the one outcome worse than not resetting at all"
+        die "could not roll ${roll_target} back to @${roll_name}"
     fi
     printf 'rolled_back=%s@%s\n' "${roll_target}" "${roll_name}"
 }
