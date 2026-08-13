@@ -137,51 +137,93 @@ freebsd-version -kru; uname -a
 
 Keep that output for the commit that registers the template.
 
-## 6a. UNRESOLVED: clones of this template do not boot usefully
+## 6a. What went wrong the first time, and why it took so long
 
-**This runbook does not currently produce a working template.** It is kept
-because everything up to sealing is correct and was verified live; the failure
-is at clone time. Read this before spending an evening the way one was already
-spent.
+**The first build of this template produced clones with no ssh at all.** The
+cause is now known exactly, and it is worth reading before you seal anything,
+because the mistake is easy to repeat and invisible afterwards.
 
-### What happens
+### The finding
 
-A clone comes up and stays up -- the hypervisor reports it running -- but:
+Six zero-byte files:
 
-- with host keys removed at seal time, it has **no ssh at all**, and
-  `/var/log/messages` records `failed precmd routine for sshd` on every boot;
-- with host keys **kept** at seal time, the last attempt did not even start the
-  guest agent, so it never reported an address either.
+```
+-rw-------  1 root  wheel  0  /etc/ssh/ssh_host_ecdsa_key
+-rw-r--r--  1 root  wheel  0  /etc/ssh/ssh_host_ecdsa_key.pub
+-rw-------  1 root  wheel  0  /etc/ssh/ssh_host_ed25519_key
+                              ... and the rsa pair
+```
 
-The second is worse than the first, which suggests the boot is failing earlier
-than sshd and that host keys were never the real problem.
+FreeBSD regenerates missing host keys on every boot, which is why this runbook
+says no custom unit is needed. But look at what `/etc/rc.d/sshd` actually tests:
 
-### What was ruled out, with evidence
+```sh
+if [ -f "${keyfile}" ] ; then
+        info "$ALG host key exists."
+        return 0
+```
+
+A zero-byte file **is** `-f`. The script reports the key exists, generates
+nothing, and sshd then fails to load an empty key file. That is the
+`failed precmd routine for sshd` in the logs, on every boot, forever. No clone
+of this template could ever accept an ssh connection.
+
+### Where the empty files came from
+
+From this runbook, in the step that said to stop the machine **hard**.
+
+That instruction was carried over from the Ubuntu runbook, where it is correct
+and load-bearing: a graceful shutdown there lets systemd write its `machine-id`
+back out and undoes the clean. FreeBSD has no such behaviour, and UFS with soft
+updates is far less forgiving of losing power mid-write than a journalling
+filesystem is.
+
+The evidence is unambiguous. On the sealed image, **every file written during
+the final session is zero bytes, and nothing else on the disk is** — the host
+keys, `/boot/loader.conf`, and `/etc/rc.local`. The superblock's clean flag is
+`0`, so the filesystem was still dirty when the power went. The `sync` in the
+clean sequence was not enough: on UFS, `sync` schedules the writes and does not
+wait for the soft-update dependency chain to complete. A clean shutdown does.
+
+The cruellest detail: `/etc/rc.local` was a *previous attempt to fix this very
+symptom* — an early script calling `ssh-keygen -A`. It is in the table below as
+"did not help". It never ran, because it was truncated to nothing by the same
+power-off that caused the problem it was written to solve.
+
+### What that means for the table of refuted hypotheses
+
+Kept, because knowing what was ruled out is worth as much as the answer -- with
+one correction.
 
 | Hypothesis | Result |
 |---|---|
 | `sshd_enable` not set | Refuted -- it is `YES` |
 | Malformed `sshd_config` | Refuted -- `sshd -t` passes |
-| Entropy starvation | Refuted -- keys regenerate with `/var/db/entropy` and `/entropy` both stripped; a virtio-rng device was attached and confirmed registered on a boot that still failed |
+| Entropy starvation | Refuted -- and `/entropy` and `/var/db/entropy/saved-entropy.1` are both present and 4096 bytes on the sealed image |
 | Missing `/etc/hostid` | Refuted -- failed with `hostid` present too |
 | The attached data disk | Refuted -- a clone with only its boot disk failed identically |
-| An explicit early rc script running `ssh-keygen -A` | Did not help |
+| An explicit early rc script running `ssh-keygen -A` | **Not refuted.** The script was zero bytes and never ran |
 
-One observation never explained: key generation succeeds on a **warm reboot**
-and fails on a **cold boot**. That is the sharpest clue available and it was not
-run down.
+The second reported symptom -- "the guest agent did not start either" -- was
+wrong. A clone boots to multi-user perfectly well and the agent reports an
+address; `rc` continues past a failed `sshd` rather than stopping. What actually
+happened is that the agent's first answer often lists an IPv6 address, and the
+CLI took it and could not route to it. That was a real bug and is fixed; see
+`docs/STATUS.md`.
 
-### What to do next
+### How it was found, eventually
 
-**Watch the console during a clone's first boot.** Every failure mode here is
-invisible from outside the machine -- that is precisely why this resisted six
-hypotheses tested remotely. Twenty minutes with eyes on the boot sequence will
-almost certainly beat another evening of inference.
+Not from the console, and not by more inference. The clone's disk was attached
+to a running Linux guest as a second disk and mounted read-only, which makes the
+whole sealed image readable without booting anything: the configuration, the
+logs, the file sizes, and the superblock's own clean flag.
 
-Until then `freebsd-15.1` is unregistered in the site configuration, so nothing
-can accidentally depend on it.
+That technique is worth remembering. It costs one running guest, needs no
+console and no extra privilege, and it answers "what did the template actually
+seal?" directly rather than by deduction. `mount -t ufs -o ro,ufstype=ufs2`.
+Note that Linux cannot *write* UFS -- `CONFIG_UFS_FS_WRITE` is not set on a
+stock Ubuntu kernel -- so this is a reading instrument only.
 
-## 6. Clean, so the clone is not a copy of this boot
 ## 6. Clean, so the clone is not a copy of this boot
 
 ```sh
@@ -197,8 +239,23 @@ above. And the entropy seed is left alone: removing it was tried while chasing
 that bug and made no difference, so there is no reason to strip randomness a
 clone could use.
 
-Then stop the machine **hard** -- a power-off from the hypervisor, not
-`shutdown` -- and do not reconnect.
+Then shut the machine down **cleanly**:
+
+```sh
+shutdown -p now
+```
+
+**Not a hard power-off**, and this is the one place this runbook differs from
+the other guest for a reason that cost an evening. See 6a: a hard stop here
+leaves UFS mid-write, and every file touched in this session survives as a
+zero-length stub -- including the host keys, which then permanently prevent
+their own regeneration. `sync` does not save you; it schedules the writes
+without waiting for the soft-update dependencies to retire.
+
+There is nothing to protect against on this platform by stopping hard. The
+Ubuntu runbook stops hard because systemd persists `machine-id` on the way
+down; FreeBSD's identity files have no such behaviour, and `/etc/hostid` and
+`/etc/machine-id` stay empty across a clean shutdown.
 
 Why each of the last three lines:
 
@@ -228,6 +285,19 @@ template = "<the identifier you used>"
 See [`../site-config.md`](../site-config.md).
 
 ## 9. Prove it
+
+**Check the sealed image before converting**, because everything below costs a
+clone and this costs nothing. From another machine with the disk attached, or
+from the machine itself before you shut it down:
+
+```sh
+find /etc /boot -type f -size 0
+```
+
+`/etc/hostid` and `/etc/machine-id` should be the only entries, and they are
+empty deliberately. **Anything else in that list is a file the shutdown lost**,
+and if `/etc/ssh/ssh_host_*` appears, this template is already broken in the
+exact way 6a describes.
 
 1. `reaper up` against this guest produces a machine that reports an address.
 2. Firstboot builds the pool and datasets — `zfs list` over SSH shows `tank` and

@@ -203,6 +203,25 @@ the registry". It is deliberately not validated against a list of known
 operating systems -- a closed list is the hardcoding this contract exists to
 prevent.
 
+## A lesson from one platform is not a lesson
+
+Both templates here were damaged by a step that was correct on the other guest.
+
+The Ubuntu runbook stops the machine **hard** at seal time, and must: a
+graceful shutdown lets systemd write `machine-id` back out, undoing the very
+step that makes clones distinct. That instruction was carried to FreeBSD, where
+it is not merely unnecessary but destructive -- UFS with soft updates loses
+in-flight writes on a power cut, and the sealed image kept every file from its
+final session as a zero-length stub. One of those files was the ssh host key
+set, which then blocked its own regeneration, because the boot-time check is
+"does the file exist" and an empty file exists.
+
+Neither template's runbook was careless. Each step had a reason; the reason just
+belonged to a different operating system. So when adding a guest, the question
+for every step copied from an existing runbook is not "does this work here?"
+but **"what was this for, and does that thing exist here?"** -- and the answer
+belongs in the runbook next to the step.
+
 ## Platform differences, and where they live
 
 Everything platform-specific lives in the runner's platform modules and nowhere

@@ -129,7 +129,56 @@ clone that is never tagged at all, so the failure cannot recur -- an untagged
 machine in the pool is reported by the sweeper and never destroyed, which is the
 correct state for work in progress.
 
-### FreeBSD is parked, not finished
+### FreeBSD: diagnosed, not yet repaired
+
+**The cause is known exactly.** Clones of template 9002 have no ssh because the
+template carries six **zero-byte** files in `/etc/ssh`, and FreeBSD's
+`rc.d/sshd` regenerates a host key only when the file does not exist -- an empty
+file exists. sshd then fails on an empty key, which is the
+`failed precmd routine for sshd` recorded on every boot.
+
+The empty files came from this project's own runbook: it said to stop the
+machine hard at seal time, which is correct on Ubuntu and destructive on UFS.
+On the sealed image, **every file written during the final session is zero
+bytes and nothing else is** -- host keys, `/boot/loader.conf`, and the
+`/etc/rc.local` that an earlier debugging attempt had added to fix this exact
+symptom, which is why that attempt "did not help". The superblock's clean flag
+is 0.
+
+Two of the earlier conclusions were wrong, and both mattered:
+
+- "the guest agent does not start either" -- it does. A clone boots to
+  multi-user and reports an address; `rc` continues past a failed `sshd`. The
+  address it reported first was often IPv6, which the CLI then could not route
+  to. That was a genuine bug, found independently during Phase 3 and fixed.
+- "an explicit early rc script did not help" -- it was never given the chance.
+
+**How it was found**, since the method is reusable and beats what was tried
+before: the clone's disk was attached to a running Linux guest and mounted
+read-only, making the whole sealed image readable -- configuration, logs, file
+sizes, superblock -- without booting it. No console, no extra privilege. Linux
+cannot write UFS, so it is a reading instrument only.
+
+What remains is the repair, and it is blocked on reaching a machine with no
+ssh. See "What is blocked".
+
+### The console cannot be read with an API token
+
+`providers/proxmox/tools/console.mjs` reads a guest's serial console through the
+API. It is finished and it cannot be used with the harness credential: **an API
+token cannot authenticate a console.** The `termproxy` call succeeds -- it is an
+ordinary API call and `VM.Console` covers it -- and then the terminal's own
+ticket check rejects a name of the form `user@realm!tokenid`. The websocket
+opens and is closed a few seconds later with no diagnosis. This is a known
+Proxmox limitation, confirmed against their support forum after the behaviour
+was reproduced.
+
+The tool therefore takes `--user` and `--password-file` instead. A user holding
+`VM.Console` on the pool and nothing else is enough, and is less privileged than
+the harness token in every other respect. Until such a user exists, the tool
+refuses at startup and explains why rather than failing at the websocket.
+
+### FreeBSD, as previously recorded
 
 Clones of the FreeBSD template do not boot usefully: without host keys they come
 up with no ssh, and with host keys the last attempt did not start the guest
@@ -296,6 +345,19 @@ there is something reaper put there.
 ### What is blocked
 
 **The FreeBSD template.** Not blocked by anything reaper owns. See above.
+
+**Repairing the FreeBSD template.** The fault is understood and the fix is
+small -- remove six empty files and re-seal cleanly -- but the machine that
+needs the fix has no ssh, which is the fault itself. Three ways in, none of
+which this credential can take today:
+
+| Route | What it needs |
+|---|---|
+| The guest agent | `VM.GuestAgent.Unrestricted` on the pool. Adds nothing meaningful: the token can already create, destroy and re-disk these machines |
+| The serial console reader | a PVE user with `VM.Console` on the pool, and a password file |
+| The web console | a person at a browser |
+
+A rebuild from the ISO is the fourth, and needs neither -- only the time.
 
 **The sweeper's live dry run**, from this workstation. Its credential file lives
 on the sweeper's own VM, which is deliberately not a deploy target for anything
