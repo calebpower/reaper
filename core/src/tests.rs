@@ -251,6 +251,7 @@ fn session(name: &str, machine: &str) -> Session {
         expires_at: now + Duration::from_secs(7200),
         ttl: Duration::from_secs(7200),
         heartbeat_pid: Some(4242),
+        synced_at: None,
     }
 }
 
@@ -515,4 +516,400 @@ template = "t"
     assert_eq!(c.session.ssh_command, "/usr/local/bin/ssh-wrapper");
     assert_eq!(c.session.ssh_connect_timeout, Duration::from_secs(5));
     assert_eq!(c.session.ssh_key, Some(PathBuf::from("/keys/k")));
+}
+
+// ---------------------------------------------------------------------------
+// Job rendering
+//
+// The escaping is the part that matters. A command reaching a guest as
+// anything other than what the tenant wrote is a bug that produces wrong test
+// results rather than an error, and this project has already had one instance
+// of a quote closing early -- on the workstation, where `rm -f` then ran
+// locally. So the hostile cases are tested first and hardest.
+// ---------------------------------------------------------------------------
+
+use std::collections::BTreeMap;
+
+use crate::job;
+
+/// Run a rendered script through a real shell and report what one variable
+/// actually held. Asserting on the script's text would only prove it matches
+/// what this test expects; asserting on what a shell makes of it proves the
+/// escaping works.
+fn value_through_sh(value: &str) -> String {
+    let env: BTreeMap<String, String> = [("V".to_string(), value.to_string())]
+        .into_iter()
+        .collect();
+    // `printf %s` rather than echo: echo mangles backslashes on some shells,
+    // and this test would then be measuring echo.
+    let script = job::render("printf '%s' \"$V\" > \"$OUT\"", &env);
+
+    let out = std::env::temp_dir().join(format!("reaper-job-{}", std::process::id()));
+    let status = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(&script)
+        .env("OUT", &out)
+        .status()
+        .expect("run sh");
+    assert!(status.success(), "script failed:\n{script}");
+
+    let got = std::fs::read_to_string(&out).expect("read output");
+    let _ = std::fs::remove_file(&out);
+    got
+}
+
+#[test]
+fn hostile_environment_values_survive_a_real_shell() {
+    for value in [
+        "plain",
+        "",
+        "it's a quote",
+        "\"double\" and 'single'",
+        "$HOME and ${NOPE} and $(echo pwned)",
+        "back`tick`s",
+        "back\\slash\\",
+        "semi; colon && ampersand | pipe",
+        "new\nline",
+        "trailing space ",
+        "*",
+    ] {
+        assert_eq!(
+            value_through_sh(value),
+            value,
+            "value did not survive rendering: {value:?}"
+        );
+    }
+}
+
+#[test]
+fn a_command_is_not_quoted_because_it_is_a_shell_command() {
+    let script = job::render("make test | tee $REAPER_OUT/log", &BTreeMap::new());
+    assert!(
+        script.contains("make test | tee $REAPER_OUT/log"),
+        "the tenant's command must reach the shell as written, pipes and all:\n{script}"
+    );
+}
+
+#[test]
+fn a_job_knows_nothing_about_where_anything_lives() {
+    // The runner owns the paths, because it is the component choosing the
+    // execution mode and the two modes see different ones. A job that named
+    // them would be a second place obliged to agree forever.
+    let script = job::render("make", &BTreeMap::new());
+    assert!(
+        !script.contains("REAPER_WORK=") && !script.contains("cd "),
+        "the job must not set the workspace up for itself:\n{script}"
+    );
+}
+
+#[test]
+fn a_profile_overlays_the_verbs_environment() {
+    let verb: BTreeMap<String, String> = [
+        ("KEEP".to_string(), "verb".to_string()),
+        ("SHARED".to_string(), "verb".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    let profile: BTreeMap<String, String> = [
+        ("SHARED".to_string(), "profile".to_string()),
+        ("ADDED".to_string(), "profile".to_string()),
+    ]
+    .into_iter()
+    .collect();
+
+    let merged = job::overlay(&verb, Some(&profile));
+    assert_eq!(merged.get("KEEP").unwrap(), "verb");
+    assert_eq!(merged.get("ADDED").unwrap(), "profile");
+    // The profile wins. A profile changes how a session is run, and being
+    // unable to change a variable the verb already set would make the nightly
+    // profile in the shipped examples useless.
+    assert_eq!(merged.get("SHARED").unwrap(), "profile");
+
+    assert_eq!(job::overlay(&verb, None), verb);
+}
+
+// ---------------------------------------------------------------------------
+// Sync
+//
+// Two layers, and both are needed. The argument assertions pin the decisions --
+// what is excluded, what mirrors deletions, what does not. The round trip below
+// runs real rsync over the same flags, because an assertion that reaper passes
+// `--delete` proves reaper passes `--delete`, and says nothing about whether
+// the results directory survives it.
+// ---------------------------------------------------------------------------
+
+use std::net::IpAddr;
+
+use crate::sync;
+use crate::transport::Ssh;
+
+fn ssh_to(address: &str) -> Ssh {
+    Ssh::new(
+        "ssh",
+        "root",
+        address.parse::<IpAddr>().expect("address"),
+        None,
+        PathBuf::from("/tmp/kh"),
+        Duration::from_secs(15),
+    )
+}
+
+#[test]
+fn the_forward_sync_mirrors_deletions_and_protects_the_results_directory() {
+    let plan = sync::push(
+        "rsync",
+        Path::new("/state/rsh"),
+        &ssh_to("192.0.2.1"),
+        Path::new("/home/tree"),
+        "/pool/work/a-project",
+        &["/target/".to_string()],
+    );
+
+    assert_eq!(plan.program, "rsync");
+    assert!(plan.args.contains(&"--delete".to_string()));
+    // Anchored. Without the leading slash this would also exclude any nested
+    // `out` in the tree, and -- far worse -- the unanchored form is what people
+    // write first, so the anchor is the thing worth asserting.
+    assert!(plan.args.contains(&"--exclude=/out/".to_string()));
+    assert!(plan.args.contains(&"--exclude=/target/".to_string()));
+    assert!(
+        !plan.args.iter().any(|a| a == "--delete-excluded"),
+        "excluded means protected on the receiver, not destroyed"
+    );
+    assert!(!plan.args.iter().any(|a| a == "-z"), "no compression on a LAN");
+
+    // Trailing slashes on both ends. Without one on the source, rsync nests the
+    // tree one directory deeper on every single sync.
+    assert_eq!(plan.args[plan.args.len() - 2], "/home/tree/");
+    assert_eq!(plan.args[plan.args.len() - 1], "192.0.2.1:/pool/work/a-project/");
+}
+
+#[test]
+fn the_results_channel_never_deletes() {
+    let plan = sync::pull(
+        "rsync",
+        Path::new("/state/rsh"),
+        &ssh_to("192.0.2.1"),
+        "/pool/work/a-project/out",
+        Path::new("/home/tree/out"),
+    );
+
+    assert!(
+        !plan.args.iter().any(|a| a.starts_with("--delete")),
+        "the guest is authoritative for what it produced, not for what was in \
+         the operator's results directory beforehand"
+    );
+    assert_eq!(plan.args[plan.args.len() - 2], "192.0.2.1:/pool/work/a-project/out/");
+    assert_eq!(plan.args[plan.args.len() - 1], "/home/tree/out/");
+}
+
+#[test]
+fn an_ipv6_session_is_written_the_way_rsync_reads_it() {
+    let plan = sync::pull(
+        "rsync",
+        Path::new("/state/rsh"),
+        &ssh_to("2001:db8::1"),
+        "/pool/work/p/out",
+        Path::new("/tree/out"),
+    );
+    // Unbracketed, the colon before the path is ambiguous with the address's
+    // own and rsync reads the wrong thing as the host.
+    assert!(
+        plan.args[plan.args.len() - 2].starts_with("[2001:db8::1]:"),
+        "got {:?}",
+        plan.args[plan.args.len() - 2]
+    );
+}
+
+#[test]
+fn the_transport_wrapper_carries_the_same_options_ssh_uses() {
+    let dir = scratch("rsh-wrapper");
+    let ssh = Ssh::new(
+        "/usr/bin/ssh",
+        "root",
+        "192.0.2.9".parse().unwrap(),
+        Some(PathBuf::from("/keys/session")),
+        dir.join("known-hosts"),
+        Duration::from_secs(15),
+    );
+
+    let path = sync::rsh_wrapper(&ssh, &dir.join("rsh")).expect("wrapper");
+    let text = std::fs::read_to_string(&path).unwrap();
+
+    for expected in [
+        "BatchMode=yes",
+        "StrictHostKeyChecking=accept-new",
+        "IdentitiesOnly=yes",
+        "known-hosts",
+        "/keys/session",
+    ] {
+        assert!(text.contains(expected), "wrapper is missing {expected}:\n{text}");
+    }
+    // The address belongs to rsync, which appends it itself. Carrying it here
+    // as well would hand ssh two hosts.
+    assert!(
+        !text.contains("192.0.2.9"),
+        "the wrapper must not name the host:\n{text}"
+    );
+    assert!(text.trim_end().ends_with("\"$@\""));
+
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o700, "the wrapper names a key file");
+}
+
+#[test]
+fn a_wrapper_path_with_whitespace_is_refused_rather_than_mangled() {
+    let dir = scratch("rsh space");
+    let ssh = ssh_to("192.0.2.1");
+    let e = sync::rsh_wrapper(&ssh, &dir.join("rsh")).expect_err("should refuse");
+
+    let message = e.to_string();
+    assert!(
+        message.contains("whitespace") || message.contains("spaces"),
+        "the refusal should say why: {message}"
+    );
+    // And it must say what to do about it, since the cause is somewhere the
+    // operator has never had to think about.
+    assert!(message.contains("XDG_STATE_HOME"), "no remedy offered: {message}");
+}
+
+fn scratch(label: &str) -> PathBuf {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!(
+        "reaper-sync-{}-{n}-{label}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch directory");
+    dir
+}
+
+/// A stand-in for ssh that drops the host and runs the command here.
+///
+/// This is what lets real rsync exercise the real flag set with no network and
+/// no guest. rsync invokes `<rsh> <host> rsync --server …`, so dropping the
+/// first argument turns a remote transfer into a local one without changing a
+/// single flag under test.
+fn local_rsh(dir: &Path) -> PathBuf {
+    let path = dir.join("rsh-local");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\n# Stand-in for ssh: drop the host, run the rest here.\nshift\nexec \"$@\"\n",
+    )
+    .expect("write rsh");
+    use std::os::unix::fs::PermissionsExt;
+    let mut p = std::fs::metadata(&path).unwrap().permissions();
+    p.set_mode(0o700);
+    std::fs::set_permissions(&path, p).unwrap();
+    path
+}
+
+fn rsync_binary() -> String {
+    // Not skipped when absent. A suite that quietly passes because its tool is
+    // missing is worse than one that fails, and the same rule already governs
+    // the shell linter.
+    let found = std::process::Command::new("sh")
+        .args(["-c", "command -v rsync"])
+        .output()
+        .expect("look for rsync");
+    assert!(
+        found.status.success(),
+        "rsync is not installed, so the flags in sync.rs have never been run. \
+         Install it rather than letting this suite pass without checking them."
+    );
+    String::from_utf8_lossy(&found.stdout).trim().to_string()
+}
+
+fn write(path: &Path, bytes: &[u8]) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// Real rsync, real flags, no network. This is the test that would catch a
+/// wrong flag; the argument assertions above would not.
+#[test]
+fn a_real_round_trip_keeps_results_and_mirrors_deletions() {
+    let rsync = rsync_binary();
+    let dir = scratch("round-trip");
+    let rsh = local_rsh(&dir);
+    let ssh = ssh_to("127.0.0.1");
+
+    let tree = dir.join("tree");
+    let remote = dir.join("remote");
+    std::fs::create_dir_all(&remote).unwrap();
+
+    write(&tree.join("src/main.rs"), b"fn main() {}");
+    write(&tree.join("doomed.txt"), b"here for now");
+    write(&tree.join("target/huge.o"), b"expensive and useless over there");
+    // A nested results directory, which the anchored exclude must not catch.
+    write(&tree.join("fixtures/out/case.json"), b"{}");
+    // Uncommitted work, and git metadata: neither may be excluded by default.
+    write(&tree.join(".git/HEAD"), b"ref: refs/heads/main\n");
+
+    // Something the guest produced on an earlier run, which a forward sync must
+    // not destroy on its way past.
+    write(&remote.join("out/trace.json"), b"{\"kept\":true}");
+
+    let excludes = vec!["/target/".to_string()];
+    let remote_str = remote.to_string_lossy().to_string();
+
+    sync::push(&rsync, &rsh, &ssh, &tree, &remote_str, &excludes)
+        .run()
+        .expect("first push");
+
+    assert!(remote.join("src/main.rs").exists());
+    assert!(remote.join(".git/HEAD").exists(), ".git must go by default");
+    assert!(
+        remote.join("fixtures/out/case.json").exists(),
+        "the exclude is anchored at the top of the tree, not every out anywhere"
+    );
+    assert!(!remote.join("target").exists(), "the tenant excluded this");
+    assert!(
+        remote.join("out/trace.json").exists(),
+        "--delete must not reach into the results directory"
+    );
+
+    // Now delete something locally and sync again: the guest must forget it.
+    std::fs::remove_file(tree.join("doomed.txt")).unwrap();
+    sync::push(&rsync, &rsh, &ssh, &tree, &remote_str, &excludes)
+        .run()
+        .expect("second push");
+    assert!(
+        !remote.join("doomed.txt").exists(),
+        "a tree still holding a file the operator removed is not the tree under test"
+    );
+    assert!(remote.join("out/trace.json").exists(), "still protected");
+
+    // Results, coming back. A multi-megabyte binary, because the evidence tier
+    // that matters most emits screenshots rather than JSON.
+    let blob: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    write(&remote.join("out/screenshot.png"), &blob);
+
+    let local_out = tree.join("out");
+    write(&local_out.join("from-an-earlier-local-run.txt"), b"mine");
+
+    sync::pull(
+        &rsync,
+        &rsh,
+        &ssh,
+        &remote.join("out").to_string_lossy(),
+        &local_out,
+    )
+    .run()
+    .expect("pull");
+
+    assert_eq!(
+        std::fs::read(local_out.join("screenshot.png")).unwrap(),
+        blob,
+        "a bulky binary must come back byte for byte"
+    );
+    assert!(local_out.join("trace.json").exists());
+    assert!(
+        local_out.join("from-an-earlier-local-run.txt").exists(),
+        "the results channel adds; it does not mirror"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

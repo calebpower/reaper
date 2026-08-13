@@ -7,9 +7,11 @@
 
 pub mod config;
 pub mod duration;
+pub mod job;
 pub mod paths;
 pub mod provider;
 pub mod session;
+pub mod sync;
 pub mod transport;
 
 pub use config::{Config, ConfigError};

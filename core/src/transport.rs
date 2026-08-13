@@ -84,6 +84,19 @@ impl Ssh {
     /// `BatchMode` because nothing here can answer a prompt, and a command that
     /// blocks forever waiting for one is worse than a command that fails.
     pub fn options(&self) -> Vec<String> {
+        let mut o = self.transport_options();
+        o.push(self.address.to_string());
+        o
+    }
+
+    /// The same options, without the target.
+    ///
+    /// rsync appends the host itself, so it needs the options and not the
+    /// destination. Splitting it out here rather than reconstructing the list
+    /// somewhere else is what stops `ssh` and `rsync` drifting into connecting
+    /// two different ways -- which would surface as a host-key prompt at the
+    /// least convenient moment, in a command that cannot answer one.
+    pub fn transport_options(&self) -> Vec<String> {
         let mut o = vec![
             "-o".into(), "BatchMode=yes".into(),
             "-o".into(), "StrictHostKeyChecking=accept-new".into(),
@@ -100,8 +113,20 @@ impl Ssh {
             o.push("-o".into());
             o.push("IdentitiesOnly=yes".into());
         }
-        o.push(self.address.to_string());
         o
+    }
+
+    pub fn program(&self) -> &str {
+        &self.program
+    }
+
+    /// The host as rsync wants it written. An IPv6 literal needs brackets, or
+    /// the colon introducing the path is ambiguous with the address's own.
+    pub fn rsync_host(&self) -> String {
+        match self.address {
+            IpAddr::V4(a) => a.to_string(),
+            IpAddr::V6(a) => format!("[{a}]"),
+        }
     }
 }
 

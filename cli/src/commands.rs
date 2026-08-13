@@ -172,6 +172,7 @@ pub fn up(
             expires_at: created_at + cfg.session.ready_grace,
             ttl,
             heartbeat_pid: None,
+            synced_at: None,
         };
         store.put(session.clone())?;
 

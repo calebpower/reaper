@@ -128,6 +128,13 @@ pub struct Session {
     /// The heartbeat renewing this session's expiry, if one was started.
     #[serde(default)]
     pub heartbeat_pid: Option<u32>,
+
+    /// When a working tree was last pushed into this session. `None` means one
+    /// never has been, which is how `down` knows there is nothing to collect on
+    /// the way past -- pulling from a directory that was never created would
+    /// fail, and a failure there would read as though results had been lost.
+    #[serde(with = "epoch_opt", default)]
+    pub synced_at: Option<SystemTime>,
 }
 
 impl Session {

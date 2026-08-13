@@ -98,6 +98,14 @@ pub struct SessionConfig {
     /// also what lets the suite exercise the whole path without a network.
     pub ssh_command: String,
     pub ssh_connect_timeout: Duration,
+    /// The rsync binary. Configurable for the same reasons as `ssh_command`:
+    /// a site may want a wrapper, and the suite needs to exercise the whole
+    /// path without a network.
+    pub rsync_command: String,
+    /// How often results are pulled back while a command is running. Results
+    /// flow continuously rather than at the end, because a failure trace must
+    /// never exist only on a machine scheduled for destruction.
+    pub results_interval: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +149,8 @@ struct RawSession {
     ssh_key: Option<String>,
     ssh_command: Option<String>,
     ssh_connect_timeout: Option<String>,
+    rsync_command: Option<String>,
+    results_interval: Option<String>,
 }
 
 impl Default for RawSession {
@@ -155,6 +165,8 @@ impl Default for RawSession {
             ssh_key: None,
             ssh_command: None,
             ssh_connect_timeout: None,
+            rsync_command: None,
+            results_interval: None,
         }
     }
 }
@@ -235,6 +247,18 @@ pub fn parse(text: &str, path: &Path) -> Result<Config, ConfigError> {
         "5m",
     )?;
     let ready_grace = dur("ready_grace", raw.session.ready_grace.as_ref(), "30m")?;
+    let results_interval = dur(
+        "results_interval",
+        raw.session.results_interval.as_ref(),
+        "5s",
+    )?;
+    if results_interval.as_secs() == 0 {
+        return Err(invalid(
+            "session.results_interval is 0, which would pull results in a tight \
+             loop for as long as a command runs"
+                .into(),
+        ));
+    }
 
     // The heartbeat is a dead-man's switch, so the margin between "we missed a
     // renewal" and "the sweeper takes the machine" has to be wide enough to
@@ -285,6 +309,8 @@ pub fn parse(text: &str, path: &Path) -> Result<Config, ConfigError> {
                 raw.session.ssh_connect_timeout.as_ref(),
                 "15s",
             )?,
+            rsync_command: raw.session.rsync_command.unwrap_or_else(|| "rsync".to_string()),
+            results_interval,
         },
         guests: raw.guests,
         provider_table,
