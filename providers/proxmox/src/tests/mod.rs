@@ -750,3 +750,36 @@ fn destroying_a_stopped_machine_does_not_bother_stopping_it() {
         "no need to stop something already stopped"
     );
 }
+
+#[test]
+fn destroying_a_machine_the_sweeper_already_took_reports_it_gone() {
+    // The API answers 403 rather than 404 for a machine that no longer exists,
+    // so a naive read of the refusal looks like a credential problem and the
+    // session can never be cleared.
+    let pve = pve_with_template();
+    let p = provider_for(&pve);
+    let m = p.create(&request("a-session", 1)).expect("create");
+    pve.collect(m.as_str()); // as the sweeper would
+
+    let e = p.destroy(&m).unwrap_err();
+    assert!(
+        matches!(e, ProviderError::NotFound(_)),
+        "should be reported as gone, got: {e}"
+    );
+}
+
+#[test]
+fn a_genuine_credential_failure_is_not_mistaken_for_a_missing_machine() {
+    // The dangerous inverse. Reporting a live machine as gone would drop the
+    // session record that is the only convenient trace of it.
+    let pve = pve_with_template();
+    let p = provider_for(&pve);
+    let m = p.create(&request("a-session", 1)).expect("create");
+    pve.with_state(|s| s.unauthorized = true);
+
+    let e = p.destroy(&m).unwrap_err();
+    assert!(
+        matches!(e, ProviderError::Unauthorized(_)),
+        "a broken credential must not read as a missing machine, got: {e}"
+    );
+}

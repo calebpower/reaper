@@ -415,7 +415,10 @@ fn route(s: &mut State, method: &str, path: &str, body: &str) -> (u16, Value) {
                     "vmid": id,
                 }}),
             ),
-            None => (404, json!({"errors": "no such machine"})),
+            // 403, not 404, exactly as the real API answers: the ACL check on
+            // /vms/<id> precedes the existence check, and a machine that is
+            // gone has no ACL entry. This distinction cost a bug.
+            None => (403, json!({"message": "Permission check failed (/vms/x, VM.Audit)"})),
         },
 
         ("POST", ["nodes", _node, "qemu", id, "status", action]) => {

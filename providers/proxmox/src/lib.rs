@@ -75,6 +75,37 @@ impl Proxmox {
         )
     }
 
+    /// Does this machine still exist, as far as we are concerned?
+    ///
+    /// Not as simple as asking. For a machine that no longer exists the API
+    /// answers 403, not 404 -- the ACL check on /vms/<id> runs before the
+    /// existence check, and there is no ACL entry for a machine that is gone.
+    /// A refusal is therefore ambiguous: gone, or a credential problem.
+    ///
+    /// It is disambiguated by consulting the listing, which uses a different
+    /// permission. If the listing works, the credential is fine, and a machine
+    /// absent from it is genuinely gone. If the listing itself fails, the
+    /// original refusal is propagated rather than guessed at -- reporting a
+    /// live machine as gone would drop the session that is the only convenient
+    /// record of it.
+    fn still_exists(&self, id: u32) -> Result<bool> {
+        match self
+            .client
+            .get(&format!("/nodes/{}/qemu/{id}/status/current", self.node()))
+        {
+            Ok(_) => Ok(true),
+            Err(e @ (ProviderError::NotFound(_) | ProviderError::Unauthorized(_))) => {
+                let listed = self.occupied_in_range()?;
+                if listed.contains(&id) {
+                    Err(e)
+                } else {
+                    Ok(false)
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     fn is_running(&self, id: u32) -> Result<bool> {
         let s = self
             .client
@@ -341,6 +372,16 @@ impl Provider for Proxmox {
 
     fn destroy(&self, machine: &MachineRef) -> Result<()> {
         let id = self.config.ids.check(machine)?;
+
+        // Already gone is a success, not a failure. The usual reason is the
+        // happy one: the sweeper collected an expired machine, doing exactly
+        // its job. Reporting that as an error leaves an operator holding a
+        // session they cannot clear.
+        if !self.still_exists(id)? {
+            return Err(ProviderError::NotFound(format!(
+                "machine {id} no longer exists"
+            )));
+        }
 
         // Stop first if it is running. The API refuses to delete a running
         // machine, so a destroy that did not do this failed every time it was
