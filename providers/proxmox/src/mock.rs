@@ -25,6 +25,8 @@ pub struct Vm {
     pub running: bool,
     pub template: bool,
     pub pool: String,
+    /// Proxmox copies this to clones. A protected machine cannot be destroyed.
+    pub protection: bool,
     pub cores: Option<u32>,
     pub memory: Option<u64>,
     /// Disks attached after creation, as bus -> "<storage>:<gib>".
@@ -163,6 +165,20 @@ task_timeout = "5s"
     pub fn tags_of(&self, machine: &str) -> String {
         let id: u32 = machine.parse().expect("handle this provider issued");
         self.with_state(|s| s.vms.get(&id).map(|v| v.tags.clone()).unwrap_or_default())
+    }
+
+    /// Mark a template protected, as a real one should be.
+    pub fn protect(&self, machine: &str) {
+        let id: u32 = machine.parse().expect("handle this provider issued");
+        self.with_state(|s| {
+            if let Some(vm) = s.vms.get_mut(&id) { vm.protection = true; }
+        });
+    }
+
+    /// Is this machine protected?
+    pub fn is_protected(&self, machine: &str) -> bool {
+        let id: u32 = machine.parse().expect("handle this provider issued");
+        self.with_state(|s| s.vms.get(&id).map(|v| v.protection).unwrap_or(false))
     }
 
     /// A credential this stand-in accepts.
@@ -340,6 +356,8 @@ fn route(s: &mut State, method: &str, path: &str, body: &str) -> (u16, Value) {
                 running: false,
                 template: false,
                 pool: form.get("pool").cloned().unwrap_or_default(),
+                // Inherited from the source, exactly as Proxmox does it.
+                protection: source.protection,
                 cores: source.cores,
                 memory: source.memory,
                 extra_disks: BTreeMap::new(),
@@ -370,6 +388,9 @@ fn route(s: &mut State, method: &str, path: &str, body: &str) -> (u16, Value) {
             };
             if let Some(t) = form.get("tags") {
                 vm.tags = t.clone();
+            }
+            if let Some(p) = form.get("protection") {
+                vm.protection = p != "0";
             }
             if let Some(c) = form.get("cores").and_then(|v| v.parse().ok()) {
                 vm.cores = Some(c);
@@ -407,6 +428,10 @@ fn route(s: &mut State, method: &str, path: &str, body: &str) -> (u16, Value) {
             let Some(key) = id.parse::<u32>().ok() else {
                 return (404, json!({"errors": "no such machine"}));
             };
+            // Refuses, as the real thing does.
+            if s.vms.get(&key).map(|v| v.protection).unwrap_or(false) {
+                return (500, json!({"errors": "protection mode enabled"}));
+            }
             if s.vms.remove(&key).is_none() {
                 return (404, json!({"errors": "no such machine"}));
             }

@@ -219,7 +219,19 @@ impl Provider for Proxmox {
         // (A *crash* in the same window leaves the untagged machine the sweeper
         // logs for a human. The two look identical afterwards and are not the
         // same thing.)
-        let mut settings = vec![("tags", tags::encode(req.expires_at))];
+        // protection=0, explicitly and always.
+        //
+        // A clone inherits the template's protection flag, and templates are
+        // rightly protected -- that is what stops a stray destroy taking the
+        // thing every session is made from. But a protected session cannot be
+        // destroyed by anything: not `down`, not the sweeper. Ephemeral
+        // machines that cannot be removed defeat the entire design, so this is
+        // cleared in the same call that sets the expiry, before the machine is
+        // ever started.
+        let mut settings = vec![
+            ("tags", tags::encode(req.expires_at)),
+            ("protection", "0".to_string()),
+        ];
         if let Some(cores) = req.cores {
             settings.push(("cores", cores.to_string()));
         }

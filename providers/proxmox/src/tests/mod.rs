@@ -665,3 +665,55 @@ fn destroying_also_clears_disks_a_failed_create_could_have_left() {
     );
     assert!(pve.vm(9001).is_none(), "the machine should be gone");
 }
+
+// --- protection ------------------------------------------------------------
+
+#[test]
+fn a_session_is_destroyable_even_though_its_template_is_protected() {
+    // Proxmox copies the protection flag to clones, and templates are rightly
+    // protected. Left inherited, a session could never be destroyed -- not by
+    // down, not by the sweeper. This is the whole design failing quietly.
+    let pve = pve_with_template();
+    pve.protect("9000");
+    let p = provider_for(&pve);
+
+    let m = p.create(&request("a-session", 1)).expect("create");
+    assert!(
+        !pve.is_protected(m.as_str()),
+        "the session inherited protection and could never be destroyed"
+    );
+
+    p.destroy(&m).expect("a session must always be destroyable");
+    assert!(pve.vm(m.as_str().parse().unwrap()).is_none());
+}
+
+#[test]
+fn protection_is_cleared_before_the_machine_is_ever_started() {
+    // In the same call as the expiry: a window in which a session is both
+    // running and undeletable is a window in which the sweeper is powerless.
+    let pve = pve_with_template();
+    pve.protect("9000");
+    let p = provider_for(&pve);
+    p.create(&request("a-session", 1)).expect("create");
+
+    let paths = pve.paths();
+    let config_at = paths.iter().position(|x| x.ends_with("/config")).expect("configured");
+    let started = paths.iter().position(|x| x.contains("/status/start"));
+    assert!(started.is_none(), "create must not start the machine: {paths:?}");
+    assert_eq!(
+        paths.iter().filter(|x| x.ends_with("/config")).count(),
+        1,
+        "expiry, resources, disk and protection belong in one call: {paths:?}"
+    );
+    assert!(config_at > 0);
+}
+
+#[test]
+fn the_template_itself_is_never_unprotected() {
+    // Clearing protection on the session must not reach back to the template.
+    let pve = pve_with_template();
+    pve.protect("9000");
+    let p = provider_for(&pve);
+    p.create(&request("a-session", 1)).expect("create");
+    assert!(pve.is_protected("9000"), "the template must stay protected");
+}
