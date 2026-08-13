@@ -137,42 +137,51 @@ freebsd-version -kru; uname -a
 
 Keep that output for the commit that registers the template.
 
-## 6a. Known bug: host keys are not regenerated at boot
+## 6a. UNRESOLVED: clones of this template do not boot usefully
 
-**This template ships with its host keys, and every clone shares them.** That is
-a deviation from the other guest, which regenerates properly, and it is a wart
-rather than a decision.
+**This runbook does not currently produce a working template.** It is kept
+because everything up to sealing is correct and was verified live; the failure
+is at clone time. Read this before spending an evening the way one was already
+spent.
 
-What is known, so nobody repeats the search:
+### What happens
 
-- `/var/log/messages` records `failed precmd routine for sshd` on **every** boot.
-  `sshd_precmd` runs keygen then configtest, and its failure is why sshd never
-  starts -- the machine boots fine and answers its guest agent, but port 22 is
-  closed.
-- Run by hand, `/etc/rc.d/sshd keygen` works perfectly and generates all three
-  key types in a second.
-- `sshd -t` passes, with and without keys present.
-- `sshd_enable="YES"` is set.
-- Entropy is not the cause. A virtio-rng device was attached and the driver was
-  confirmed loaded (`random: registering fast source VirtIO Entropy Adapter`) on
-  a boot that still failed. An earlier check appeared to show the driver absent;
-  that was a bad grep -- the kernel prints `VirtIO Entropy Adapter`, not
-  `virtio_random`.
+A clone comes up and stays up -- the hypervisor reports it running -- but:
 
-So: the code path works, the config is valid, the service is enabled, and
-randomness is available -- but it fails when rc runs it at boot. The most
-promising untried lead is that `sshd_precmd` calls `run_rc_command` recursively
-for `keygen` and `configtest`, and that nested invocation may behave differently
-in the boot context than from an interactive shell.
+- with host keys removed at seal time, it has **no ssh at all**, and
+  `/var/log/messages` records `failed precmd routine for sshd` on every boot;
+- with host keys **kept** at seal time, the last attempt did not even start the
+  guest agent, so it never reported an address either.
 
-**Why shipping anyway is acceptable, and what it costs.** reaper generates a
-fresh per-session `known_hosts` and connects with `accept-new`, so it never
-carries a key from one session to the next -- shared host keys do not weaken
-anything reaper itself does. The residual risk is a person who SSHes to sessions
-by hand with a shared `known_hosts`: they will not be warned when the key
-changes, because it never does. If that matters to you, generate keys per
-session yourself after `up`.
+The second is worse than the first, which suggests the boot is failing earlier
+than sshd and that host keys were never the real problem.
 
+### What was ruled out, with evidence
+
+| Hypothesis | Result |
+|---|---|
+| `sshd_enable` not set | Refuted -- it is `YES` |
+| Malformed `sshd_config` | Refuted -- `sshd -t` passes |
+| Entropy starvation | Refuted -- keys regenerate with `/var/db/entropy` and `/entropy` both stripped; a virtio-rng device was attached and confirmed registered on a boot that still failed |
+| Missing `/etc/hostid` | Refuted -- failed with `hostid` present too |
+| The attached data disk | Refuted -- a clone with only its boot disk failed identically |
+| An explicit early rc script running `ssh-keygen -A` | Did not help |
+
+One observation never explained: key generation succeeds on a **warm reboot**
+and fails on a **cold boot**. That is the sharpest clue available and it was not
+run down.
+
+### What to do next
+
+**Watch the console during a clone's first boot.** Every failure mode here is
+invisible from outside the machine -- that is precisely why this resisted six
+hypotheses tested remotely. Twenty minutes with eyes on the boot sequence will
+almost certainly beat another evening of inference.
+
+Until then `freebsd-15.1` is unregistered in the site configuration, so nothing
+can accidentally depend on it.
+
+## 6. Clean, so the clone is not a copy of this boot
 ## 6. Clean, so the clone is not a copy of this boot
 
 ```sh

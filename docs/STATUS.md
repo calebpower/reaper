@@ -12,7 +12,7 @@ Last updated: 2026-08-12.
 |---|---|---|
 | **0** | Repo bootstrap: docs, manifest schema, seam guards, sweeper | **Complete.** Sweeper imported, hardened, self-tested, and dry-run against the live API |
 | 1 | Provider seam + session core (`up`/`list`/`renew`/`down`) | **Accepted live.** up, list, renew and down all run against the real cluster |
-| 2 | Guest templates + the runner | **Both templates built.** Ubuntu proven end to end; FreeBSD session under test |
+| 2 | Guest templates + the runner | **Ubuntu complete and proven.** FreeBSD unresolved and unregistered |
 | 3 | Sync, build, execution | Not started |
 | 4 | `reset` and the `@pristine` snapshot | Not started |
 | 5 | Tenant onboarding | Not started |
@@ -101,16 +101,26 @@ clone that is never tagged at all, so the failure cannot recur -- an untagged
 machine in the pool is reported by the sweeper and never destroyed, which is the
 correct state for work in progress.
 
-### One open bug, in the FreeBSD guest
+### FreeBSD is parked, not finished
 
-Clones share host keys, because boot-time regeneration fails for reasons that
-resisted diagnosis. Three hypotheses were tested and refuted; the evidence and
-the most promising untried lead are recorded in `docs/runbooks/freebsd.md`.
+Clones of the FreeBSD template do not boot usefully: without host keys they come
+up with no ssh, and with host keys the last attempt did not start the guest
+agent either. Six hypotheses were tested and refuted -- `sshd_enable`, malformed
+`sshd_config`, entropy, missing `hostid`, the attached data disk, and an
+explicit early rc script. `docs/runbooks/freebsd.md` records each with its
+evidence.
 
-It is shipped rather than blocked because reaper uses a fresh per-session
-`known_hosts` with `accept-new` and never carries a key between sessions, so
-this does not weaken anything reaper does. The two guests differing is a wart,
-not a design choice, and it is written down as such.
+The sharpest unexplained clue: key generation succeeds on a warm reboot and
+fails on a cold boot.
+
+It blocks nothing. Phase 3 is sync, build and execution, which needs the
+container-execution guest -- Ubuntu -- and there are no host-execution tenants
+yet. `freebsd-15.1` is unregistered so nothing can depend on it by accident.
+
+The next step is not more remote inference: it is **watching the console during
+a clone's first boot**, which is where every one of these failures is visible
+and outside the machine none of them are. That should have been the second move
+rather than the last.
 
 ### An extra privilege PVE 9 requires
 
