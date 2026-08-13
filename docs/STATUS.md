@@ -4,7 +4,7 @@ Where the work actually stands. When this document disagrees with any other,
 trust this one -- the rest describe intended shapes, this describes the shape
 that exists.
 
-Last updated: 2026-08-12.
+Last updated: 2026-08-13.
 
 ## Phases
 
@@ -12,8 +12,8 @@ Last updated: 2026-08-12.
 |---|---|---|
 | **0** | Repo bootstrap: docs, manifest schema, seam guards, sweeper | **Complete.** Sweeper imported, hardened, self-tested, and dry-run against the live API |
 | 1 | Provider seam + session core (`up`/`list`/`renew`/`down`) | **Accepted live.** up, list, renew and down all run against the real cluster |
-| 2 | Guest templates + the runner | **Ubuntu complete and proven.** FreeBSD unresolved and unregistered |
-| 3 | Sync, build, execution | Not started |
+| 2 | Guest templates + the runner | **Ubuntu proven, and now known to need one more package.** FreeBSD unresolved and unregistered |
+| 3 | Sync, build, execution | **Accepted live.** sync, build and run against the real cluster, results flowing continuously |
 | 4 | `reset` and the `@pristine` snapshot | Not started |
 | 5 | Tenant onboarding | Not started |
 | 6 | Hardening, `doctor`, third-tenant proof | Not started |
@@ -32,35 +32,63 @@ decisions below. Phase 2 is parallel-safe with Phase 1; nothing else is.
 | `manifest/test/run.sh` | The schema accepts what it should and rejects what it claims to |
 
 `cargo test --workspace` runs the Rust suites, including the CLI driven end to
-end as a subprocess against a stand-in hypervisor and a stand-in ssh: up, list,
-renew and down, the concurrency cap, an unregistered guest, a failed destroy,
-the heartbeat, the session's pool disk, and the runner being delivered and
-firstboot run before a session is called ready.
+end as a subprocess against a stand-in hypervisor, a stand-in ssh and a stand-in
+rsync: up, list, renew and down, the concurrency cap, an unregistered guest, a
+failed destroy, the heartbeat, the session's pool disk, the runner being
+delivered and firstboot run before a session is called ready, and Phase 3's
+sync, build and run -- including that a failing command still gets its results
+out, and that a job reaches the guest as a delivered file rather than as an
+argument.
 
-`runner/test/run.sh` runs the runner's decision self-test: 50 cases against
+It also runs **real rsync** between two local directories, over the same flags
+reaper uses. Asserting that reaper passes `--delete` proves reaper passes
+`--delete`; it says nothing about whether the results directory survives it.
+
+`runner/test/run.sh` runs the runner's decision self-test: 97 assertions against
 stubbed tools, asserting the invocation log rather than exit codes, because
 "it refused" and "it refused without touching anything" are different claims.
+Since Phase 3 it also asserts the runner's documented **exit codes** -- 2 for a
+malformed call, 1 for a failure -- because a mutation that turned a refusal into
+a log survived the first version of those tests: the shell then fell over one
+line later trying to run an engine named by the empty string, which is
+indistinguishable from a refusal if all you check is a boolean status.
 
 ### Measured against the real cluster
 
+Phase 3, 2026-08-13, with reaper as its own tenant: a Rust workspace of five
+crates, built and tested inside a session on `ubuntu-26.04`.
+
 | | |
 |---|---|
-| `up`, cold, to a ready session | **9m20s** |
-| `down` (stop, destroy, disks) | ~5s |
-| Template boot disk | 8 GiB |
-| Storage | plain LVM, no snapshots -- every clone is a full copy |
+| `up`, cold, to a ready session | **1m56s**, including a 912 MB image pull |
+| `sync`, whole tree including `.git` | 4s |
+| `build`, empty caches | 49s (45s of it inside cargo) |
+| `build`, warm caches | **3.4s** (0.17s inside cargo) |
+| `build --profile nightly`, cold by design | 48s |
+| `run` -- the entire battery, Rust and shell | 27s |
+| `down` (final results pull, stop, destroy, disks) | 7s |
+| Session cost on storage | 8 GiB boot clone + 64 GiB pool disk |
 
-Nine minutes is the number the original plan warned about and asked to be
-measured honestly. It is dominated by the full copy of the boot disk. It is
-acceptable for a session that lasts an afternoon, and it is why the pool disk
-is attached rather than carried: only the 8 GiB boot disk is copied, not the
-session's storage.
+The warm loop -- sync, build, run -- is **35 seconds**, and that is the number
+the original plan said to stop and reassess over if it did not clearly beat
+running the suite locally. It does.
+
+`up` at under two minutes also contradicts the 9m20s recorded during Phase 1,
+and the honest position is that we do not know why. Same storage, same template,
+same 8 GiB boot disk. It is not the image pull, which is inside the new figure
+and not the old. Both numbers were measured rather than estimated; the earlier
+one is left here rather than deleted, because a five-fold difference nobody can
+explain is worth remembering the next time somebody wants to plan around it.
+
+What has not changed: storage is plain LVM with no snapshots, so every clone is
+a full copy. That is still why the pool disk is attached rather than carried --
+only the boot disk is copied, and never the session's 64 GiB of storage.
 
 ### Guests registered
 
 | Name | Template | Execution | Notes |
 |---|---|---|---|
-| `ubuntu-26.04` | 9001 | `container` | ZFS, podman, rsync, guest agent. No language toolchains |
+| `ubuntu-26.04` | 9001 | `container` | ZFS, podman, rsync, guest agent. No language toolchains. **Missing `nftables`, so container execution does not work until the template is rebuilt** |
 | `freebsd-15.1` | 9000 | `host` | ZFS in base, rsync, guest agent. No container engine, and none wanted -- the engine here runs only foreign-format images under emulation |
 
 The FreeBSD template ships a C compiler because FreeBSD base includes one. It
@@ -121,6 +149,52 @@ The next step is not more remote inference: it is **watching the console during
 a clone's first boot**, which is where every one of these failures is visible
 and outside the machine none of them are. That should have been the second move
 rather than the last.
+
+### Phase 3, and what running it live found
+
+Five findings, four fixed and one handed back. Every one of them was invisible
+to a suite that never left this machine, which is the same lesson Phase 1
+recorded and worth recording again rather than assuming it was learned.
+
+| Found | Why nothing offline saw it |
+|---|---|
+| The engine can pull images but cannot start one -- no `nftables` | Nothing offline runs a container, and `podman info` does not either |
+| Determinism mode broke every command that named a cache | The stand-in never expanded a variable |
+| rsync carried uids across machines with no shared user database | Both ends of an offline test are the same machine |
+| `manifest/test` ignored `CARGO_TARGET_DIR`, which a session always sets | Nothing here redirects the build output |
+| `mktemp -d -t <name>` is a prefix on one system and a template on another | The suites had only ever run on one of them |
+
+The first is a template defect and is **not fixed**: template 9001 needs
+`nftables` and a rebuild, which is the sysadmin's to do. Until it is, a session
+on `ubuntu-26.04` can build and run only under host execution; container
+execution works in a session only after the package is installed by hand, which
+is how the rest of Phase 3's acceptance was completed.
+
+The second is worth stating as a rule rather than a bug. `warm_cache: false`
+means *the cache is not warm*. It never meant "the tenant's command must be
+written twice", which is what dropping the variables amounted to -- the
+documented way to use a cache is to name its path in your command, and that
+expanded to an empty string. A cold run now gets the same variables and the
+same paths, pointing at a directory emptied first, and the claim that matters
+is unchanged: nothing from the warm cache is reachable.
+
+Two of the five were bugs in reaper's own test suites, found only because
+reaper became its own tenant and tried to run them somewhere that was not this
+workstation. That is the whole argument for dogfooding, arriving on the first
+day of it.
+
+### Phase 3 decisions
+
+| Question | Answer |
+|---|---|
+| Execution mode | A property of a **verb**, not of a guest. A toolchain image carries no engine client, so a run that orchestrates containers cannot execute inside the image that built it -- while a run that is `cargo test` very much wants to |
+| Image inheritance | A container-execution `run` with no image of its own uses `build.image`, resolved before validation so the schema still sees a complete guest |
+| Where paths live | The runner. The CLI asks it where a workspace is rather than computing one, so pool layout is one component's business |
+| Job delivery | Rendered in Rust, quoted there, delivered over stdin. Never an argument -- an apostrophe in a command has already cost this project a `rm -f` on the workstation |
+| Results | Continuous while a command runs, again when it stops whatever it did, and once more on `down`. A trace that exists only on a machine scheduled for destruction is a trace nobody reads |
+| Reverse sync | Never `--delete`. The guest is authoritative for what it produced, not for what was in the operator's results directory beforehand |
+| `.git` | Synced by default. Never needing a commit is the point, and deltas make it cheap after the first |
+| Pre-fetch failure | Warns, never fatal. The engine would fetch on demand anyway, and a registry blip must not cost a machine that took two minutes to clone |
 
 ### An extra privilege PVE 9 requires
 
@@ -197,24 +271,14 @@ there is something reaper put there.
 built in the web interface, which needs no token. `docs/runbooks/` is the
 deliverable; follow it and record what you actually built.
 
-**Phase 1's and Phase 2's live acceptance.** Everything is built and covered
-offline, but the stated criteria are live and need a harness token in
-`~/.config/reaper/`:
+**Container execution on `ubuntu-26.04`**, until template 9001 is rebuilt with
+`nftables`. Everything else works on it; a container simply cannot start. Host
+execution is unaffected and was exercised live.
 
-1. `providers/proxmox/tools/make-stub-template.sh <id>` -- a diskless machine
-   converted to a template clones instantly and exercises every real API path
-   without an operating system. Run it with `--dry-run` first.
-2. `reaper up`, `list`, `renew`, `down` against the real pool.
-3. Kill the heartbeat and confirm the sweeper collects the machine after
-   expiry. This one also needs the sweeper, so it is blocked twice.
-4. For **each** template: a clone boots, firstboot builds the pool and the four
-   datasets, `zfs list` is sane, and a **second** clone proves the first boot
-   did not dirty the template. Record clone wall time and disk cost -- that
-   number decides whether the storage fallback is needed.
-
-Until then the honest description is *offline-verified, live pending* -- the
-mock exercises the real HTTP client, but it is still a mock, and it agrees with
-whatever this project believes the API does.
+**The sweeper's live dry run**, from this workstation. Its credential file lives
+on the sweeper's own VM, which is deliberately not a deploy target for anything
+here, so `cull.sh --dry-run` can only be run there. The cluster was verified
+clean through the API instead.
 
 ## Decisions taken
 
@@ -247,9 +311,9 @@ Each is deliberately deferred to the phase that first needs it, per
 |---|---|
 | Heartbeat cadence and per-profile TTL defaults (strawman: renew every 10 min to now+2h for dev) | Phase 1 |
 | Whether `resources.cores`/`ram_gb` apply at clone time or are fixed per template | Phase 1 or 2 |
-| Registry strategy for image pulls: direct, or a pull-through cache on the LAN | Phase 3 |
+| ~~Registry strategy for image pulls~~ | **Decided in Phase 3: direct.** A 912 MB image pulled inside a two-minute `up`, so availability is the only thing a LAN cache would buy and digest pinning already rules out getting the wrong bytes. Revisit when a registry outage first stings |
 | `reset --to <name>` and `snapshot <name>` in v1, or deferred | Phase 4 |
-| Storage fallback if full-copy clone latency proves intolerable | Phase 2 |
+| Storage fallback if full-copy clone latency proves intolerable | **Not needed.** `up` measured at 1m56s; see the numbers above, and the unexplained gap from Phase 1's 9m20s |
 
 ## Environment facts
 
