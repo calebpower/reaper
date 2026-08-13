@@ -149,6 +149,10 @@ pub fn up(
             template: template.clone(),
             cores: g.resources.cores,
             ram_gb: g.resources.ram_gb,
+            // The tenant's size if it named one, otherwise the site's. A
+            // project with a large build cache needs a bigger pool, and that
+            // is the tenant's knowledge, not the sysadmin's.
+            data_disk_gb: Some(g.resources.disk_gb.unwrap_or(cfg.session.default_disk_gb)),
             expires_at: created_at + cfg.session.ready_grace,
         })?;
 

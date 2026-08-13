@@ -226,6 +226,21 @@ impl Provider for Proxmox {
         if let Some(ram) = req.ram_gb {
             settings.push(("memory", (u64::from(ram) * 1024).to_string()));
         }
+        // The blank disk rides along in the same call as the expiry, so it
+        // costs nothing extra and does not widen the window in which the
+        // machine exists without a tag.
+        if let Some(gb) = req.data_disk_gb {
+            let storage = self.config.data_storage.as_ref().ok_or_else(|| {
+                ProviderError::Config(format!(
+                    "a {gb} GiB session disk was requested but [proxmox].data_storage \
+                     is not set, so there is nowhere to put it"
+                ))
+            })?;
+            settings.push((
+                self.config.data_bus.as_str(),
+                format!("{storage}:{gb}"),
+            ));
+        }
 
         if let Err(tag_failure) = self
             .client

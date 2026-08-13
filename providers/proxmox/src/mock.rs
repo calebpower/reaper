@@ -27,6 +27,8 @@ pub struct Vm {
     pub pool: String,
     pub cores: Option<u32>,
     pub memory: Option<u64>,
+    /// Disks attached after creation, as bus -> "<storage>:<gib>".
+    pub extra_disks: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +129,7 @@ node       = "somenode"
 pool       = "{pool}"
 id_range   = [9000, 9099]
 token_file = "{}"
+data_storage = "stand-in-storage"
 tls        = "insecure"
 # Short, so a test exercising the timeout path finishes in seconds rather than
 # waiting out a duration chosen for full-copy clones.
@@ -145,6 +148,14 @@ task_timeout = "5s"
                 .filter(|(_, vm)| !vm.template)
                 .map(|(id, _)| id.to_string())
                 .collect()
+        })
+    }
+
+    /// What was attached to a machine after it was made, by slot.
+    pub fn attached_disks(&self, machine: &str) -> BTreeMap<String, String> {
+        let id: u32 = machine.parse().expect("handle this provider issued");
+        self.with_state(|s| {
+            s.vms.get(&id).map(|v| v.extra_disks.clone()).unwrap_or_default()
         })
     }
 
@@ -331,6 +342,7 @@ fn route(s: &mut State, method: &str, path: &str, body: &str) -> (u16, Value) {
                 pool: form.get("pool").cloned().unwrap_or_default(),
                 cores: source.cores,
                 memory: source.memory,
+                extra_disks: BTreeMap::new(),
             };
             s.vms.insert(newid, vm);
             let t = new_task(s);
@@ -364,6 +376,12 @@ fn route(s: &mut State, method: &str, path: &str, body: &str) -> (u16, Value) {
             }
             if let Some(m) = form.get("memory").and_then(|v| v.parse().ok()) {
                 vm.memory = Some(m);
+            }
+            // Anything shaped like a disk slot is a disk being attached.
+            for (k, v) in &form {
+                if k.starts_with("virtio") || k.starts_with("scsi") || k.starts_with("sata") {
+                    vm.extra_disks.insert(k.clone(), v.clone());
+                }
             }
             (200, json!({ "data": null }))
         }

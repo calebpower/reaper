@@ -408,3 +408,26 @@ fn times_are_kept_to_whole_seconds_on_purpose() {
     assert_eq!(got.expires_at, UNIX_EPOCH + Duration::from_secs(1_700_000_000));
     assert!(got.expires_at <= ragged, "truncation must never round forward");
 }
+
+#[test]
+fn the_default_pool_size_has_bounds_at_both_ends() {
+    // A typo asking for tens of thousands of gibibytes should be refused here,
+    // not by a storage backend part-way through creating a session.
+    for bad in [0, 4097, 999_999] {
+        let text = format!(
+            "provider = \"p\"\n[session]\ndefault_disk_gb = {bad}\n[guests.g]\ntemplate = \"t\"\n[p]\n"
+        );
+        assert!(parse(&text).is_err(), "default_disk_gb = {bad} should be refused");
+    }
+    for good in [1, 64, 4096] {
+        let text = format!(
+            "provider = \"p\"\n[session]\ndefault_disk_gb = {good}\n[guests.g]\ntemplate = \"t\"\n[p]\n"
+        );
+        assert!(parse(&text).is_ok(), "default_disk_gb = {good} should be accepted");
+    }
+}
+
+#[test]
+fn the_default_pool_size_defaults() {
+    assert_eq!(parse(GOOD).unwrap().session.default_disk_gb, 64);
+}

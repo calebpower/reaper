@@ -31,6 +31,7 @@ default_ttl        = "2h"    # how long a session lives without a heartbeat
 heartbeat_interval = "5m"    # how often the CLI renews it
 ready_grace        = "30m"   # the first expiry, covering creation
 max_concurrent     = 2
+default_disk_gb    = 64      # size of each session's storage pool
 
 # The guest registry. Names are free-form and mean whatever you say they mean;
 # a tenant asks for one by name and the framework looks it up here. Quote keys
@@ -49,6 +50,8 @@ node       = "somenode"
 pool       = "a/pool"
 id_range   = [9000, 9099]
 token_file = "~/.config/reaper/token"
+data_storage = "some-storage"  # where each session's blank pool disk is made
+data_bus     = "virtio1"       # which slot it hangs on; templates boot from virtio0
 tls        = "ca-file"       # webpki | ca-file | insecure
 ca_file    = "~/.config/reaper/node-ca.pem"
 ```

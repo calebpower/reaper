@@ -83,6 +83,9 @@ pub struct SessionConfig {
     /// used.
     pub ready_grace: Duration,
     pub max_concurrent: usize,
+    /// Size of the blank disk attached to each session, in gibibytes, unless a
+    /// tenant asks for something else.
+    pub default_disk_gb: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +124,7 @@ struct RawSession {
     heartbeat_interval: Option<String>,
     ready_grace: Option<String>,
     max_concurrent: Option<usize>,
+    default_disk_gb: Option<u32>,
 }
 
 impl Default for RawSession {
@@ -130,6 +134,7 @@ impl Default for RawSession {
             heartbeat_interval: None,
             ready_grace: None,
             max_concurrent: None,
+            default_disk_gb: None,
         }
     }
 }
@@ -233,6 +238,16 @@ pub fn parse(text: &str, path: &Path) -> Result<Config, ConfigError> {
         ));
     }
 
+    let default_disk_gb = raw.session.default_disk_gb.unwrap_or(64);
+    // An upper bound as well as a lower one. A typo that asks for sixty-four
+    // thousand gibibytes should be refused here rather than by a storage
+    // backend, halfway through creating a session.
+    if !(1..=4096).contains(&default_disk_gb) {
+        return Err(invalid(format!(
+            "session.default_disk_gb is {default_disk_gb}; expected between 1 and 4096"
+        )));
+    }
+
     Ok(Config {
         path: path.to_path_buf(),
         provider: raw.provider,
@@ -241,6 +256,7 @@ pub fn parse(text: &str, path: &Path) -> Result<Config, ConfigError> {
             heartbeat_interval,
             ready_grace,
             max_concurrent,
+            default_disk_gb,
         },
         guests: raw.guests,
         provider_table,

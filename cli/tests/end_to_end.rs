@@ -277,3 +277,39 @@ fn a_heartbeat_is_started_and_stopped_with_the_session() {
         "down should have stopped the heartbeat"
     );
 }
+
+#[test]
+fn a_session_gets_a_blank_disk_sized_by_the_site_default() {
+    let h = Harness::new("disk-default");
+    h.ok(&["up"]);
+    let id = h.machines()[0].clone();
+
+    let disks = h.hypervisor.attached_disks(&id);
+    assert!(
+        disks.values().any(|d| d.ends_with(":64")),
+        "expected a 64 GiB disk, attached: {disks:?}"
+    );
+    h.ok(&["down"]);
+}
+
+#[test]
+fn a_tenant_can_ask_for_a_bigger_pool_than_the_site_default() {
+    // The size is the tenant's knowledge -- a project with a large build cache
+    // needs more -- so the manifest wins over the site's default.
+    let h = Harness::new("disk-override");
+    write(
+        &h.dir.join(".reaper.yaml"),
+        "schema: 1\nproject: a-project\nguests: [a-guest]\nexec: host\n\
+         run:\n  cmd: make check\nresources:\n  disk_gb: 200\n",
+        None,
+    );
+    h.ok(&["up"]);
+    let id = h.machines()[0].clone();
+
+    let disks = h.hypervisor.attached_disks(&id);
+    assert!(
+        disks.values().any(|d| d.ends_with(":200")),
+        "expected a 200 GiB disk, attached: {disks:?}"
+    );
+    h.ok(&["down"]);
+}

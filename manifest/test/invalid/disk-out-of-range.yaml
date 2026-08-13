@@ -1,0 +1,10 @@
+# A pool size nothing could satisfy. Refused here rather than by a storage
+# backend halfway through creating a session.
+schema: 1
+project: enormous
+guests: [some-guest]
+exec: host
+run:
+  cmd: make e2e
+resources:
+  disk_gb: 99999

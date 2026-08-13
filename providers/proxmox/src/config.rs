@@ -32,6 +32,13 @@ pub struct Config {
     pub pool: String,
     pub ids: IdRange,
     pub token_file: PathBuf,
+    /// Storage for the blank disk attached to each session. `None` means this
+    /// provider cannot attach one, which is only workable if the templates
+    /// carry their own.
+    pub data_storage: Option<String>,
+    /// Where that disk hangs. The templates boot from `virtio0`, so the data
+    /// disk goes on the next VirtIO slot unless a site says otherwise.
+    pub data_bus: String,
     pub tls: Tls,
     /// How long to wait for an asynchronous operation before giving up on
     /// knowing its outcome. Generous by default: a full-copy clone on storage
@@ -59,6 +66,8 @@ struct Raw {
     pool: String,
     id_range: [u32; 2],
     token_file: String,
+    data_storage: Option<String>,
+    data_bus: Option<String>,
     tls: String,
     ca_file: Option<String>,
     task_timeout: Option<String>,
@@ -139,6 +148,8 @@ pub fn from_table(table: &toml::Value) -> Result<Config, ConfigError> {
         pool: raw.pool,
         ids,
         token_file: expand_tilde(&raw.token_file),
+        data_storage: raw.data_storage,
+        data_bus: raw.data_bus.unwrap_or_else(|| "virtio1".to_string()),
         tls,
         task_timeout: parse_dur("task_timeout", raw.task_timeout.as_ref(), "10m")?,
         request_timeout: parse_dur("request_timeout", raw.request_timeout.as_ref(), "30s")?,

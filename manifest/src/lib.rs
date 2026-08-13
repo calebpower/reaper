@@ -106,6 +106,9 @@ pub struct Run {
 pub struct Resources {
     pub cores: Option<u16>,
     pub ram_gb: Option<u16>,
+    /// Size of the session's storage pool, in gibibytes. `None` defers to the
+    /// site's default.
+    pub disk_gb: Option<u32>,
 }
 
 /// One guest, with the top-level defaults already merged in.

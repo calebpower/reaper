@@ -49,6 +49,16 @@ pub struct CreateRequest {
     pub template: String,
     pub cores: Option<u16>,
     pub ram_gb: Option<u16>,
+    /// A blank disk to attach, in gibibytes, for the session's storage pool.
+    ///
+    /// Attached rather than carried by the template on purpose. Where cloning
+    /// is a byte-for-byte copy, a data disk in the template is copied in full
+    /// on every session whether or not anything is on it -- so this is created,
+    /// not copied, and its size is a per-session decision rather than one
+    /// frozen when the template was built.
+    ///
+    /// `None` means the template already provides one.
+    pub data_disk_gb: Option<u32>,
     /// When this machine stops being anybody's responsibility.
     ///
     /// Part of creation rather than a follow-up call, so that the window

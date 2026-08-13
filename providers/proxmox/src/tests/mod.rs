@@ -24,6 +24,8 @@ fn provider_for(pve: &MockPve) -> Proxmox {
         pool: POOL.to_string(),
         ids: IdRange::new(9000, 9099).unwrap(),
         token_file: "/dev/null".into(),
+        data_storage: Some("some-storage".to_string()),
+        data_bus: "virtio1".to_string(),
         tls: Tls::Insecure,
         task_timeout: Duration::from_secs(2),
         request_timeout: Duration::from_secs(5),
@@ -58,6 +60,7 @@ fn request(name: &str, expires: u64) -> CreateRequest {
         template: "9000".to_string(),
         cores: Some(4),
         ram_gb: Some(8),
+        data_disk_gb: Some(64),
         expires_at: at(expires),
     }
 }
@@ -427,6 +430,7 @@ node = "somenode"
 pool = "a/pool"
 id_range = [9000, 9099]
 token_file = "/dev/null"
+data_storage = "some-storage"
 "#;
 
 fn with(extra: &str) -> std::result::Result<Config, crate::config::ConfigError> {
@@ -492,7 +496,7 @@ fn an_unknown_tls_mode_is_refused_rather_than_defaulted() {
 
 #[test]
 fn an_empty_pool_is_refused_with_a_reason() {
-    let t = table("api = \"https://n\"\nnode = \"n\"\npool = \"\"\nid_range = [9000, 9099]\ntoken_file = \"/dev/null\"\ntls = \"webpki\"\n");
+    let t = table("api = \"https://n\"\nnode = \"n\"\npool = \"\"\nid_range = [9000, 9099]\ntoken_file = \"/dev/null\"\ndata_storage = \"s\"\ntls = \"webpki\"\n");
     let e = crate::config::from_table(&t).expect_err("should refuse");
     assert!(e.to_string().contains("must be placed"), "{e}");
 }
@@ -546,4 +550,97 @@ fn a_token_that_is_not_shaped_like_a_credential_is_refused() {
         let p = token_file(label, body, 0o600);
         assert!(crate::config::read_token(&p).is_err(), "{label} should be refused");
     }
+}
+
+// --- the session's disk ----------------------------------------------------
+
+#[test]
+fn a_blank_disk_is_attached_at_the_requested_size() {
+    // Attached rather than carried by the template: where cloning is a
+    // byte-for-byte copy, a template disk is copied in full every session.
+    let pve = pve_with_template();
+    let p = provider_for(&pve);
+
+    let m = p.create(&request("a-session", 1)).expect("create");
+    let disks = pve.attached_disks(m.as_str());
+
+    assert_eq!(
+        disks.get("virtio1").map(String::as_str),
+        Some("some-storage:64"),
+        "attached: {disks:?}"
+    );
+}
+
+#[test]
+fn the_disk_is_attached_in_the_same_call_as_the_expiry() {
+    // Not thrift for its own sake: a separate call would widen the window in
+    // which the machine exists without a tag, and that window is the one
+    // unrecoverable state in the design.
+    let pve = pve_with_template();
+    let p = provider_for(&pve);
+    p.create(&request("a-session", 1_700_000_000)).expect("create");
+
+    let config_calls = pve
+        .paths()
+        .iter()
+        .filter(|path| path.ends_with("/config"))
+        .count();
+    assert_eq!(config_calls, 1, "expected one config write, saw {config_calls}");
+}
+
+#[test]
+fn a_template_that_carries_its_own_disk_gets_no_second_one() {
+    let pve = pve_with_template();
+    let p = provider_for(&pve);
+    let mut req = request("a-session", 1);
+    req.data_disk_gb = None;
+
+    let m = p.create(&req).expect("create");
+    assert!(
+        pve.attached_disks(m.as_str()).is_empty(),
+        "nothing should have been attached"
+    );
+}
+
+#[test]
+fn asking_for_a_disk_with_nowhere_to_put_it_is_refused_clearly() {
+    let pve = pve_with_template();
+    let mut config = Config {
+        api: pve.url(),
+        node: NODE.to_string(),
+        pool: POOL.to_string(),
+        ids: IdRange::new(9000, 9099).unwrap(),
+        token_file: "/dev/null".into(),
+        data_storage: None,
+        data_bus: "virtio1".to_string(),
+        tls: Tls::Insecure,
+        task_timeout: Duration::from_secs(2),
+        request_timeout: Duration::from_secs(5),
+    };
+    config.data_storage = None;
+    let mut p = Proxmox::with_token(config, "someone@realm!t=s".into()).unwrap();
+    p.set_poll_interval(Duration::from_millis(5));
+
+    let e = p.create(&request("a-session", 1)).unwrap_err();
+    assert!(e.to_string().contains("data_storage"), "{e}");
+}
+
+#[test]
+fn the_disk_slot_is_configurable() {
+    // Templates boot from virtio0 here, but a site whose templates differ
+    // should not have to patch the provider.
+    let pve = pve_with_template();
+    let mut config = crate::config::from_table(&table(&format!(
+        "{}\nnode = \"{NODE}\"\npool = \"{POOL}\"\nid_range = [9000, 9099]\n\
+         token_file = \"/dev/null\"\ndata_storage = \"s\"\ndata_bus = \"scsi3\"\ntls = \"insecure\"\n",
+        format_args!("api = \"{}\"", pve.url())
+    )))
+    .expect("config");
+    config.task_timeout = Duration::from_secs(2);
+    let mut p = Proxmox::with_token(config, "someone@realm!t=s".into()).unwrap();
+    p.set_poll_interval(Duration::from_millis(5));
+
+    let m = p.create(&request("a-session", 1)).expect("create");
+    let disks = pve.attached_disks(m.as_str());
+    assert_eq!(disks.get("scsi3").map(String::as_str), Some("s:64"), "{disks:?}");
 }
