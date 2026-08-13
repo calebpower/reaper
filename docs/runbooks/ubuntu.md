@@ -77,13 +77,24 @@ Let it finish, then reboot and log in at the console.
 ```sh
 sudo apt-get update
 sudo apt-get install --no-install-recommends -y \
-    zfsutils-linux podman qemu-guest-agent rsync
+    zfsutils-linux podman nftables qemu-guest-agent rsync
 ```
 
-Four packages, and each is in the guest contract for a reason: ZFS is the
+Five packages, and each is in the guest contract for a reason: ZFS is the
 rollback mechanism, podman runs the toolchains, the guest agent is how the
 address is discovered, and rsync is how a working tree gets in and results get
 out.
+
+**`nftables` is the one this runbook originally missed**, and it is worth
+knowing why. `--no-install-recommends` is right -- it is what keeps a template
+from acquiring a package set nobody chose -- but podman only *recommends* the
+packet-filter tooling its network backend drives. Without it podman installs,
+starts, reports itself healthy, and pulls images perfectly. It fails the first
+time anything tries to *run* a container, minutes into a build, with an error
+about a missing `nft` binary that reads like a fault in the tenant's toolchain.
+
+The check in step 9 exists because of that, and so does the one the runner now
+performs after a pre-pull.
 
 **Do not install a language toolchain.** Not a JDK, not Node, not Rust. On a
 container-execution template a compiler nobody declared is a compiler nobody can
@@ -259,7 +270,11 @@ Do not trust the build; test it. The phase's acceptance criteria are:
 1. `reaper up` against this guest produces a machine that reports an address.
 2. Firstboot builds the pool and the four datasets — `zfs list` over SSH shows
    `tank`, `tank/images`, `tank/cache`, `tank/state`, `tank/work`.
-3. `podman info` runs.
+3. **A container actually runs** — `podman run --rm <some pinned image> /bin/true`.
+   Not `podman info`, which is what this said first and which is exactly the
+   check that let a template ship unable to start a container at all. `info`
+   inspects configuration; it exercises no part of the runtime or the network
+   backend.
 4. **A second clone works too.** This is the one people skip. It proves the
    first boot did not dirty the template — if machine-id or host keys survived
    step 6, two clones will collide and you want to find that now.

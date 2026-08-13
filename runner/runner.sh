@@ -331,7 +331,23 @@ valid_image() {
 }
 
 work_dir()  { printf '%s/work/%s\n' "${POOL_MOUNT}" "$1"; }
-cache_dir() { printf '%s/cache/%s\n' "${POOL_MOUNT}" "$1"; }
+
+# Warm caches persist between runs and are never rolled back. A cold run gets
+# the same variable and the same path inside a container, pointing at a
+# directory that is emptied first.
+#
+# Not "no variable at all", which is what this used to do: a tenant's command
+# that names a cache path -- the documented way to use one -- then expanded it
+# to nothing and failed inside the toolchain with a message about an empty
+# string. Determinism mode means the cache is not warm. It does not mean the
+# tenant writes their command twice.
+cache_dir() {
+    if [ -n "${COLD:-}" ]; then
+        printf '%s/cold/%s\n' "${POOL_MOUNT}" "$1"
+    else
+        printf '%s/cache/%s\n' "${POOL_MOUNT}" "$1"
+    fi
+}
 
 # A cache name as an environment variable suffix. A manifest name may carry a
 # dot or a hyphen; an environment variable may not.
@@ -369,14 +385,33 @@ cmd_pull() {
         valid_image "${pull_ref}" || usage "pull: ${pull_ref} is not a digest-pinned image"
         announce "pull ${pull_ref}"
         "${pull_engine}" pull "${pull_ref}" >&2 || die "could not pull ${pull_ref}"
+        pull_last=${pull_ref}
     done
+
+    # Then prove the engine can actually *start* one.
+    #
+    # Pulling exercises none of the container runtime: an engine with a broken
+    # network backend pulls perfectly, reports itself healthy, and fails only
+    # when something tries to run. That is exactly how a template shipped here
+    # with podman installed and no packet-filter tooling for netavark to drive,
+    # and the failure surfaced minutes later inside a build as an error about a
+    # missing `nft` binary. Checking here costs one container start and moves
+    # the discovery to the moment the template is first used.
+    if ! "${pull_engine}" run --rm "${pull_last}" /bin/true >&2; then
+        die "${pull_engine} can fetch images here but cannot run one. That is a
+       fault in this guest's template rather than in anything a tenant wrote --
+       usually a container engine installed without the packet-filter tooling
+       its network backend needs. Until it is fixed, only host execution will
+       work on this guest"
+    fi
 }
 
 cmd_exec() {
-    exec_project=""; exec_job=""; exec_image=""; exec_caches=""
+    exec_project=""; exec_job=""; exec_image=""; exec_caches=""; COLD=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
+            --cold) COLD=1; shift ;;
             --project|--job|--image|--cache)
                 [ $# -ge 2 ] || usage "exec: $1 needs a value"
                 case "$1" in
@@ -401,7 +436,15 @@ cmd_exec() {
 
     for exec_c in ${exec_caches}; do
         valid_name "${exec_c}" || usage "exec: ${exec_c} is not a usable cache name"
-        mkdir -p "$(cache_dir "${exec_c}")" || die "cannot make the ${exec_c} cache"
+        exec_dir=$(cache_dir "${exec_c}")
+        if [ -n "${COLD}" ]; then
+            # Emptied rather than merely separate. A cold run that inherited
+            # the last cold run's output would answer a different question from
+            # the one determinism mode is asked.
+            announce "empty the cold ${exec_c} cache at ${exec_dir}"
+            rm -rf "${exec_dir}" || die "cannot clear the cold ${exec_c} cache"
+        fi
+        mkdir -p "${exec_dir}" || die "cannot make the ${exec_c} cache"
     done
 
     if [ -n "${exec_image}" ]; then

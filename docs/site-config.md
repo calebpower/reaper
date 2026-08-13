@@ -32,6 +32,8 @@ heartbeat_interval = "5m"    # how often the CLI renews it
 ready_grace        = "30m"   # the first expiry, covering creation
 max_concurrent     = 2
 default_disk_gb    = 64      # size of each session's storage pool
+rsync_command      = "rsync"  # the binary that moves the tree and the results
+results_interval   = "5s"    # how often results are pulled while a command runs
 
 # The guest registry. Names are free-form and mean whatever you say they mean;
 # a tenant asks for one by name and the framework looks it up here. Quote keys
@@ -61,6 +63,12 @@ rather than assumed: a provider with no table, an empty registry, a guest with
 no template, a heartbeat that does not fit at least three times into the TTL.
 That last one is a margin rather than a formality -- it is what lets two
 renewals fail before a machine is lost.
+
+`ssh_command` and `rsync_command` exist so a site can point at a wrapper, and
+because it is what lets the whole path be exercised with no network at all.
+`results_interval` is how often a run's output is fetched back *while it is
+still running*; the shorter it is, the less of a trace can be lost when a
+session is taken down mid-run, and the more often a small transfer happens.
 
 ## What it holds
 

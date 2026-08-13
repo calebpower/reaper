@@ -42,6 +42,18 @@ mDNS -- a guest agent is the usual mechanism.
 `exec: container` tenants. Templates serving only `exec: host` tenants do not
 need one, and firstboot skips the image-store configuration when it finds none.
 
+Note that execution mode is a property of a *verb* rather than of a guest, so a
+template may well serve a tenant that builds in a container and runs on the
+host. The requirement is unchanged: an engine is needed if any verb aimed at
+this guest asks for one.
+
+And "provides a container engine" means one that can **start a container**, not
+one that is installed. The distinction is not pedantic: an engine missing the
+packet-filter tooling its network backend drives installs cleanly, reports
+itself healthy, and pulls images without complaint, failing only when something
+tries to run. That is how a template shipped here in exactly that state. The
+runner now proves it after a pre-pull, at the cost of one container start.
+
 ## What a template does *not* provide
 
 Three things it might seem to need, and does not.
@@ -132,6 +144,44 @@ carry results outward.
 Firstboot also caps the ZFS ARC (1--2 GB is the working figure) so the cache
 does not compete with the workload under test for memory. A database and a
 browser in the same machine will both lose that fight.
+
+## Inside those datasets
+
+The runner makes two more layers, on demand rather than up front:
+
+| Path | What |
+|---|---|
+| `tank/work/<project>` | one project's synced tree |
+| `tank/work/<project>/out` | where that project's results are collected from |
+| `tank/cache/<name>` | one directory per cache the tenant declared |
+
+Directories rather than datasets, deliberately. A dataset per cache would buy
+per-cache `zfs list` figures and nothing else, since `reset` never touches
+`cache` whichever it is.
+
+The results directory is made before the first job runs. Making it lazily would
+mean the first attempt to fetch results failed on a directory that never
+existed, and that failure reads as though results had been lost.
+
+## Where a container sees them
+
+Under container execution the runner mounts three things, at paths that are
+fixed and documented rather than configurable:
+
+| Inside | From |
+|---|---|
+| `/reaper/work` | `tank/work/<project>` |
+| `/reaper/cache/<name>` | `tank/cache/<name>` |
+| `/reaper/job.sh` | the rendered job, read-only |
+
+Fixed because these paths reach a tenant's environment as `REAPER_WORK` and
+`REAPER_CACHE_*`, and a site that moved them would quietly break every manifest
+written against the documented ones. Read-only for the job because nothing
+inside a container has any business rewriting what it was asked to run.
+
+The runner is the only component that knows any of this. The CLI asks it where a
+workspace is rather than working the path out for itself, so pool layout stays
+one component's business.
 
 ## Registering a guest
 

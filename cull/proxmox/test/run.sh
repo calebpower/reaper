@@ -32,7 +32,11 @@ REAL_TOOLS="jq awk sed grep tr sort cat mkdir rm chmod cut head wc printf ln env
 
 new_case() {
     CASE="$1"
-    WORK=$(mktemp -d -t reaper-cull)
+    # Not `mktemp -d -t <name>`. That is portable-looking and is not: on one
+    # system the argument is a prefix, on another it is a template that must
+    # end in X's, and there it fails outright. A full template works on both,
+    # and this suite has to run on the systems it tests.
+    WORK=$(mktemp -d "${TMPDIR:-/tmp}/reaper-cull.XXXXXXXX")
     mkdir -p "${WORK}/bin" "${WORK}/fix"
     : > "${WORK}/log"
 

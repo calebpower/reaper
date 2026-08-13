@@ -764,14 +764,14 @@ pub fn exec(
             Exec::Host => None,
         };
 
-        // A cold profile mounts nothing. That is the whole of determinism mode:
-        // if a run passes here, a warm cache was not the reason.
+        // A cold profile still names every cache; what changes is that the
+        // runner gives it an empty one. That is the whole of determinism mode:
+        // if a run passes here, a warm cache was not the reason. Dropping the
+        // names instead -- which this did first -- broke every command that
+        // referred to a cache path, which is the documented way to use one.
         let warm = profile.and_then(|p| p.warm_cache) != Some(false);
-        let caches: Vec<String> = if warm {
-            g.build.as_ref().map(|b| b.cache.clone()).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let caches: Vec<String> =
+            g.build.as_ref().map(|b| b.cache.clone()).unwrap_or_default();
 
         let env: BTreeMap<String, String> = job::overlay(verb_env, profile.map(|p| &p.env));
         let script = job::render(cmd, &env);
@@ -793,6 +793,9 @@ pub fn exec(
         }
         for c in &caches {
             command.push_str(&format!(" --cache {c}"));
+        }
+        if !warm {
+            command.push_str(" --cold");
         }
 
         let rsh = sync::rsh_wrapper(&ssh, &state_file(&s.name, "rsh")?)?;

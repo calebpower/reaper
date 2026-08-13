@@ -29,6 +29,9 @@ run:
   cmd: make e2e
   images: [registry/thing@sha256:...]    # optional; pre-pulled for you
 
+sync:
+  exclude: [/target/]              # optional; rsync patterns
+
 reset:
   datasets: [state]
 
@@ -118,6 +121,96 @@ The tradeoff is real and worth naming: host execution moves your toolchain from
 something you pin in a manifest to something the sysadmin bakes into a template.
 You gain access to the host; you lose the guarantee that the toolchain is what
 you said it was. Pick deliberately.
+
+### And you may pick differently per verb
+
+`exec` at the top level is a default. Either verb may override it:
+
+```yaml
+exec: container
+build:
+  image: registry/jdk@sha256:...
+  cmd: ./gradlew shadowJar
+run:
+  exec: host                 # brings up a pod, so it needs the engine
+  cmd: e2e/run.sh
+```
+
+This is not a nicety. A toolchain image carries a compiler and no
+container-engine client, so a `run` that orchestrates containers cannot execute
+inside one -- while a `run` that is simply `cargo test` very much wants to. Both
+are ordinary, and neither is expressible if execution mode belongs to the guest.
+
+A container-execution `run` that names no `image` of its own runs in
+`build.image`, so a project whose two verbs share one toolchain writes the
+digest once. A host-execution verb never inherits one.
+
+## The loop
+
+Four verbs, and the first is the only one that costs minutes.
+
+```sh
+reaper up            # clone a machine, build its pool, fetch your images
+reaper sync          # your tree in, results back out
+reaper build         # your build command
+reaper run           # your run command
+reaper down          # destroy it, results collected on the way
+```
+
+`sync`, `build` and `run` each act on every session this project has, so a
+manifest naming two guests tests both with one command. Name a session to act on
+just one.
+
+### What sync does, and what it deliberately does not
+
+Forward, it is a delta copy of your tree with **deletions mirrored**: a session
+still holding a file you removed is not the tree you are testing. `.git` goes
+with it -- never needing a commit is the point, plenty of builds stamp a version
+out of it, and after the first sync the deltas make it cheap. Anything you would
+rather not send goes in `sync.exclude`, as rsync patterns; a leading slash
+anchors one at the top of your tree.
+
+Backward, it is `out/` and only `out/`, and it **never deletes**. The session is
+authoritative for what it produced; it is not authoritative for what was in your
+`out/` beforehand.
+
+`out/` is excluded from the forward direction whatever else you write, because
+mirroring deletions into the directory results arrive in would destroy them.
+
+### Results arrive while a run is happening
+
+Not at the end. A trace is fetched back every few seconds for as long as your
+command runs, once more when it stops -- whether it passed or failed -- and once
+more when you take the session down. A failure trace that exists only on a
+machine scheduled for destruction is a failure trace nobody reads, and the runs
+worth investigating are exactly the ones that end with somebody giving up.
+
+### Where your command runs, and what it is told
+
+Working directory is your synced tree. Three kinds of variable are set for you,
+with the same names in both execution modes so your commands need not know
+which one they got:
+
+| Variable | What it is |
+|---|---|
+| `REAPER_WORK` | your tree |
+| `REAPER_OUT` | where results are collected from |
+| `REAPER_CACHE_<NAME>` | one per name in `build.cache`, uppercased, `-` and `.` becoming `_` |
+
+Your `cmd` is handed to a shell, so it may use those:
+
+```yaml
+cmd: CARGO_TARGET_DIR=$REAPER_CACHE_TARGET cargo build --locked
+```
+
+Values under `env` are **not** expanded -- they are passed through exactly as
+written, and the framework never interpolates or interprets one. If you want
+expansion, it belongs in the command.
+
+Caches are declared once, under `build.cache`, and are given to every verb. A
+profile with `warm_cache: false` gives none of them to any verb: not an unset
+variable but no cache at all, because a cache reachable by a path you could
+guess would quietly defeat the one thing determinism mode establishes.
 
 ## Digests, not tags
 

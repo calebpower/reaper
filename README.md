@@ -12,12 +12,12 @@ The purpose is the tight `edit -> test` cycle *before* commit and push. It is
 deliberately **not** a CI platform. CI remains the independent re-proof after
 you push, and nothing here replaces it.
 
-> **Status: Phase 1.** The CLI can bring a session up, list it, renew it and
-> take it down, against a provider behind a seam -- all verified offline against
-> a stand-in hypervisor, none of it yet run against a real one. The runner and
-> the guest templates are Phases 2 onward. See [`docs/STATUS.md`](docs/STATUS.md)
-> for where the work actually stands, which is the document to trust over this
-> one when they disagree.
+> **Status: Phase 3.** A session can be brought up, listed, renewed and taken
+> down; a guest template exists and is proven; and a working tree can be synced
+> in, built, run, and its results collected back out. `reset` and the
+> `@pristine` snapshot are Phase 4. See [`docs/STATUS.md`](docs/STATUS.md) for
+> where the work actually stands, which is the document to trust over this one
+> when they disagree.
 
 ## Vocabulary
 
@@ -128,15 +128,25 @@ portfolio and what question each tier uniquely answers.
 
 ## Getting started
 
-There is nothing to run yet beyond the manifest validator and the sweeper's
-self-test; see [`docs/STATUS.md`](docs/STATUS.md). When there is, the shape will
-be:
-
 1. A sysadmin builds a guest template and registers it
    ([`docs/guests.md`](docs/guests.md), [`docs/site-config.md`](docs/site-config.md)).
 2. You write a `.reaper.yaml` in your project
    ([`docs/tenants.md`](docs/tenants.md), `manifest/examples/`).
-3. `reaper test` syncs, builds, resets and runs.
+3. Then, from your project:
+
+```sh
+reaper up      # a machine of your own, with your images already fetched
+reaper sync    # your uncommitted tree in, results back out
+reaper build   # your build command, in your pinned toolchain
+reaper run     # your run command; traces arrive while it runs
+reaper down    # gone, and gone anyway if you vanish
+```
+
+`reset` is Phase 4, and `reaper test` -- sync, build, reset, run as one verb --
+arrives with it. See [`docs/STATUS.md`](docs/STATUS.md).
+
+This repository is its own first tenant: the `.reaper.yaml` at the root is real,
+and `reaper run` here runs reaper's whole battery inside a session.
 
 ## License
 

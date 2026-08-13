@@ -605,9 +605,13 @@ fn a_cold_profile_mounts_no_cache_and_wins_on_environment() {
     assert!(out.contains("cold"), "the operator should be told: {out}");
 
     let ssh = h.log("ssh.log");
+    // The caches are still named -- the runner is what makes them empty. A
+    // tenant's command that refers to a cache path is the documented way to
+    // use one, and dropping the names broke exactly that.
+    assert!(ssh.contains("--cache deps"), "{ssh}");
     assert!(
-        !ssh.contains("--cache"),
-        "determinism mode mounts nothing: {ssh}"
+        ssh.contains("--cold"),
+        "the runner has to be told this is determinism mode: {ssh}"
     );
 
     // A profile changes how a session is run, so it wins where both name the

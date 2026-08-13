@@ -43,15 +43,16 @@ run:
   # exercises less of it than `tools/check.sh` does on a workstation.
   #
   # The apt line is the honest cost of not having a purpose-built builder
-  # image: the stock Rust image carries neither rsync nor shellcheck, and both
-  # are real dependencies of this project's own suite -- rsync because reaper
-  # uses it, shellcheck because reaper is half shell. Installing them is the
+  # image: the stock Rust image carries none of rsync, shellcheck or jq, and all
+  # three are real dependencies of this project's own suite -- rsync because
+  # reaper uses it, shellcheck because reaper is half shell, jq because the
+  # sweeper's self-test reads canned API replies. Installing them is the
   # tenant's business and not the framework's, which never learns what any of
   # this means. The right answer is a builder image with them baked in;
   # inventing one nobody has built would be the worse kind of wrong, which is
   # the same call manifest/examples/README.md records.
   cmd: >-
-    apt-get -qq update && apt-get -qq install -y rsync shellcheck &&
+    apt-get -qq update && apt-get -qq install -y rsync shellcheck jq &&
     CARGO_HOME=$REAPER_CACHE_CARGO
     CARGO_TARGET_DIR=$REAPER_CACHE_TARGET
     cargo test --workspace --locked &&

@@ -36,7 +36,11 @@ REAL_TOOLS="awk sed grep tr sort cat mkdir rm chmod cut head wc printf ln env sh
 
 new_case() {
     CASE="$1"
-    WORK=$(mktemp -d -t reaper-runner)
+    # Not `mktemp -d -t <name>`. That is portable-looking and is not: on one
+    # system the argument is a prefix, on another it is a template that must
+    # end in X's, and there it fails outright. A full template works on both,
+    # and this suite has to run on the systems it tests.
+    WORK=$(mktemp -d "${TMPDIR:-/tmp}/reaper-runner.XXXXXXXX")
     mkdir -p "${WORK}/bin" "${WORK}/fix" "${WORK}/sysroot" "${WORK}/pool"
     : > "${WORK}/log"
 
@@ -454,19 +458,31 @@ log_has 'REAPER_CACHE_BUILD_DIR=/reaper/cache/build-dir'
 log_has '/bin/sh /reaper/job.sh'
 if [ -d "${WORK}/pool/cache/cargo" ]; then ok "made the cargo cache"; else bad "cache directory missing"; fi
 
-new_case "a cold profile mounts no cache at all"
+new_case "a cold run gets an empty cache, not a missing one"
 FAKE_PLATFORM=Linux
 with_engine
 job=$(a_job)
 run_runner workspace --project a-project
-if run_runner exec --project a-project --job "${job}" \
-     --image docker.io/library/example@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef; then :; else bad "exec should have succeeded"; fi
+# Something left behind by an earlier cold run, which must not survive.
+mkdir -p "${WORK}/pool/cold/cargo"
+: > "${WORK}/pool/cold/cargo/stale"
+if run_runner exec --project a-project --job "${job}" --cold \
+     --image docker.io/library/example@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+     --cache cargo; then :; else bad "exec should have succeeded"; fi
 log_has 'podman run --rm'
-# Not merely unset: a cold run must not even name a cache. Determinism mode is
-# the control for "was the warm cache the reason this passed", and a cache
-# reachable by a path the tenant could guess would defeat it.
-log_lacks '/reaper/cache'
-log_lacks 'REAPER_CACHE_'
+# The load-bearing claim: nothing from the warm cache is reachable. That is what
+# makes determinism mode a control for "was the warm cache the reason this
+# passed".
+log_lacks "${WORK}/pool/cache"
+# But the tenant still gets the variable and the same path inside, because a
+# command that names a cache path is the documented way to use one.
+log_has 'REAPER_CACHE_CARGO=/reaper/cache/cargo'
+log_has "${WORK}/pool/cold/cargo:/reaper/cache/cargo"
+if [ -e "${WORK}/pool/cold/cargo/stale" ]; then
+    bad "a cold run must not inherit the last cold run's output"
+else
+    ok "the cold cache was emptied first"
+fi
 
 new_case "host execution runs the job here, with no engine involved"
 FAKE_PLATFORM=Linux

@@ -14,7 +14,11 @@ set -eu
 here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 root=$(CDPATH='' cd -- "${here}/../.." && pwd)
 
-validate="${root}/target/debug/reaper-manifest-validate"
+# CARGO_TARGET_DIR, when set, is where cargo actually put it. Assuming
+# ./target instead means this suite cannot run anywhere the build output has
+# been redirected -- which is exactly what a session does, so reaper could not
+# run its own schema suite inside one.
+validate="${CARGO_TARGET_DIR:-${root}/target}/debug/reaper-manifest-validate"
 if [ ! -x "${validate}" ]; then
     echo "building the validator first" >&2
     ( cd "${root}" && cargo build --quiet --manifest-path manifest/Cargo.toml ) \

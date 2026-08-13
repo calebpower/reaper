@@ -160,6 +160,7 @@ fn make_executable(at: &Path) -> Result<()> {
 /// artifact costs more than it saves.
 pub fn push(rsync: &str, rsh: &Path, ssh: &Ssh, local: &Path, remote: &str, exclude: &[String]) -> Plan {
     let mut args = vec!["-a".to_string(), "--delete".to_string()];
+    args.extend(ownership());
     args.push(format!("--exclude=/{RESULTS}/"));
     for pattern in exclude {
         args.push(format!("--exclude={pattern}"));
@@ -180,14 +181,26 @@ pub fn push(rsync: &str, rsh: &Path, ssh: &Ssh, local: &Path, remote: &str, excl
 /// entire purpose is that a failure trace must never exist only on a machine
 /// scheduled for destruction.
 pub fn pull(rsync: &str, rsh: &Path, ssh: &Ssh, remote: &str, local: &Path) -> Plan {
-    let args = vec![
-        "-a".to_string(),
+    let mut args = vec!["-a".to_string()];
+    args.extend(ownership());
+    args.extend([
         "-e".to_string(),
         rsh.to_string_lossy().to_string(),
         format!("{}:{}", ssh.rsync_host(), with_slash(remote)),
         dir(local),
-    ];
+    ]);
     Plan { program: rsync.to_string(), args }
+}
+
+/// Numeric owners are not carried across.
+///
+/// `-a` preserves them, and the two machines share no user database, so a tree
+/// synced from a workstation lands owned by a uid the guest has never heard of.
+/// Everything in a session runs as root, and the practical result of the
+/// default is that tools which check who owns what -- git's own repository
+/// ownership check is the one that bit -- refuse to work on the synced tree.
+fn ownership() -> [String; 2] {
+    ["--no-owner".to_string(), "--no-group".to_string()]
 }
 
 /// A trailing slash on a source means "the contents of", and on a destination
