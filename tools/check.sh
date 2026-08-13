@@ -28,6 +28,7 @@ run() { # run <label> <command...>
 run "shell lint"       ./tools/lint-shell.sh
 run "seam guards"      ./tools/guards.sh
 run "manifest schema"  ./manifest/test/run.sh
+run "runner decisions" ./runner/test/run.sh
 
 # The sweeper is provider-specific and arrives with its provider. Absent is
 # fine; present but unrunnable is not.

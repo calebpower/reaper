@@ -85,8 +85,14 @@ guard_guest() {
     #
     # manifest/examples is allowed because guest *names* are tenant-chosen
     # strings that quite reasonably say which system they mean.
+    #
+    # runner/ is allowed because it *is* the platform module -- the one place
+    # operating-system specifics are supposed to live. This used to say
+    # runner/platform/, from when the runner was going to be a compiled binary
+    # with a platform sub-module; it is a single shell script delivered over
+    # SSH, so the directory is the boundary.
     scan "guest seam" \
-        '^(docs/|README\.md$|manifest/examples/|runner/platform/|tools/guards\.sh$)' \
+        '^(docs/|README\.md$|manifest/examples/|runner/|tools/guards\.sh$)' \
         'systemctl|systemd|apt-get|dpkg |zfsutils-linux|/dev/(vd|vtbd|sd|nvme)[a-z0-9]|rc\.conf|\brc\.d\b|\b(ubuntu|debian|freebsd|alpine|centos|fedora)\b' \
         "An operating system leaked out of the runner's platform modules. The
 guest seam exists so that adding a system is a template build and a
