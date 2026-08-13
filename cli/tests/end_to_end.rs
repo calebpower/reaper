@@ -309,6 +309,20 @@ fn a_heartbeat_is_started_and_stopped_with_the_session() {
         "the heartbeat should be running"
     );
 
+    // It must be its own session leader, or it dies with the terminal that
+    // started it -- which offline testing cannot notice, because nothing here
+    // signals the process group. Found live: the heartbeat was gone the moment
+    // `up` returned.
+    let sid = std::process::Command::new("ps")
+        .args(["-o", "sid=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps");
+    let sid: u32 = String::from_utf8_lossy(&sid.stdout).trim().parse().unwrap_or(0);
+    assert_eq!(
+        sid, pid,
+        "the heartbeat must be its own session leader (sid {sid} != pid {pid})"
+    );
+
     h.ok(&["down"]);
     std::thread::sleep(Duration::from_millis(200));
     assert!(

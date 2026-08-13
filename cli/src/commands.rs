@@ -278,12 +278,32 @@ fn start_heartbeat(session: &str) -> Result<Option<u32>> {
         .append(true)
         .open(&log_path)?;
 
-    let child = std::process::Command::new(exe)
-        .args(["heartbeat", "--session", session])
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["heartbeat", "--session", session])
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
-        .stderr(log)
-        .spawn()?;
+        .stderr(log);
+
+    // Detach into its own session, so it outlives the terminal that started
+    // it. Without this the heartbeat stays in the parent's process group and
+    // dies when that group is signalled -- closing the shell after `up` would
+    // silently stop renewing, and the machine would be collected hours later
+    // while someone was still working on it. The dead-man's switch is meant to
+    // fire when the operator vanishes, not when their terminal does.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            // Safety: setsid in the child between fork and exec is
+            // async-signal-safe. It fails only if we are already a group
+            // leader, which a freshly forked child is not.
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let child = cmd.spawn()?;
 
     Ok(Some(child.id()))
 }
