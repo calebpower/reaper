@@ -1,0 +1,391 @@
+//! A stand-in Proxmox API, over loopback.
+//!
+//! Deliberately a real HTTP server rather than a stubbed-out client. The whole
+//! request path -- URL building, the authorization header, form encoding, the
+//! `{"data": ...}` envelope, status handling, task polling -- is the part most
+//! likely to be subtly wrong, and a fake that replaced it would test nothing
+//! but the fake.
+//!
+//! It is also why plain HTTP to loopback is permitted by the provider's own
+//! endpoint check: that rule exists so this can work without a certificate,
+//! and it is defensible on its own terms.
+
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use serde_json::{json, Value};
+
+#[derive(Debug, Clone, Default)]
+pub struct Vm {
+    pub name: String,
+    pub tags: String,
+    pub running: bool,
+    pub template: bool,
+    pub pool: String,
+    pub cores: Option<u32>,
+    pub memory: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Task {
+    pub status: String,
+    pub exitstatus: String,
+}
+
+#[derive(Debug, Default)]
+pub struct State {
+    pub vms: BTreeMap<u32, Vm>,
+    pub tasks: BTreeMap<String, Task>,
+    /// Every request the provider made, in order: method and path. Tests assert
+    /// on this to prove that a refusal happened *before* the network, which is
+    /// the whole claim the range guard makes.
+    pub requests: Vec<(String, String)>,
+    pub task_seq: u32,
+
+    // Behaviours a test can ask for.
+    pub tasks_never_finish: bool,
+    pub next_task_fails: Option<String>,
+    pub reject_config_writes: bool,
+    pub unauthorized: bool,
+    pub agent_interfaces: Option<Value>,
+    pub agent_unavailable: bool,
+}
+
+pub struct MockPve {
+    pub addr: SocketAddr,
+    pub state: Arc<Mutex<State>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl MockPve {
+    pub fn start() -> MockPve {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        let state = Arc::new(Mutex::new(State {
+            task_seq: 1,
+            ..State::default()
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let thread_state = Arc::clone(&state);
+        let thread_stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if thread_stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                let Ok(stream) = stream else { continue };
+                let _ = serve(stream, &thread_state);
+            }
+        });
+
+        MockPve { addr, state, stop }
+    }
+
+    pub fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    pub fn with_state<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
+        f(&mut self.state.lock().expect("state lock"))
+    }
+
+    pub fn vm(&self, id: u32) -> Option<Vm> {
+        self.with_state(|s| s.vms.get(&id).cloned())
+    }
+
+    /// Paths the provider actually requested, in order.
+    pub fn paths(&self) -> Vec<String> {
+        self.with_state(|s| s.requests.iter().map(|(_, p)| p.clone()).collect())
+    }
+
+    pub fn request_count(&self) -> usize {
+        self.with_state(|s| s.requests.len())
+    }
+}
+
+impl Drop for MockPve {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        // Unblock the accept loop so the thread can notice and exit.
+        let _ = TcpStream::connect(self.addr);
+    }
+}
+
+fn serve(mut stream: TcpStream, state: &Arc<Mutex<State>>) -> std::io::Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line)? == 0 {
+        return Ok(());
+    }
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let path = parts.next().unwrap_or("").to_string();
+
+    let mut length = 0usize;
+    let mut authorized = false;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let line = line.trim_end();
+        if line.is_empty() {
+            break;
+        }
+        let lower = line.to_ascii_lowercase();
+        if let Some(v) = lower.strip_prefix("content-length:") {
+            length = v.trim().parse().unwrap_or(0);
+        }
+        if lower.starts_with("authorization:") && line.contains("PVEAPIToken=") {
+            authorized = true;
+        }
+    }
+
+    let mut body = vec![0u8; length];
+    if length > 0 {
+        reader.read_exact(&mut body)?;
+    }
+    let body = String::from_utf8_lossy(&body).to_string();
+
+    let (status, payload) = {
+        let mut s = state.lock().expect("state lock");
+        s.requests.push((method.clone(), path.clone()));
+        if !authorized {
+            (401u16, json!({"errors": "no ticket"}))
+        } else if s.unauthorized {
+            (403, json!({"errors": "permission denied"}))
+        } else {
+            route(&mut s, &method, &path, &body)
+        }
+    };
+
+    let body = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into());
+    let reason = match status {
+        200 => "OK",
+        401 => "authentication failure",
+        403 => "Forbidden",
+        404 => "Not Found",
+        _ => "Error",
+    };
+    write!(
+        stream,
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    )?;
+    stream.flush()
+}
+
+fn route(s: &mut State, method: &str, path: &str, body: &str) -> (u16, Value) {
+    let (path_only, query) = match path.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (path, ""),
+    };
+    let segments: Vec<&str> = path_only.trim_matches('/').split('/').collect();
+
+    // Everything lives under /api2/json.
+    let seg = match segments.as_slice() {
+        ["api2", "json", rest @ ..] => rest,
+        _ => return (404, json!({"errors": "not an api path"})),
+    };
+
+    match (method, seg) {
+        ("GET", ["cluster", "resources"]) => {
+            let _ = query;
+            let items: Vec<Value> = s
+                .vms
+                .iter()
+                .map(|(id, vm)| {
+                    json!({
+                        "vmid": id,
+                        "name": vm.name,
+                        "tags": vm.tags,
+                        "pool": vm.pool,
+                        "status": if vm.running { "running" } else { "stopped" },
+                        "template": if vm.template { 1 } else { 0 },
+                        "type": "qemu",
+                    })
+                })
+                .collect();
+            (200, json!({ "data": items }))
+        }
+
+        ("POST", ["nodes", _node, "qemu", id, "clone"]) => {
+            let Some(source) = id.parse::<u32>().ok().and_then(|i| s.vms.get(&i).cloned()) else {
+                return (404, json!({"errors": "no such template"}));
+            };
+            let form = parse_form(body);
+            let newid: u32 = form.get("newid").and_then(|v| v.parse().ok()).unwrap_or(0);
+            if s.vms.contains_key(&newid) {
+                return (500, json!({"errors": "identifier already in use"}));
+            }
+            let vm = Vm {
+                name: form.get("name").cloned().unwrap_or_default(),
+                tags: String::new(),
+                running: false,
+                template: false,
+                pool: form.get("pool").cloned().unwrap_or_default(),
+                cores: source.cores,
+                memory: source.memory,
+            };
+            s.vms.insert(newid, vm);
+            let t = new_task(s);
+            (200, json!({ "data": t }))
+        }
+
+        ("GET", ["nodes", _node, "qemu", id, "config"]) => match lookup(s, id) {
+            Some(vm) => (
+                200,
+                json!({"data": {"tags": vm.tags, "cores": vm.cores, "memory": vm.memory}}),
+            ),
+            None => (404, json!({"errors": "no such machine"})),
+        },
+
+        ("PUT", ["nodes", _node, "qemu", id, "config"]) => {
+            if s.reject_config_writes {
+                return (500, json!({"errors": "configuration write refused"}));
+            }
+            let Some(key) = id.parse::<u32>().ok() else {
+                return (404, json!({"errors": "no such machine"}));
+            };
+            let form = parse_form(body);
+            let Some(vm) = s.vms.get_mut(&key) else {
+                return (404, json!({"errors": "no such machine"}));
+            };
+            if let Some(t) = form.get("tags") {
+                vm.tags = t.clone();
+            }
+            if let Some(c) = form.get("cores").and_then(|v| v.parse().ok()) {
+                vm.cores = Some(c);
+            }
+            if let Some(m) = form.get("memory").and_then(|v| v.parse().ok()) {
+                vm.memory = Some(m);
+            }
+            (200, json!({ "data": null }))
+        }
+
+        ("POST", ["nodes", _node, "qemu", id, "status", action]) => {
+            let Some(key) = id.parse::<u32>().ok() else {
+                return (404, json!({"errors": "no such machine"}));
+            };
+            let running = match *action {
+                "start" => true,
+                "stop" => false,
+                _ => return (404, json!({"errors": "no such action"})),
+            };
+            let Some(vm) = s.vms.get_mut(&key) else {
+                return (404, json!({"errors": "no such machine"}));
+            };
+            vm.running = running;
+            let t = new_task(s);
+            (200, json!({ "data": t }))
+        }
+
+        ("DELETE", ["nodes", _node, "qemu", id]) => {
+            let Some(key) = id.parse::<u32>().ok() else {
+                return (404, json!({"errors": "no such machine"}));
+            };
+            if s.vms.remove(&key).is_none() {
+                return (404, json!({"errors": "no such machine"}));
+            }
+            let t = new_task(s);
+            (200, json!({ "data": t }))
+        }
+
+        ("GET", ["nodes", _node, "qemu", _id, "agent", "network-get-interfaces"]) => {
+            if s.agent_unavailable {
+                return (500, json!({"errors": "QEMU guest agent is not running"}));
+            }
+            let result = s.agent_interfaces.clone().unwrap_or_else(|| json!([]));
+            (200, json!({ "data": { "result": result } }))
+        }
+
+        ("GET", ["nodes", _node, "tasks", upid, "status"]) => match s.tasks.get(*upid) {
+            Some(t) => (
+                200,
+                json!({"data": {"status": t.status, "exitstatus": t.exitstatus, "upid": upid}}),
+            ),
+            None => (404, json!({"errors": "no such task"})),
+        },
+
+        _ => (404, json!({ "errors": format!("unrouted: {method} {path_only}") })),
+    }
+}
+
+fn lookup(s: &State, id: &str) -> Option<Vm> {
+    id.parse::<u32>().ok().and_then(|i| s.vms.get(&i).cloned())
+}
+
+fn new_task(s: &mut State) -> String {
+    let upid = format!("UPID:node:0000:0000:0000:task:{}:cal@pve:", s.task_seq);
+    s.task_seq += 1;
+
+    let task = if s.tasks_never_finish {
+        Task {
+            status: "running".into(),
+            exitstatus: String::new(),
+        }
+    } else if let Some(reason) = s.next_task_fails.take() {
+        Task {
+            status: "stopped".into(),
+            exitstatus: reason,
+        }
+    } else {
+        Task {
+            status: "stopped".into(),
+            exitstatus: "OK".into(),
+        }
+    };
+
+    s.tasks.insert(upid.clone(), task);
+    upid
+}
+
+fn parse_form(body: &str) -> BTreeMap<String, String> {
+    body.split('&')
+        .filter(|p| !p.is_empty())
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(k, v)| (percent_decode(k), percent_decode(v)))
+        .collect()
+}
+
+/// Enough percent-decoding for form bodies. Tags contain semicolons, which are
+/// encoded, so this is load-bearing rather than decorative.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                match u8::from_str_radix(hex, 16) {
+                    Ok(b) => {
+                        out.push(b);
+                        i += 3;
+                    }
+                    Err(_) => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}

@@ -97,11 +97,15 @@ path or init command is enough to make that false."
 guard_provider() {
     # Hypervisor vocabulary belongs to a provider and its sweeper.
     #
-    # Cargo.toml is allowed because a workspace root must name its members, and
-    # a member at providers/proxmox is the seam working rather than leaking.
-    # README.md is allowed because it is documentation.
+    # Cargo.toml and Cargo.lock are allowed because a workspace root names its
+    # members and a lockfile enumerates them: a member called
+    # reaper-provider-proxmox appearing there is the seam working rather than
+    # leaking. Be honest about what the exemption costs: these files are skipped
+    # wholesale, not scanned for names only. It is acceptable because neither
+    # carries code, and Cargo.lock is generated rather than written -- so the
+    # exemption cannot hide a decision a person made. README.md is documentation.
     scan "provider seam" \
-        '^(docs/|README\.md$|Cargo\.toml$|providers/|cull/|tools/guards\.sh$)' \
+        '^(docs/|README\.md$|Cargo\.toml$|Cargo\.lock$|providers/|cull/|tools/guards\.sh$)' \
         '\bpve\b|\bvmid\b|\bupid\b|proxmox|pveapitoken|\b(9000|9099)\b' \
         "Hypervisor vocabulary leaked into the core. Machine identifiers,
 identifier ranges, resource pools, task handles and API tokens belong
