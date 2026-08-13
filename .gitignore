@@ -12,6 +12,11 @@ reaper.toml
 token
 token.*
 
+# Results, on their way back from a session. reaper is a tenant of itself, so
+# this directory is real here rather than hypothetical: it is where a run's
+# traces and artifacts land, and none of it is source.
+/out/
+
 # Editor and OS droppings
 *~
 .#*

@@ -92,7 +92,7 @@ guard_guest() {
     # with a platform sub-module; it is a single shell script delivered over
     # SSH, so the directory is the boundary.
     scan "guest seam" \
-        '^(docs/|README\.md$|manifest/examples/|runner/|tools/guards\.sh$)' \
+        '^(docs/|README\.md$|manifest/examples/|\.reaper\.yaml$|runner/|tools/guards\.sh$)' \
         'systemctl|systemd|apt-get|dpkg |zfsutils-linux|/dev/(vd|vtbd|sd|nvme)[a-z0-9]|rc\.conf|\brc\.d\b|\b(ubuntu|debian|freebsd|alpine|centos|fedora)\b' \
         "An operating system leaked out of the runner's platform modules. The
 guest seam exists so that adding a system is a template build and a

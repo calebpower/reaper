@@ -44,6 +44,12 @@ expect() {
     fi
 }
 
+echo "this project's own manifest -- must be accepted"
+# reaper is a tenant of itself, and that manifest is the only one in this
+# repository that a session actually runs. A change that broke it would
+# otherwise be found by a nine-minute clone rather than by this suite.
+expect 0 "accepted" "${root}/.reaper.yaml"
+
 echo "worked examples -- must be accepted"
 for f in "${root}"/manifest/examples/*.yaml; do
     expect 0 "accepted" "${f}"
