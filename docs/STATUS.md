@@ -11,7 +11,7 @@ Last updated: 2026-08-12.
 | Phase | What it delivers | State |
 |---|---|---|
 | **0** | Repo bootstrap: docs, manifest schema, seam guards, sweeper | **Complete but for the sweeper**, which is blocked -- see below |
-| 1 | Provider seam + session core (`up`/`list`/`renew`/`down`) | Not started |
+| 1 | Provider seam + session core (`up`/`list`/`renew`/`down`) | **Built and verified offline**; live acceptance blocked |
 | 2 | Guest templates + the runner | Not started |
 | 3 | Sync, build, execution | Not started |
 | 4 | `reset` and the `@pristine` snapshot | Not started |
@@ -31,8 +31,23 @@ decisions below. Phase 2 is parallel-safe with Phase 1; nothing else is.
 | `tools/guards.sh` | No tenant, operating system or hypervisor has leaked out of its seam |
 | `manifest/test/run.sh` | The schema accepts what it should and rejects what it claims to |
 
+`cargo test --workspace` runs 98 tests, including the CLI driven end to end as a
+subprocess against a stand-in hypervisor: up, list, renew and down, the
+concurrency cap, an unregistered guest, a failed destroy, and the heartbeat
+being started and stopped with its session.
+
 Every assertion in those suites has been mutation-checked: broken deliberately,
 and observed failing, before being counted as coverage.
+
+### Phase 1 decisions
+
+| Question | Answer |
+|---|---|
+| Heartbeat cadence | 5 minutes by default, and configuration refuses any value that does not fit three times into the TTL |
+| Resources | Applied at clone time, not baked into templates -- a guest is an operating system, not an operating system crossed with every size a tenant might want |
+| TLS | Three modes, no default. `insecure` warns on every invocation; plain HTTP is refused unless the host is loopback |
+| Credential | One file holding `user@realm!name=secret`, refused if anyone but the owner can read it |
+| TTL from readiness | Creation tags a short `ready_grace`; the heartbeat switches to the real TTL once the machine answers. No untagged window at any point |
 
 ### What is blocked
 
@@ -43,9 +58,19 @@ payloads with nothing live. The script exists only on the sweeper's own machine
 and has not been retrieved, so `cull/` does not exist yet. Everything else in
 Phase 0 is done.
 
-Two things are wanted before Phase 1 can be accepted rather than merely written:
-the deployed sweeper script, and a harness token in `~/.config/reaper/` so the
-live checks can run.
+**Phase 1's live acceptance.** Everything is built and covered offline, but the
+stated criteria are live and need a harness token in `~/.config/reaper/`:
+
+1. `providers/proxmox/tools/make-stub-template.sh <id>` -- a diskless machine
+   converted to a template clones instantly and exercises every real API path
+   without an operating system. Run it with `--dry-run` first.
+2. `reaper up`, `list`, `renew`, `down` against the real pool.
+3. Kill the heartbeat and confirm the sweeper collects the machine after
+   expiry. This one also needs the sweeper, so it is blocked twice.
+
+Until then the honest description is *offline-verified, live pending* -- the
+mock exercises the real HTTP client, but it is still a mock, and it agrees with
+whatever this project believes the API does.
 
 ## Decisions taken
 

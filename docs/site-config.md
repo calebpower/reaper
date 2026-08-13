@@ -18,6 +18,47 @@ Per-user takes precedence. Credentials live here and **never** in a repository;
 `.gitignore` carries entries for the obvious mistakes, but the real protection
 is that this directory is not inside a checkout.
 
+## The file
+
+`config.toml`, in one of the directories above. `REAPER_CONFIG` overrides the
+search entirely when you want to be explicit.
+
+```toml
+provider = "proxmox"
+
+[session]
+default_ttl        = "2h"    # how long a session lives without a heartbeat
+heartbeat_interval = "5m"    # how often the CLI renews it
+ready_grace        = "30m"   # the first expiry, covering creation
+max_concurrent     = 2
+
+# The guest registry. Names are free-form and mean whatever you say they mean;
+# a tenant asks for one by name and the framework looks it up here. Quote keys
+# containing dots, as TOML requires.
+[guests."ubuntu-26.04"]
+template = "9000"
+
+[guests."freebsd-15.1"]
+template = "9001"
+
+# The selected provider's own table. reaper carries this through without
+# reading it; what the keys mean is the provider's business.
+[proxmox]
+api        = "https://node.example:8006"
+node       = "somenode"
+pool       = "a/pool"
+id_range   = [9000, 9099]
+token_file = "~/.config/reaper/token"
+tls        = "ca-file"       # webpki | ca-file | insecure
+ca_file    = "~/.config/reaper/node-ca.pem"
+```
+
+Every value is checked when it loads, and unacceptable combinations are refused
+rather than assumed: a provider with no table, an empty registry, a guest with
+no template, a heartbeat that does not fit at least three times into the TTL.
+That last one is a margin rather than a formality -- it is what lets two
+renewals fail before a machine is lost.
+
 ## What it holds
 
 Three things:
@@ -42,6 +83,22 @@ than to any tenant, because the tenant cannot see what else is running.
 
 Two credentials, deliberately separate, and the separation is the design:
 
+### The token file
+
+One file, holding the whole credential on one line:
+
+```
+user@realm!name=secret
+```
+
+Not an identifier in configuration beside a secret in a file: one secret, one
+place, nothing to keep in step. reaper refuses to read it if anyone but you can
+-- the same rule ssh applies to a private key, and for the same reason.
+
+```sh
+chmod 600 ~/.config/reaper/token
+```
+
 **The harness credential** is held by the CLI. It can create, configure, tag,
 start, stop and destroy machines within its allotted scope, and it can do
 nothing outside that scope. This is the one a developer's workstation holds, and
@@ -57,6 +114,32 @@ Both should be scoped to the minimum the contract in [`providers.md`](providers.
 requires -- never to an account's full authority. If your hypervisor supports
 privilege-separated tokens that inherit nothing from the account that created
 them, use them.
+
+## Transport security
+
+`tls` takes three values, and there is no default -- the choice is too
+consequential to make on somebody's behalf.
+
+| Value | Meaning |
+|---|---|
+| `webpki` | Ordinary public trust roots. Right when the node has a publicly-issued certificate |
+| `ca-file` | Trust one specific authority. Right for a node whose certificate comes from an internal CA, which is most of them |
+| `insecure` | No verification at all. Warns on every invocation |
+
+`insecure` is honest rather than forbidden, because the alternative is people
+disabling checks in ways nobody can see. It prints a warning every time reaper
+runs, and that warning is the only thing keeping it temporary.
+
+To move off it you need the certificate authority that issued the node's
+certificate -- not the node's own certificate, which is a leaf and cannot serve
+as a trust anchor. A hypervisor typically does not publish its CA over the API,
+so the practical route is to open the web interface in a browser, inspect the
+certificate, and export the *issuer*. Save it as PEM, point `ca_file` at it, and
+change one line.
+
+Also worth knowing: plain HTTP is refused outright unless the host is loopback.
+A credential travelling in a header over a plaintext link to another machine is
+a credential you have given away.
 
 ## The expiry contract
 

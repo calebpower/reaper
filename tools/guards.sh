@@ -104,6 +104,11 @@ guard_provider() {
     # wholesale, not scanned for names only. It is acceptable because neither
     # carries code, and Cargo.lock is generated rather than written -- so the
     # exemption cannot hide a decision a person made. README.md is documentation.
+    #
+    # Note what is *not* exempt: the CLI, tests included. Driving the CLI end to
+    # end needs a hypervisor, but it does not need a named one -- the provider
+    # registry re-exports a stand-in neutrally, so no exemption is required. An
+    # exemption is a place coupling can hide; not needing one is better.
     scan "provider seam" \
         '^(docs/|README\.md$|Cargo\.toml$|Cargo\.lock$|providers/|cull/|tools/guards\.sh$)' \
         '\bpve\b|\bvmid\b|\bupid\b|proxmox|pveapitoken|\b(9000|9099)\b' \

@@ -89,6 +89,103 @@ impl MockPve {
         format!("http://{}", self.addr)
     }
 
+    /// Add a template and return the handle a guest registry would record.
+    ///
+    /// Callers get an opaque string back, so a test can register a guest
+    /// without knowing what this provider's handles look like.
+    pub fn add_template(&self, pool: &str) -> String {
+        let id = self.with_state(|s| {
+            let id = (9000..=9099)
+                .find(|id| !s.vms.contains_key(id))
+                .expect("a free identifier");
+            s.vms.insert(
+                id,
+                Vm {
+                    name: "stand-in-template".into(),
+                    template: true,
+                    pool: pool.to_string(),
+                    ..Vm::default()
+                },
+            );
+            id
+        });
+        id.to_string()
+    }
+
+    /// A site-configuration fragment pointing reaper at this stand-in.
+    ///
+    /// Knowing how to be configured is the provider's business, not the
+    /// caller's -- which is what lets a caller drive the whole stack without
+    /// naming a hypervisor anywhere in its own source.
+    pub fn site_config(&self, token_file: &std::path::Path, pool: &str) -> String {
+        format!(
+            r#"provider = "proxmox"
+
+[proxmox]
+api        = "{}"
+node       = "somenode"
+pool       = "{pool}"
+id_range   = [9000, 9099]
+token_file = "{}"
+tls        = "insecure"
+# Short, so a test exercising the timeout path finishes in seconds rather than
+# waiting out a duration chosen for full-copy clones.
+task_timeout = "5s"
+"#,
+            self.url(),
+            token_file.display()
+        )
+    }
+
+    /// The machines that are not templates: the sessions, in other words.
+    pub fn session_machines(&self) -> Vec<String> {
+        self.with_state(|s| {
+            s.vms
+                .iter()
+                .filter(|(_, vm)| !vm.template)
+                .map(|(id, _)| id.to_string())
+                .collect()
+        })
+    }
+
+    /// The tag string a machine carries.
+    pub fn tags_of(&self, machine: &str) -> String {
+        let id: u32 = machine.parse().expect("handle this provider issued");
+        self.with_state(|s| s.vms.get(&id).map(|v| v.tags.clone()).unwrap_or_default())
+    }
+
+    /// A credential this stand-in accepts.
+    ///
+    /// What a valid credential looks like is the provider's business too, so a
+    /// caller can write one to disk without knowing the shape.
+    pub fn credential(&self) -> &'static str {
+        "someone@realm!test=secret"
+    }
+
+    /// Report this address from every machine's guest agent.
+    pub fn reports_address(&self, addr: &str) {
+        self.with_state(|s| {
+            s.agent_interfaces = Some(serde_json::json!([
+                {"name": "net0", "ip-addresses": [
+                    {"ip-address": addr, "ip-address-type": "ipv4"}
+                ]}
+            ]));
+        });
+    }
+
+    /// Leave asynchronous operations unfinished, so callers must time out.
+    pub fn stall_operations(&self, stalled: bool) {
+        self.with_state(|s| s.tasks_never_finish = stalled);
+    }
+
+    /// Forget a machine, as an external sweeper would.
+    pub fn collect(&self, machine: &str) {
+        let id: u32 = machine.parse().expect("handle this provider issued");
+        self.with_state(|s| {
+            s.vms.remove(&id);
+        });
+    }
+
     pub fn with_state<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
         f(&mut self.state.lock().expect("state lock"))
     }

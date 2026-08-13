@@ -60,6 +60,30 @@ reaper -- an independent backstop that shared code with the thing it is backing
 up would not be independent. So each provider brings its own sweeper, and
 `cull/` is organised by provider for that reason.
 
+## The trait, as it stands
+
+```rust
+pub trait Provider {
+    fn name(&self) -> &'static str;
+    fn create(&self, req: &CreateRequest) -> Result<MachineRef>;
+    fn set_expiry(&self, machine: &MachineRef, at: SystemTime) -> Result<()>;
+    fn start(&self, machine: &MachineRef) -> Result<()>;
+    fn stop(&self, machine: &MachineRef) -> Result<()>;
+    fn destroy(&self, machine: &MachineRef) -> Result<()>;
+    fn address(&self, machine: &MachineRef) -> Result<Option<IpAddr>>;
+    fn list(&self) -> Result<Vec<MachineSummary>>;
+}
+```
+
+`MachineRef` is an opaque string. The core stores it and hands it back; it never
+parses it. The moment anything outside a provider reads structure out of that
+string, this seam has stopped meaning anything.
+
+`ProviderError` keeps `Timeout` separate from every other failure, and
+implementations must respect the distinction. A timeout means the machine's
+state is *unknown* -- the operation may still be running -- so a caller must
+never respond by destroying things. The expiry tag exists to cover that case.
+
 ## Implementations
 
 **Proxmox** -- the implementation that ships. Its module owns machine

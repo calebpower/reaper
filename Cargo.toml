@@ -3,7 +3,7 @@
 # re-implementing manifest handling three times.
 [workspace]
 resolver = "2"
-members = ["manifest", "core", "providers/proxmox", "providers/registry"]
+members = ["manifest", "core", "providers/proxmox", "providers/registry", "cli"]
 
 [workspace.package]
 edition = "2021"

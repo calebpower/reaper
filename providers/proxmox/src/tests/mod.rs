@@ -1,7 +1,5 @@
 //! Provider tests, driven against a stand-in API over loopback.
 
-mod mock;
-
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reaper_core::provider::{CreateRequest, MachineRef, Provider, ProviderError};
@@ -10,7 +8,7 @@ use serde_json::json;
 use super::*;
 use crate::config::{Config, Tls};
 use crate::ids::IdRange;
-use mock::{MockPve, Vm};
+use crate::mock::{MockPve, Vm};
 
 const NODE: &str = "somenode";
 const POOL: &str = "a/pool";

@@ -6,6 +6,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Re-exports a provider's stand-in API. The CLI's end-to-end tests need *some*
+# hypervisor to drive; routing it through here keeps the CLI's manifest free of
+# any provider's name, in dev-dependencies as well as in dependencies.
+mock = ["reaper-provider-proxmox/mock"]
+
 [dependencies]
 reaper-core = { path = "../../core" }
 reaper-provider-proxmox = { path = "../proxmox" }

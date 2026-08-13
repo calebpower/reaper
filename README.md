@@ -12,9 +12,10 @@ The purpose is the tight `edit -> test` cycle *before* commit and push. It is
 deliberately **not** a CI platform. CI remains the independent re-proof after
 you push, and nothing here replaces it.
 
-> **Status: Phase 0.** The repository bootstrap -- documentation, the manifest
-> schema, and the sweeper -- is what exists today. The CLI, the runner and the
-> guest templates are Phases 1 through 6. See [`docs/STATUS.md`](docs/STATUS.md)
+> **Status: Phase 1.** The CLI can bring a session up, list it, renew it and
+> take it down, against a provider behind a seam -- all verified offline against
+> a stand-in hypervisor, none of it yet run against a real one. The runner and
+> the guest templates are Phases 2 onward. See [`docs/STATUS.md`](docs/STATUS.md)
 > for where the work actually stands, which is the document to trust over this
 > one when they disagree.
 

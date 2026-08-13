@@ -9,6 +9,11 @@
 
 pub mod config;
 pub mod http;
+/// A stand-in API for tests. Behind a feature so that other crates -- the CLI,
+/// principally -- can drive the whole stack against a fake hypervisor without
+/// it ever being compiled into a shipped binary.
+#[cfg(any(test, feature = "mock"))]
+pub mod mock;
 pub mod ids;
 pub mod tags;
 

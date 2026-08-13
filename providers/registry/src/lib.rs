@@ -12,6 +12,20 @@
 
 use reaper_core::provider::{Provider, ProviderError};
 
+/// A stand-in hypervisor, for tests that need to drive the whole stack.
+///
+/// Which provider supplies it is this crate's business, exactly as the real
+/// implementations are.
+#[cfg(feature = "mock")]
+pub mod mock {
+    // Re-exported under neutral names. A caller driving the whole stack needs
+    // *a* hypervisor, not a particular one, and saying so here means the CLI's
+    // tests need no exemption from the provider lint -- which is better than
+    // having one, since an exemption is a place coupling could hide later.
+    pub use reaper_provider_proxmox::mock::MockPve as StandIn;
+    pub use reaper_provider_proxmox::mock::{State, Task, Vm};
+}
+
 /// Provider names this build supports, in the order they are offered to a
 /// reader who got the name wrong.
 pub const AVAILABLE: &[&str] = &["proxmox"];
