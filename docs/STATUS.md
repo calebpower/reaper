@@ -10,7 +10,7 @@ Last updated: 2026-08-12.
 
 | Phase | What it delivers | State |
 |---|---|---|
-| **0** | Repo bootstrap: docs, manifest schema, seam guards, sweeper | **Complete but for the sweeper**, which is blocked -- see below |
+| **0** | Repo bootstrap: docs, manifest schema, seam guards, sweeper | **Complete.** Sweeper imported, hardened, self-tested, and dry-run against the live API |
 | 1 | Provider seam + session core (`up`/`list`/`renew`/`down`) | **Built and verified offline**; live acceptance blocked |
 | 2 | Guest templates + the runner | **Software done and verified offline**; templates await building |
 | 3 | Sync, build, execution | Not started |
@@ -65,14 +65,24 @@ and observed failing, before being counted as coverage.
 | Credential | One file holding `user@realm!name=secret`, refused if anyone but the owner can read it |
 | TTL from readiness | Creation tags a short `ready_grace`; the heartbeat switches to the real TTL once the machine answers. No untagged window at any point |
 
-### What is blocked
+### First contact with the real cluster
 
-**The sweeper.** Phase 0 calls for importing the deployed `pve-reap` script
-verbatim, then hardening it -- fixing the swallowed-error defect, adding a
-dry-run mode, and adding a decision self-test that runs against canned API
-payloads with nothing live. The script exists only on the sweeper's own machine
-and has not been retrieved, so `cull/` does not exist yet. Everything else in
-Phase 0 is done.
+The harness token works: `cal@pve!harness`, PVE 9.1.4, verified with a live
+`GET /version`. `~/.config/reaper/config.toml` points at the real endpoint with
+`tls = "insecure"`, since the node's certificate is issued by an internal CA
+that is not available -- reaper warns on every invocation, and switching to
+`ca-file` is a one-line change once it is.
+
+The sweeper's live `--dry-run` reaches the API, parses the reply and reports
+`0/0`. Be precise about what that proves: reachability, credential and JSON
+handling. It does **not** prove the pool filter selects correctly, because there
+is nothing yet to select. The mocked suite covers the filter; the live proof
+arrives with the first machine.
+
+The pool is empty -- zero VMs in `cal/ephemeral` -- so anything that appears
+there is something reaper put there.
+
+### What is blocked
 
 **The templates themselves.** Not blocked by anything reaper owns -- they are
 built in the web interface, which needs no token. `docs/runbooks/` is the
