@@ -12,7 +12,7 @@ Last updated: 2026-08-12.
 |---|---|---|
 | **0** | Repo bootstrap: docs, manifest schema, seam guards, sweeper | **Complete.** Sweeper imported, hardened, self-tested, and dry-run against the live API |
 | 1 | Provider seam + session core (`up`/`list`/`renew`/`down`) | **Accepted live.** up, list, renew and down all run against the real cluster |
-| 2 | Guest templates + the runner | **Ubuntu template built and proven.** FreeBSD template outstanding |
+| 2 | Guest templates + the runner | **Both templates built.** Ubuntu proven end to end; FreeBSD session under test |
 | 3 | Sync, build, execution | Not started |
 | 4 | `reset` and the `@pristine` snapshot | Not started |
 | 5 | Tenant onboarding | Not started |
@@ -55,6 +55,36 @@ measured honestly. It is dominated by the full copy of the boot disk. It is
 acceptable for a session that lasts an afternoon, and it is why the pool disk
 is attached rather than carried: only the 8 GiB boot disk is copied, not the
 session's storage.
+
+### Guests registered
+
+| Name | Template | Execution | Notes |
+|---|---|---|---|
+| `ubuntu-26.04` | 9001 | `container` | ZFS, podman, rsync, guest agent. No language toolchains |
+| `freebsd-15.1` | 9000 | `host` | ZFS in base, rsync, guest agent. No container engine, and none wanted -- the engine here runs only foreign-format images under emulation |
+
+The FreeBSD template ships a C compiler because FreeBSD base includes one. It
+ships no Rust, Node or JDK, so it cannot yet serve a host-execution tenant that
+needs one; adding a toolchain is a deliberate, recorded act per the runbook.
+
+### Building the second template was much cheaper than the first
+
+Not because the first taught transferable fixes -- most of them did not
+transfer -- but because the platform was checked rather than assumed. Four of
+the six Ubuntu problems simply do not exist on FreeBSD: `rc.d/sshd` regenerates
+host keys unconditionally, there is no cloud-init to destroy the network
+configuration, `dhclient` identifies by MAC already, and sshd is a persistent
+daemon rather than socket-activated so deleting keys does not sever the
+connection in use.
+
+Two FreeBSD-specific traps were found by looking instead: it carries **both**
+`/etc/hostid` and `/etc/machine-id`, and it ships `PermitRootLogin no` where
+Ubuntu ships `prohibit-password`.
+
+The runner was exercised on real FreeBSD before the template was sealed,
+including its refusal path: with no spare disk it declined to build a pool and
+said why, and `info` reported `platform=FreeBSD` with no engine. Both platform
+branches are now proven against real systems rather than fixtures.
 
 ### An extra privilege PVE 9 requires
 
