@@ -1,0 +1,8 @@
+# Only schema 1 exists. A future version must fail loudly here rather than be
+# interpreted as though it were this one.
+schema: 2
+project: from-the-future
+guests: [some-guest]
+exec: host
+run:
+  cmd: make e2e

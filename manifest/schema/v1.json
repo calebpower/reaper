@@ -1,0 +1,228 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/calebpower/reaper/manifest/schema/v1.json",
+  "title": "reaper tenant manifest, schema version 1",
+  "description": "The entire integration surface between a project and reaper. See docs/tenants.md. Two schemas live in this file: the root schema validates the document as written, and $defs/resolvedGuest validates each guest after top-level defaults have been merged with that guest's overrides. The second pass is where execution-mode coherence is enforced, because inheritance is not something JSON Schema can compute.",
+
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "project", "guests", "run"],
+
+  "properties": {
+    "schema": {
+      "description": "Manifest schema version. Only 1 exists.",
+      "const": 1
+    },
+    "project": {
+      "description": "Names the working directory under tank/work and the session. Not an identifier the framework attaches any meaning to.",
+      "$ref": "#/$defs/name"
+    },
+    "guests": {
+      "description": "Which registered guests this project runs on. Names are resolved against the sysadmin's registry; the framework attaches no meaning to them and deliberately does not validate against a list of known operating systems.",
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/guestEntry" }
+    },
+    "exec": { "$ref": "#/$defs/execMode" },
+    "build": { "$ref": "#/$defs/buildPartial" },
+    "run": { "$ref": "#/$defs/runPartial" },
+    "reset": { "$ref": "#/$defs/reset" },
+    "resources": { "$ref": "#/$defs/resources" },
+    "profiles": {
+      "description": "Named variations on a session. A profile changes how a session is run, never what is run.",
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "#/$defs/name" },
+      "additionalProperties": { "$ref": "#/$defs/profile" }
+    }
+  },
+
+  "$defs": {
+    "name": {
+      "description": "Lowercase, starts alphanumeric. Deliberately narrow: these names end up in paths, dataset names and session identifiers.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+
+    "imageRef": {
+      "description": "A fully-qualified, digest-pinned image reference. Tags are rejected: a run that cannot say which bytes it ran is a run whose result stops meaning anything tomorrow. Requiring a registry host as well removes any ambiguity about where the bytes came from.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+(:[0-9]+)?(/[A-Za-z0-9._-]+)+@sha256:[0-9a-f]{64}$"
+    },
+
+    "execMode": {
+      "description": "container: commands run in a digest-pinned toolchain image, and the guest template stays generic. host: commands run directly in the guest, with the toolchain supplied by the template. See docs/tenants.md for the tradeoff.",
+      "enum": ["container", "host"]
+    },
+
+    "env": {
+      "description": "Environment passed through to the command. Values are strings; the framework does not interpolate, expand or interpret them.",
+      "type": "object",
+      "propertyNames": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+      "additionalProperties": { "type": "string" }
+    },
+
+    "buildPartial": {
+      "description": "Build configuration. Partial: any key may be omitted here and supplied by a per-guest override, or the other way round. Completeness is enforced on the resolved form, not on this one.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "image": { "$ref": "#/$defs/imageRef" },
+        "cmd": { "type": "string", "minLength": 1 },
+        "cache": {
+          "description": "Names of cache directories under tank/cache, preserved between runs. Free-form: these are the tenant's own labels and the framework attaches no meaning to them.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/name" }
+        },
+        "env": { "$ref": "#/$defs/env" }
+      }
+    },
+
+    "runPartial": {
+      "description": "Run configuration. Partial, for the same reason as buildPartial.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cmd": {
+          "description": "Opaque. The framework hands this to a shell and does not know what a stage, a journey or a seed is.",
+          "type": "string",
+          "minLength": 1
+        },
+        "images": {
+          "description": "Images pre-pulled into tank/images before the run. Optional and may be empty -- a project that runs no containers declares none.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/imageRef" }
+        },
+        "env": { "$ref": "#/$defs/env" }
+      }
+    },
+
+    "reset": {
+      "description": "Which datasets `reset` rolls back to @pristine.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["datasets"],
+      "properties": {
+        "datasets": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "description": "Only `state` is a rollback target. work, cache and images are refused here rather than left for the runner to notice: work carries results outward, and rolling back cache or images would silently destroy the thing that makes the next iteration fast.",
+            "enum": ["state"]
+          }
+        }
+      }
+    },
+
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cores": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "ram_gb": { "type": "integer", "minimum": 1, "maximum": 256 }
+      }
+    },
+
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ttl": {
+          "description": "How long a session lives without a heartbeat. Measured from readiness, not from the create request.",
+          "type": "string",
+          "pattern": "^[1-9][0-9]*(s|m|h|d)$"
+        },
+        "warm_cache": {
+          "description": "false runs without tank/cache mounted: determinism mode, for when a warm cache is the suspect.",
+          "type": "boolean"
+        },
+        "env": { "$ref": "#/$defs/env" }
+      }
+    },
+
+    "guestEntry": {
+      "description": "Either a bare registered guest name, or an object overriding the top-level defaults for that guest.",
+      "oneOf": [
+        { "$ref": "#/$defs/name" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name"],
+          "properties": {
+            "name": { "$ref": "#/$defs/name" },
+            "exec": { "$ref": "#/$defs/execMode" },
+            "build": { "$ref": "#/$defs/buildPartial" },
+            "run": { "$ref": "#/$defs/runPartial" },
+            "resources": { "$ref": "#/$defs/resources" }
+          }
+        }
+      ]
+    },
+
+    "resolvedGuest": {
+      "description": "One guest after top-level defaults have been merged with its own overrides. This is the form the runner actually acts on, and the only form in which execution-mode coherence can be checked -- a manifest may perfectly reasonably declare `exec` at the top level and `build.image` per guest, so neither key alone tells you whether the pair is coherent.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "exec", "run"],
+      "properties": {
+        "name": { "$ref": "#/$defs/name" },
+        "exec": { "$ref": "#/$defs/execMode" },
+        "build": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cmd"],
+          "properties": {
+            "image": { "$ref": "#/$defs/imageRef" },
+            "cmd": { "type": "string", "minLength": 1 },
+            "cache": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/name" } },
+            "env": { "$ref": "#/$defs/env" }
+          }
+        },
+        "run": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cmd"],
+          "properties": {
+            "cmd": { "type": "string", "minLength": 1 },
+            "images": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/imageRef" } },
+            "env": { "$ref": "#/$defs/env" }
+          }
+        },
+        "resources": { "$ref": "#/$defs/resources" }
+      },
+
+      "allOf": [
+        {
+          "description": "Container execution needs a toolchain image, and it must be declared rather than assumed.",
+          "if": {
+            "properties": { "exec": { "const": "container" } },
+            "required": ["exec", "build"]
+          },
+          "then": {
+            "properties": { "build": { "required": ["image"] } }
+          }
+        },
+        {
+          "description": "Host execution has no image to run in. A build.image alongside exec: host means one of the two is a mistake, and failing here is far kinder than failing deep inside a guest.",
+          "if": {
+            "properties": { "exec": { "const": "host" } },
+            "required": ["exec"]
+          },
+          "then": {
+            "properties": {
+              "build": {
+                "not": { "required": ["image"] }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

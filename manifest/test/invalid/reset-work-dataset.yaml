@@ -1,0 +1,10 @@
+# Rolling back tank/work would destroy results on their way out of the guest.
+# Refused by the schema rather than left for the runner to notice.
+schema: 1
+project: rolls-back-work
+guests: [some-guest]
+exec: host
+run:
+  cmd: make e2e
+reset:
+  datasets: [work]

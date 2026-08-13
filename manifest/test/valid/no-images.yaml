@@ -1,0 +1,15 @@
+# A project that runs no containers at all declares no images. This is the
+# assertion that the schema is not shaped around one reference tenant: a
+# manifest written only against a pod-based web service would have made
+# run.images required, and this fixture would fail.
+schema: 1
+project: no-images
+guests: [some-guest]
+exec: host
+build:
+  cmd: cargo build --locked
+  cache: [cargo]
+run:
+  cmd: cargo test --locked
+reset:
+  datasets: [state]

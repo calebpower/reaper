@@ -1,0 +1,18 @@
+# exec in one place, the toolchain image in another, the command in a third.
+# All three are needed to decide whether this manifest is coherent, and no
+# single scope holds them -- so this fixture passes only if resolution merges
+# before checking.
+schema: 1
+project: inherited
+guests:
+  - name: guest-a
+    exec: host
+  - name: guest-b
+    exec: container
+    build:
+      image: docker.io/library/example@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+build:
+  cmd: make build
+  cache: [obj]
+run:
+  cmd: make e2e

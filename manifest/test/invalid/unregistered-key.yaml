@@ -1,0 +1,9 @@
+# A typo'd or invented top-level key. Rejected rather than ignored -- a key the
+# framework silently drops is a setting the author believes is in force.
+schema: 1
+project: typo
+guests: [some-guest]
+exec: host
+run:
+  cmd: make e2e
+reset_datasets: [state]

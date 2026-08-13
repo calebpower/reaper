@@ -1,0 +1,11 @@
+# Workspace root. Phase 0 has one member; the CLI, the runner and the Proxmox
+# provider join it in Phases 1 and 2 and share the manifest crate rather than
+# re-implementing manifest handling three times.
+[workspace]
+resolver = "2"
+members = ["manifest/validate"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/calebpower/reaper"

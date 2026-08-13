@@ -1,0 +1,9 @@
+# The smallest legal manifest. Asserts that nothing beyond these four keys is
+# required -- a project with no build step and no state to roll back is a
+# perfectly ordinary tenant.
+schema: 1
+project: minimal
+guests: [some-guest]
+run:
+  cmd: make check
+exec: host

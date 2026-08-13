@@ -1,0 +1,7 @@
+# An empty guest list. There is nowhere to run this.
+schema: 1
+project: nowhere
+guests: []
+exec: host
+run:
+  cmd: make e2e
