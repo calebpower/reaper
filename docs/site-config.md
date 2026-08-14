@@ -30,7 +30,7 @@ provider = "proxmox"
 default_ttl        = "2h"    # how long a session lives without a heartbeat
 heartbeat_interval = "5m"    # how often the CLI renews it
 ready_grace        = "30m"   # the first expiry, covering creation
-max_concurrent     = 2
+max_concurrent     = 2       # counted across the provider, not per workstation
 default_disk_gb    = 64      # size of each session's storage pool
 rsync_command      = "rsync"  # the binary that moves the tree and the results
 results_interval   = "5s"    # how often results are pulled while a command runs
@@ -53,10 +53,25 @@ pool       = "a/pool"
 id_range   = [9000, 9099]
 token_file = "~/.config/reaper/token"
 data_storage = "some-storage"  # where each session's blank pool disk is made
+min_free_gb  = 10              # room to leave on a storage after a session takes its share
 data_bus     = "virtio1"       # which slot it hangs on; templates boot from virtio0
 tls        = "ca-file"       # webpki | ca-file | insecure
 ca_file    = "~/.config/reaper/node-ca.pem"
 ```
+
+**`max_concurrent` counts sessions on the provider**, not sessions in your own
+session file. The things a cap protects -- identifiers and storage -- belong to
+the cluster, and a limit that only saw your own sessions would stop being a
+limit the moment a second person shared the hardware. So a refusal may name
+sessions that are not yours, and says so when it does.
+
+**`min_free_gb` is the room left behind.** Before cloning, reaper prices the
+session -- the template's disks, which are copied whole on storage without
+snapshots, plus the blank pool disk -- and refuses if that would leave a storage
+with less than this. A clone that fills a shared storage takes down everything
+else living on it, and the failure otherwise arrives minutes in with a
+half-copied disk to clean up. A storage that cannot be queried is not treated as
+full: not knowing is not the same as knowing there is no room.
 
 Every value is checked when it loads, and unacceptable combinations are refused
 rather than assumed: a provider with no table, an empty registry, a guest with

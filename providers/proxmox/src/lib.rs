@@ -17,6 +17,7 @@ pub mod mock;
 pub mod ids;
 pub mod tags;
 
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::time::{Duration, SystemTime};
 
@@ -151,6 +152,70 @@ impl Proxmox {
     /// next-free-id endpoint, which knows nothing about which identifiers are
     /// reaper's to use and would happily hand back one belonging to the wider
     /// cluster.
+
+    /// Refuse a session that would leave a storage too full.
+    ///
+    /// What a session costs is the template's disks copied whole -- this
+    /// storage has no snapshots, so a clone is a byte-for-byte copy -- plus the
+    /// blank pool disk. Those can land on different storages, so the need is
+    /// totalled per storage and each is checked against its own free space.
+    fn check_room(&self, template: u32, data_disk_gb: Option<u32>) -> Result<()> {
+        let mut need: BTreeMap<String, u64> = BTreeMap::new();
+
+        let config = self
+            .client
+            .get(&format!("/nodes/{}/qemu/{template}/config", self.node()))?;
+        for (key, value) in config.as_object().into_iter().flatten() {
+            if !is_disk_key(key) {
+                continue;
+            }
+            let Some(spec) = value.as_str() else { continue };
+            if let Some((storage, bytes)) = disk_storage_and_size(spec) {
+                *need.entry(storage).or_default() += bytes;
+            }
+        }
+
+        if let (Some(gb), Some(storage)) = (data_disk_gb, self.config.data_storage.as_ref()) {
+            *need.entry(storage.clone()).or_default() += u64::from(gb) * GIB;
+        }
+
+        let floor = u64::from(self.config.min_free_gb) * GIB;
+        for (storage, wanted) in need {
+            // A storage that cannot be queried and one that answers without a
+            // figure are the same thing here: we do not know. Both were not
+            // handled at first -- only the second -- so an offline storage
+            // refused the session while the comment below claimed it would not.
+            let reported = self
+                .client
+                .get(&format!("/nodes/{}/storage/{storage}/status", self.node()))
+                .ok()
+                .and_then(|status| status.get("avail").and_then(Value::as_u64));
+
+            let Some(avail) = reported else {
+                // Not knowing is not the same as knowing there is room, but
+                // refusing every session because one storage will not report
+                // itself would be worse. Say so and carry on.
+                eprintln!(
+                    "reaper: {storage} did not report its free space; \
+                     creating without checking there is room"
+                );
+                continue;
+            };
+
+            if avail < wanted + floor {
+                return Err(ProviderError::Refused(format!(
+                    "{storage} has {} free and this session needs {}, leaving less \
+                     than the {} floor. Take a session down, or lower \
+                     [proxmox].min_free_gb if you mean to run it close",
+                    gib(avail),
+                    gib(wanted),
+                    gib(floor),
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn free_id(&self) -> Result<u32> {
         // Every machine in range, whoever owns it. Identifiers are cluster-wide
         // in Proxmox, so an identifier held by another pool -- or by a template,
@@ -253,6 +318,11 @@ impl Provider for Proxmox {
             })?;
 
         let id = self.free_id()?;
+
+        // Before anything is created, not after. A clone that runs a shared
+        // storage out of space takes down everything else living on it, and
+        // the failure arrives minutes in, with a half-copied disk to clean up.
+        self.check_room(template, req.data_disk_gb)?;
 
         // pool is always sent. The credential can allocate nowhere else, and
         // omitting it produces a permission error that reads like a bug.
@@ -508,3 +578,52 @@ fn first_usable_address(data: &Value) -> Option<IpAddr> {
 
 #[cfg(test)]
 mod tests;
+
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+fn gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / GIB as f64)
+}
+
+/// Disk keys, and only disk keys. `virtio0` is one; `virtiofs0` is not, and
+/// neither is anything else that merely starts with a bus name.
+fn is_disk_key(key: &str) -> bool {
+    for bus in ["virtio", "scsi", "sata", "ide"] {
+        if let Some(rest) = key.strip_prefix(bus) {
+            return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit());
+        }
+    }
+    false
+}
+
+/// The storage a disk lives on, and how much room it takes.
+///
+/// A spec reads `storage:vm-9001-disk-0,iothread=1,size=8G`. A `cdrom` is not a
+/// disk that gets copied, and `none`/`cloudinit` entries have no size at all.
+fn disk_storage_and_size(spec: &str) -> Option<(String, u64)> {
+    if spec.contains("media=cdrom") {
+        return None;
+    }
+    let storage = spec.split(':').next()?.to_string();
+    if storage.is_empty() || storage == "none" {
+        return None;
+    }
+    let size = spec
+        .split(',')
+        .find_map(|part| part.strip_prefix("size="))
+        .and_then(parse_size)?;
+    Some((storage, size))
+}
+
+/// `8G`, `512M`, `1T`, or a bare byte count.
+fn parse_size(text: &str) -> Option<u64> {
+    let (digits, scale) = match text.chars().last()? {
+        'K' | 'k' => (&text[..text.len() - 1], 1024),
+        'M' | 'm' => (&text[..text.len() - 1], 1024 * 1024),
+        'G' | 'g' => (&text[..text.len() - 1], GIB),
+        'T' | 't' => (&text[..text.len() - 1], GIB * 1024),
+        _ => (text, 1),
+    };
+    digits.trim().parse::<u64>().ok().map(|n| n * scale)
+}

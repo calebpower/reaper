@@ -39,6 +39,10 @@ pub struct Config {
     /// Where that disk hangs. The templates boot from `virtio0`, so the data
     /// disk goes on the next VirtIO slot unless a site says otherwise.
     pub data_bus: String,
+    /// How much room to leave on a storage after a session has taken what it
+    /// needs. A clone that fills a shared storage completely takes everything
+    /// else on it down with it, and this is the cheapest way not to.
+    pub min_free_gb: u32,
     pub tls: Tls,
     /// How long to wait for an asynchronous operation before giving up on
     /// knowing its outcome. Generous by default: a full-copy clone on storage
@@ -68,6 +72,7 @@ struct Raw {
     token_file: String,
     data_storage: Option<String>,
     data_bus: Option<String>,
+    min_free_gb: Option<u32>,
     tls: String,
     ca_file: Option<String>,
     task_timeout: Option<String>,
@@ -150,6 +155,7 @@ pub fn from_table(table: &toml::Value) -> Result<Config, ConfigError> {
         token_file: expand_tilde(&raw.token_file),
         data_storage: raw.data_storage,
         data_bus: raw.data_bus.unwrap_or_else(|| "virtio1".to_string()),
+        min_free_gb: raw.min_free_gb.unwrap_or(10),
         tls,
         task_timeout: parse_dur("task_timeout", raw.task_timeout.as_ref(), "10m")?,
         request_timeout: parse_dur("request_timeout", raw.request_timeout.as_ref(), "30s")?,

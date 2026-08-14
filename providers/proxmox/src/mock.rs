@@ -39,6 +39,10 @@ pub struct Task {
     pub exitstatus: String,
 }
 
+/// One name for the stand-in storage, so the configuration handed out and the
+/// disk specs reported cannot drift apart.
+const STORAGE: &str = "stand-in-storage";
+
 #[derive(Debug, Default)]
 pub struct State {
     pub vms: BTreeMap<u32, Vm>,
@@ -56,6 +60,10 @@ pub struct State {
     pub unauthorized: bool,
     pub agent_interfaces: Option<Value>,
     pub agent_unavailable: bool,
+    /// Free space every storage reports. Generous by default, so only the tests
+    /// that care about the floor have to arrange anything; zero means the
+    /// storage refuses to answer at all.
+    pub storage_avail_bytes: u64,
 }
 
 pub struct MockPve {
@@ -69,6 +77,7 @@ impl MockPve {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("addr");
         let state = Arc::new(Mutex::new(State {
+            storage_avail_bytes: 4 * 1024 * 1024 * 1024 * 1024,
             task_seq: 1,
             ..State::default()
         }));
@@ -107,6 +116,32 @@ impl MockPve {
                 Vm {
                     name: "stand-in-template".into(),
                     template: true,
+                    pool: pool.to_string(),
+                    ..Vm::default()
+                },
+            );
+            id
+        });
+        id.to_string()
+    }
+
+    /// A session this workstation did not create.
+    ///
+    /// The cluster is shared, so a cap that only counts what is in the local
+    /// session file is no cap at all. This is how a test says "somebody else
+    /// already has one up".
+    pub fn add_foreign_session(&self, pool: &str) -> String {
+        let id = self.with_state(|s| {
+            let id = (9000..=9099)
+                .find(|id| !s.vms.contains_key(id))
+                .expect("a free identifier");
+            s.vms.insert(
+                id,
+                Vm {
+                    name: "somebody-elses-session".into(),
+                    template: false,
+                    running: true,
+                    tags: "expires-9999999999".into(),
                     pool: pool.to_string(),
                     ..Vm::default()
                 },
@@ -190,6 +225,11 @@ task_timeout = "5s"
     }
 
     /// Report this address from every machine's guest agent.
+    /// How much room every storage claims to have.
+    pub fn storage_has(&self, bytes: u64) {
+        self.state.lock().expect("mock state").storage_avail_bytes = bytes;
+    }
+
     pub fn reports_address(&self, addr: &str) {
         self.with_state(|s| {
             s.agent_interfaces = Some(serde_json::json!([
@@ -224,6 +264,15 @@ task_timeout = "5s"
     /// Paths the provider actually requested, in order.
     pub fn paths(&self) -> Vec<String> {
         self.with_state(|s| s.requests.iter().map(|(_, p)| p.clone()).collect())
+    }
+
+    /// Requests as method and path.
+    ///
+    /// The path alone is not enough to say what happened: reading a template's
+    /// configuration and writing a session's tags are both `/config`, and a
+    /// test that means the second must be able to say so.
+    pub fn calls(&self) -> Vec<(String, String)> {
+        self.with_state(|s| s.requests.clone())
     }
 
     pub fn request_count(&self) -> usize {
@@ -368,12 +417,35 @@ fn route(s: &mut State, method: &str, path: &str, body: &str) -> (u16, Value) {
         }
 
         ("GET", ["nodes", _node, "qemu", id, "config"]) => match lookup(s, id) {
-            Some(vm) => (
-                200,
-                json!({"data": {"tags": vm.tags, "cores": vm.cores, "memory": vm.memory}}),
-            ),
+            Some(vm) => {
+                let mut cfg = json!({
+                    "tags": vm.tags,
+                    "cores": vm.cores,
+                    "memory": vm.memory,
+                    // A boot disk, because a machine without one weighs nothing
+                    // and a free-space check would have nothing to weigh.
+                    "virtio0": format!("{STORAGE}:vm-{id}-disk-0,iothread=1,size=8G"),
+                    // Not a disk, and named to catch a prefix match that thinks
+                    // it is.
+                    "virtiofs0": "some-share",
+                });
+                for (bus, spec) in &vm.extra_disks {
+                    cfg[bus] = json!(spec);
+                }
+                (200, json!({ "data": cfg }))
+            }
             None => (404, json!({"errors": "no such machine"})),
         },
+
+        // How much room a storage has. The stand-in is generous unless a test
+        // says otherwise, so only the tests that care have to arrange it.
+        ("GET", ["nodes", _node, "storage", storage, "status"]) => {
+            if s.storage_avail_bytes == 0 {
+                return (500, json!({"errors": "storage is not online"}));
+            }
+            let _ = storage;
+            (200, json!({"data": {"avail": s.storage_avail_bytes, "total": s.storage_avail_bytes}}))
+        }
 
         ("PUT", ["nodes", _node, "qemu", id, "config"]) => {
             if s.reject_config_writes {

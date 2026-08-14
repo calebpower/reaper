@@ -143,12 +143,24 @@ pub fn up(
             continue;
         }
 
-        let live = store.list()?.len();
-        if live >= cfg.session.max_concurrent {
+        // Counted from the provider, not from this workstation's session file.
+        // The resources a cap protects -- identifiers and storage -- are the
+        // cluster's, and a limit that only sees your own sessions is no limit
+        // at all the moment a second person shares the hardware.
+        let live = provider.list()?;
+        if live.len() >= cfg.session.max_concurrent {
+            let mine: Vec<String> = store.list()?.into_iter().map(|s| s.name).collect();
+            let others = live.len().saturating_sub(mine.len());
             return Err(format!(
-                "{live} sessions are already up and this site allows {}. \
+                "{} session(s) are already up on this provider and it allows {}{}. \
                  Take one down, or raise session.max_concurrent in {}",
+                live.len(),
                 cfg.session.max_concurrent,
+                if others > 0 {
+                    format!(" -- {others} of them not yours")
+                } else {
+                    String::new()
+                },
                 cfg.path.display()
             )
             .into());

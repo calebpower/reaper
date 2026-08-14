@@ -1142,3 +1142,28 @@ fn a_failing_step_stops_the_ones_after_it() {
     let _ = std::fs::remove_file(h.dir.join("ssh.fail"));
     h.ok(&["down"]);
 }
+
+
+#[test]
+fn the_cap_counts_the_cluster_and_not_just_this_workstation() {
+    // The resources a cap protects -- identifiers and storage -- belong to the
+    // cluster. Counting only the local session file meant two people each got
+    // the whole allowance, which is not a cap.
+    let h = Harness::new("cap-shared");
+
+    // Somebody else already has two up. The cap here is two.
+    h.hypervisor.add_foreign_session(POOL);
+    h.hypervisor.add_foreign_session(POOL);
+
+    let err = h.fails(&["up"]);
+    assert!(err.contains("already up on this provider"), "{err}");
+    assert!(
+        err.contains("not yours"),
+        "it should say whose they are, or the message is baffling: {err}"
+    );
+    assert!(
+        h.machines().len() == 2,
+        "nothing of ours may have been created: {:?}",
+        h.machines()
+    );
+}

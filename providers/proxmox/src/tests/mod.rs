@@ -26,6 +26,7 @@ fn provider_for(pve: &MockPve) -> Proxmox {
         token_file: "/dev/null".into(),
         data_storage: Some("some-storage".to_string()),
         data_bus: "virtio1".to_string(),
+        min_free_gb: 10,
         tls: Tls::Insecure,
         task_timeout: Duration::from_secs(2),
         request_timeout: Duration::from_secs(5),
@@ -92,16 +93,18 @@ fn creating_tags_before_starting_and_does_not_start_at_all() {
     let p = provider_for(&pve);
     let m = p.create(&request("a-session", 1_700_000_000)).unwrap();
 
-    let paths = pve.paths();
-    let clone_at = paths.iter().position(|p| p.contains("/clone")).expect("cloned");
-    let config_at = paths
+    let calls = pve.calls();
+    let clone_at = calls.iter().position(|(_, p)| p.contains("/clone")).expect("cloned");
+    // The *write*, specifically. Reading the template's configuration to see
+    // what a session will cost is also a /config request, and it happens first.
+    let tagged_at = calls
         .iter()
-        .position(|p| p.ends_with("/config") )
-        .expect("configured");
-    assert!(clone_at < config_at, "tagged before cloning? {paths:?}");
+        .position(|(m, p)| m == "PUT" && p.ends_with("/config"))
+        .expect("tagged");
+    assert!(clone_at < tagged_at, "tagged before cloning? {calls:?}");
     assert!(
-        !paths.iter().any(|p| p.contains("/status/start")),
-        "create must not start the machine: {paths:?}"
+        !calls.iter().any(|(_, p)| p.contains("/status/start")),
+        "create must not start the machine: {calls:?}"
     );
     assert!(!pve.vm(m.as_str().parse().unwrap()).unwrap().running);
 }
@@ -580,12 +583,14 @@ fn the_disk_is_attached_in_the_same_call_as_the_expiry() {
     let p = provider_for(&pve);
     p.create(&request("a-session", 1_700_000_000)).expect("create");
 
-    let config_calls = pve
-        .paths()
+    // Writes only. Reading the template's configuration to price the session
+    // is a /config request too, and it is not what this is counting.
+    let config_writes = pve
+        .calls()
         .iter()
-        .filter(|path| path.ends_with("/config"))
+        .filter(|(m, p)| m == "PUT" && p.ends_with("/config"))
         .count();
-    assert_eq!(config_calls, 1, "expected one config write, saw {config_calls}");
+    assert_eq!(config_writes, 1, "expected one config write, saw {config_writes}");
 }
 
 #[test]
@@ -613,6 +618,7 @@ fn asking_for_a_disk_with_nowhere_to_put_it_is_refused_clearly() {
         token_file: "/dev/null".into(),
         data_storage: None,
         data_bus: "virtio1".to_string(),
+        min_free_gb: 10,
         tls: Tls::Insecure,
         task_timeout: Duration::from_secs(2),
         request_timeout: Duration::from_secs(5),
@@ -697,11 +703,18 @@ fn protection_is_cleared_before_the_machine_is_ever_started() {
     p.create(&request("a-session", 1)).expect("create");
 
     let paths = pve.paths();
-    let config_at = paths.iter().position(|x| x.ends_with("/config")).expect("configured");
+    let config_at = pve
+        .calls()
+        .iter()
+        .position(|(m, p)| m == "PUT" && p.ends_with("/config"))
+        .expect("configured");
     let started = paths.iter().position(|x| x.contains("/status/start"));
     assert!(started.is_none(), "create must not start the machine: {paths:?}");
     assert_eq!(
-        paths.iter().filter(|x| x.ends_with("/config")).count(),
+        pve.calls()
+            .iter()
+            .filter(|(m, p)| m == "PUT" && p.ends_with("/config"))
+            .count(),
         1,
         "expiry, resources, disk and protection belong in one call: {paths:?}"
     );
@@ -782,4 +795,103 @@ fn a_genuine_credential_failure_is_not_mistaken_for_a_missing_machine() {
         matches!(e, ProviderError::Unauthorized(_)),
         "a broken credential must not read as a missing machine, got: {e}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Room on the storage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_session_that_would_fill_the_storage_is_refused_before_anything_is_made() {
+    let pve = pve_with_template();
+    let p = provider_for(&pve);
+
+    // Room for the 64 GiB pool disk, but not for it plus the floor that must
+    // be left behind.
+    pve.storage_has(70 * 1024 * 1024 * 1024);
+
+    let mut req = request("a-session", 1_700_000_000);
+    req.data_disk_gb = Some(64);
+    let err = p.create(&req).expect_err("should have refused");
+
+    let message = err.to_string();
+    assert!(message.contains("free"), "{message}");
+    assert!(message.contains("min_free_gb"), "should say how to override: {message}");
+
+    // And nothing was created on the way to finding out.
+    assert!(
+        !pve.paths().iter().any(|x| x.contains("/clone")),
+        "refused after cloning: {:?}",
+        pve.paths()
+    );
+}
+
+#[test]
+fn room_is_counted_per_storage_and_includes_the_template_being_copied() {
+    let pve = pve_with_template();
+    let p = provider_for(&pve);
+
+    // No pool disk at all, so the only thing to weigh is the template's own
+    // 8 GiB boot disk being copied. A check that priced only the disk it
+    // attaches would find nothing to object to here.
+    pve.storage_has(12 * 1024 * 1024 * 1024);
+
+    let mut req = request("a-session", 1_700_000_000);
+    req.data_disk_gb = None;
+    assert!(p.create(&req).is_err(), "the boot copy has to count too");
+}
+
+#[test]
+fn a_session_that_fits_is_created() {
+    let pve = pve_with_template();
+    let p = provider_for(&pve);
+    pve.storage_has(500 * 1024 * 1024 * 1024);
+
+    let mut req = request("a-session", 1_700_000_000);
+    req.data_disk_gb = Some(64);
+    assert!(p.create(&req).is_ok());
+}
+
+#[test]
+fn a_storage_that_will_not_say_how_full_it_is_does_not_stop_a_session() {
+    // Not knowing is not the same as knowing there is no room. Refusing every
+    // session because one storage will not report itself would be a worse
+    // failure than the one being guarded against.
+    let pve = pve_with_template();
+    let p = provider_for(&pve);
+    pve.storage_has(0);
+
+    let mut req = request("a-session", 1_700_000_000);
+    req.data_disk_gb = Some(64);
+    assert!(p.create(&req).is_ok(), "an unreadable storage must not block a session");
+}
+
+#[test]
+fn a_disk_key_is_a_disk_key_and_not_merely_a_prefix() {
+    // `virtiofs0` starts with a bus name and is not a disk. The stand-in
+    // reports one precisely so a prefix match gets caught here.
+    assert!(super::is_disk_key("virtio0"));
+    assert!(super::is_disk_key("scsi12"));
+    assert!(!super::is_disk_key("virtiofs0"));
+    assert!(!super::is_disk_key("virtio"));
+    assert!(!super::is_disk_key("net0"));
+}
+
+#[test]
+fn disk_specs_are_read_the_way_proxmox_writes_them() {
+    assert_eq!(
+        super::disk_storage_and_size("some-storage:vm-9001-disk-0,iothread=1,size=8G"),
+        Some(("some-storage".to_string(), 8 * 1024 * 1024 * 1024))
+    );
+    assert_eq!(
+        super::disk_storage_and_size("s:vm-1-disk-0,size=512M"),
+        Some(("s".to_string(), 512 * 1024 * 1024))
+    );
+    // A mounted image is not a disk that gets copied.
+    assert_eq!(
+        super::disk_storage_and_size("local:iso/x.iso,media=cdrom,size=900M"),
+        None
+    );
+    // Nor is an entry with no size at all.
+    assert_eq!(super::disk_storage_and_size("none,media=cdrom"), None);
 }

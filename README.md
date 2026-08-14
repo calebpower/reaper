@@ -163,7 +163,7 @@ provider = "proxmox"
 default_ttl        = "2h"     # how long a session lives without a heartbeat
 heartbeat_interval = "5m"     # must fit at least three times into the TTL
 ready_grace        = "30m"    # the first expiry, covering a slow clone
-max_concurrent     = 2
+max_concurrent     = 2        # across the provider, not per workstation
 default_disk_gb    = 64
 ssh_key            = "~/.config/reaper/session-key"
 
@@ -177,6 +177,7 @@ pool         = "a/pool"
 id_range     = [9000, 9099]
 token_file   = "~/.config/reaper/token"
 data_storage = "some-storage"  # where each session's blank pool disk is made
+min_free_gb  = 10              # room to leave after a session takes its share
 tls          = "ca-file"       # webpki | ca-file | insecure
 ca_file      = "~/.config/reaper/node-ca.pem"
 ```
@@ -295,6 +296,8 @@ The container that asks is spared when the others are stopped.
 | `<pid> DEAD` in `reaper list` | The heartbeat stopped, so the expiry stopped moving. Nothing is leaked -- the sweeper will collect it -- but you are on a countdown nobody is winding |
 | `refusing to roll … back: process(es) N still have files open` | Something is still using the dataset. Rolling back under it would leave it reading data that no longer exists |
 | `there is no tank/state@pristine to roll back to` | No run has succeeded on this session yet |
+| `… has N free and this session needs M, leaving less than the … floor` | The storage would be too full. Take a session down, or lower `min_free_gb` if you mean to run it close |
+| `N session(s) are already up on this provider … not yours` | The cap counts the whole cluster, so somebody else's sessions count against it |
 | `could not pre-fetch images` | A registry blip. The session is up and usable; the first build fetches them itself |
 | `WARNING: TLS certificate verification is disabled` | Exactly what it says. Export the node's CA and switch `tls` to `ca-file` |
 
