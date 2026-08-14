@@ -834,13 +834,20 @@ if [ -e "${ctl}/io/runner.sh" ]; then
 else
     ok "the runner copy is outside the container-writable directory"
 fi
-# find rather than parsing ls: the mode is what is being asserted, so read it
-# as a number rather than as formatted text.
-mode=$(find "${ctl}" -maxdepth 1 -name runner.sh -exec stat -f '%Lp' {} + 2>/dev/null \
-       || find "${ctl}" -maxdepth 1 -name runner.sh -printf '%m\n' 2>/dev/null)
+# `stat` disagrees between platforms about what -f means, and -- the part that
+# bit -- it does not fail when asked the wrong way. On Linux `stat -f` is
+# "filesystem status", so the BSD spelling *succeeds* and prints something that
+# is not a mode at all, and an `||` fallback never fires. Found by running this
+# suite inside a Linux session, having only ever run it on BSD.
+#
+# So try both and judge the answer rather than the exit status.
+mode=$(stat -c '%a' "${ctl}/runner.sh" 2>/dev/null || true)
+case "${mode}" in
+    ''|*[!0-7]*) mode=$(stat -f '%Lp' "${ctl}/runner.sh" 2>/dev/null || true) ;;
+esac
 case "${mode}" in
     700) ok "runner copy is root-only (${mode})" ;;
-    *)   bad "runner copy is mode ${mode}, expected 700" ;;
+    *)   bad "runner copy is mode '${mode}', expected 700" ;;
 esac
 if [ -f "${ctl}/loop.pid" ]; then ok "recorded a pid"; else bad "no pid file"; fi
 outsays 'control='

@@ -15,7 +15,7 @@ Last updated: 2026-08-13.
 | 2 | Guest templates + the runner | **Complete.** Both guests rebuilt, registered and proven live |
 | 3 | Sync, build, execution | **Accepted live.** sync, build and run against the real cluster, results flowing continuously |
 | 4 | `reset` and the `@pristine` snapshot | **Accepted live.** Reset, named checkpoints, and an in-guest trigger a container can call |
-| 5 | Tenant onboarding | Not started |
+| 5 | The loop as one verb, dogfooded | **Accepted live.** `reaper test`, and the payoff proven both ways |
 | 6 | Hardening, `doctor`, third-tenant proof | Not started |
 
 Phase detail is in [`reaper-plan.md`](reaper-plan.md) §6, amended by the
@@ -257,6 +257,74 @@ Two of the five were bugs in reaper's own test suites, found only because
 reaper became its own tenant and tried to run them somewhere that was not this
 workstation. That is the whole argument for dogfooding, arriving on the first
 day of it.
+
+### Phase 5: the loop, and an honest cycle time
+
+`reaper test` is sync -> build -> reset -> run. Proven live against reaper
+itself and against a fixture tenant, three loops in sequence on one session:
+
+| Loop | What ran | |
+|---|---|---|
+| 1st, fresh session | sync, build, run -- reset skipped, nothing to reset to | 2m05s |
+| 2nd | the same; the run succeeded, so it took `@pristine` | 55s |
+| 3rd | **all four steps**, rolled back in 2s | 57s |
+
+The first run failed, which was not staged: it hit a real bug (below). That made
+the design's own rule visible without arranging it -- **a failed run takes no
+pristine**, so the loop kept skipping the reset until a run succeeded.
+
+### The payoff, proven both ways
+
+> The same seed, replayed against two consecutive resets, produces an identical
+> action sequence and an identical outcome.
+
+A fixture tenant whose action sequence depends on accumulated state as well as
+on its seed -- the state-accumulation problem the methodology describes, where a
+journey engine tags data per-run to avoid colliding with its own history.
+
+| | Same seed, twice |
+|---|---|
+| **Without** a reset | `step 1 -> 749 …` then `step 1 -> 780 …` -- **different** |
+| **With** a reset | `step 1 -> 749 …` both times -- **identical** |
+
+The negative half was run first and deliberately: a fixture that cannot detect
+accumulation would have proved nothing at all.
+
+### The cycle time, and what it does not show
+
+| | |
+|---|---|
+| reaper's battery, locally on the workstation | **27.5s** |
+| `reaper test` for reaper, warm | **57s** |
+| `reaper test` for the fixture tenant, warm | **9.5s** |
+
+So for reaper as its own tenant the loop is **twice as slow as running it
+locally**, and the original plan says to stop and reassess if it does not
+clearly beat local. Reassessed, and recorded rather than dropped for being
+unflattering: this is the correct answer for this tenant, not a failure of the
+design. reaper's battery needs no database, no browser and no pod. It is exactly
+the kind of suite `docs/tenants.md` says belongs on a workstation, and moving it
+into a session because sessions exist is the anti-pattern that document warns
+about.
+
+What the third row shows is that the loop's own overhead is small -- under ten
+seconds including a rollback. The 57s is reaper's battery being run twice over,
+once locally to build and once in the session. A tenant whose battery genuinely
+needs a real machine is where the comparison becomes meaningful, and this
+repository does not contain one.
+
+### What dogfooding caught that nothing else had
+
+Running reaper's own suite inside a Linux session failed, on a check that has
+always passed on the FreeBSD workstation. `stat -f` means "format" on BSD and
+**"filesystem status" on Linux** -- so the BSD spelling *succeeds* there and
+prints something that is not a mode, and the `||` fallback never fires. The test
+now tries both spellings and judges the answer rather than the exit status.
+
+That is the third portability bug in this project's own suites found only by
+running them somewhere other than where they were written, after `mktemp -t` and
+`CARGO_TARGET_DIR`. It is the argument for dogfooding stated as a fact rather
+than a hope.
 
 ### Phase 4, and the number that justifies the whole design
 

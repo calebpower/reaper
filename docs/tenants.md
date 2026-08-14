@@ -157,9 +157,22 @@ reaper run           # your run command
 reaper down          # destroy it, results collected on the way
 ```
 
-`sync`, `build` and `run` each act on every session this project has, so a
-manifest naming two guests tests both with one command. Name a session to act on
-just one.
+Every verb acts on all of this project's sessions, so a manifest naming two
+guests tests both with one command. Name a session to act on just one.
+
+### What `test` skips, and why
+
+A step with nothing to do is skipped and says so, rather than failing:
+
+| Skipped when | |
+|---|---|
+| no `build` block | a project whose test command needs no build step is ordinary |
+| no `reset.datasets` | nothing to roll back |
+| no `@pristine` yet | the **first** `test` on a session has nowhere to reset to; that run takes the snapshot, and every later `test` gets all four steps |
+
+That last one has a consequence worth knowing: a run that *fails* takes no
+pristine, so a session whose first run never succeeded keeps skipping the reset
+until one does.
 
 ### What sync does, and what it deliberately does not
 

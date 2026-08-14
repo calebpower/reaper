@@ -12,7 +12,7 @@ The purpose is the tight `edit -> test` cycle *before* commit and push. It is
 deliberately **not** a CI platform. CI remains the independent re-proof after
 you push, and nothing here replaces it.
 
-> **Status: Phase 4.** A session can be brought up, listed, renewed and taken
+> **Status: Phase 5.** A session can be brought up, listed, renewed and taken
 > down; two guest templates exist and are proven; a working tree can be synced
 > in, built, run, and its results collected back out; and tenant state rolls
 > back in under three seconds. See [`docs/STATUS.md`](docs/STATUS.md) for
@@ -136,15 +136,12 @@ portfolio and what question each tier uniquely answers.
 
 ```sh
 reaper up      # a machine of your own, with your images already fetched
-reaper sync    # your uncommitted tree in, results back out
-reaper build   # your build command, in your pinned toolchain
-reaper run     # your run command; traces arrive while it runs
-reaper reset   # your state back to pristine, in seconds
+reaper test    # sync, build, reset, run -- the loop
 reaper down    # gone, and gone anyway if you vanish
 ```
 
-`reaper test` -- sync, build, reset and run as one verb -- is Phase 5, with the
-first real tenant. See [`docs/STATUS.md`](docs/STATUS.md).
+Each step is also a verb of its own -- `sync`, `build`, `reset`, `run` -- for
+when you want one without the others. See [`docs/STATUS.md`](docs/STATUS.md).
 
 This repository is its own first tenant: the `.reaper.yaml` at the root is real,
 and `reaper run` here runs reaper's whole battery inside a session.
