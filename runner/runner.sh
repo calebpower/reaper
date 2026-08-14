@@ -562,6 +562,7 @@ exec_in_container() {
         -v "$(state_dir):${MOUNT_STATE}" \
         -v "$(control_io "${exec_project}"):${MOUNT_CONTROL}/io" \
         -v "$(control_dir "${exec_project}")/reset:${MOUNT_CONTROL}/reset:ro" \
+        -v "$(control_dir "${exec_project}")/snapshot:${MOUNT_CONTROL}/snapshot:ro" \
         -e "REAPER_WORK=${MOUNT_WORK}" \
         -e "REAPER_OUT=${MOUNT_WORK}/out" \
         -e "REAPER_STATE=${MOUNT_STATE}" \
@@ -877,18 +878,26 @@ control_start() {
     chmod 0700 "${ctl_runner}"
 
     # The wrapper a tenant actually runs. It hides the protocol so that nothing
-    # inside a container needs to know any of this.
+    # inside a container needs to know any of this. One script, two names: it
+    # takes the verb from how it was called, so there is one copy of the
+    # protocol rather than two that can drift.
     cat > "${ctl_dir}/reset" <<'WRAPPER'
 #!/bin/sh
-# Ask the guest to roll this project's state back, and wait for it.
+# Ask the guest to do something to this project's state, and wait for it.
 #
-#   reset [snapshot-name]      default: pristine
+#   reset    [name]    roll back        default: pristine
+#   snapshot [name]    name this point  default: pristine
 #
 # Exits with the status of the rollback. Run it from anywhere that can see this
 # directory -- inside a container it is mounted at /reaper/control.
 set -eu
 dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+verb=$(basename -- "$0")
 name=${1:-pristine}
+case "${verb}" in
+    reset|snapshot) : ;;
+    *) echo "control: called as '${verb}', which is not a verb it knows" >&2; exit 2 ;;
+esac
 # Bounded wait, in seconds. Overridable so a test suite need not sit through
 # the production default.
 limit=${REAPER_RESET_TIMEOUT:-300}
@@ -900,7 +909,7 @@ caller=$(hostname 2>/dev/null || echo unknown)
 id="${caller}-$$"
 
 io="${dir}/io"
-printf '%s\n%s\n%s\n' reset "${name}" "${caller}" > "${io}/req.${id}.tmp"
+printf '%s\n%s\n%s\n' "${verb}" "${name}" "${caller}" > "${io}/req.${id}.tmp"
 mv "${io}/req.${id}.tmp" "${io}/req.${id}"
 
 # Bounded. A wrapper that waits forever on a loop that has died is worse than
@@ -911,7 +920,7 @@ while [ ! -f "${io}/res.${id}" ]; do
     waited=$((waited + 1))
     if [ "${waited}" -gt "${limit}" ]; then
         rm -f "${io}/req.${id}"
-        echo "reset: no answer from the guest in ${limit}s; is the control loop running?" >&2
+        echo "${verb}: no answer from the guest in ${limit}s; is the control loop running?" >&2
         exit 1
     fi
 done
@@ -921,6 +930,10 @@ rm -f "${io}/res.${id}"
 exit "${rc}"
 WRAPPER
     chmod 0755 "${ctl_dir}/reset"
+    # The same script under the other name. `basename $0` is what tells it
+    # which it is.
+    cp "${ctl_dir}/reset" "${ctl_dir}/snapshot"
+    chmod 0755 "${ctl_dir}/snapshot"
 
     # Detached, so it outlives the connection that started it.
     nohup "${ctl_runner}" control --project "${ctl_project}" serve \
@@ -976,6 +989,17 @@ control_serve() {
                         --dataset state \
                         --name "${control_snap:-pristine}" \
                         --except-container "${control_from}" || control_rc=$?
+                    ;;
+                snapshot)
+                    # --if-absent, because the point of this is a tenant saying
+                    # "my stack is up, mark here" at the start of every run. The
+                    # first successful one defines the point and later runs
+                    # reset *to* it rather than moving it -- which is the whole
+                    # value of a named point.
+                    "${ctl_runner}" snapshot \
+                        --dataset state \
+                        --name "${control_snap:-pristine}" \
+                        --if-absent || control_rc=$?
                     ;;
                 *)
                     log "control: ignoring an unknown request ${control_verb:-<empty>}"

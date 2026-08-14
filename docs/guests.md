@@ -98,7 +98,42 @@ supply a toolchain the guest itself provides. That is a real cost -- the tenant
 loses the ability to pin what it builds with -- and it is the reason
 container execution is the default.
 
+There is a second cost, learned from the first tenant that wanted one: a guest
+carrying a toolchain tends to multiply into a guest per toolchain *combination*,
+and the sysadmin then owns everyone's versions. Before building one, check
+whether the tenant can containerize its test driver instead -- a host-execution
+`run` on a guest with a container engine can orchestrate anything, so the
+toolchain need never touch the template. `docs/tenants.md` sets out that shape.
+
+### "No toolchain" does not mean "no tools"
+
+Say what a template has, because a tenant cannot see inside one until a session
+exists. The rule above is about *compilers a tenant could have pinned instead*.
+It is not licence to omit ordinary build plumbing and leave a tenant to discover
+it a clone at a time.
+
+`make` is the one that bit: a tenant whose entry point is a Makefile target --
+which is most of them -- found it absent, and "no language toolchain" does not
+obviously imply "no make". The same goes for `git`, `unzip` and a C compiler,
+each of which something in a normal build reaches for.
+
+Either put them in, or record their absence where a tenant will read it before
+writing a manifest. `docs/STATUS.md` carries the inventory for the guests
+registered here.
+
 **Project state of any kind.** A template is not a fixture.
+
+## The root disk is not scratch space
+
+A template's boot disk is deliberately small -- 8 GiB here -- because storage
+without snapshots copies it whole on every single clone. What that means for a
+tenant is that **under 4 GiB is free on a fresh session**, and a managed language
+runtime, a dependency tree and a browser bundle will not fit.
+
+That is what `tank/cache` is for, and it is why `build.cache` exists rather than
+being an optimisation a tenant can ignore. A guest should not be built with a
+larger boot disk to accommodate caches; the pool is already tens of gibibytes
+and is the right place. `docs/tenants.md` says the same thing to the tenant.
 
 ## How the pool disk is chosen
 
@@ -202,7 +237,13 @@ fixed and documented rather than configurable:
 | `/reaper/cache/<name>` | `tank/cache/<name>` | |
 | `/reaper/control/io` | `tank/control/<project>/io` | the reset trigger's request queue |
 | `/reaper/control/reset` | the wrapper | **read-only** |
+| `/reaper/control/snapshot` | the wrapper | **read-only** |
 | `/reaper/job.sh` | the rendered job | **read-only** |
+
+Note what is *not* mounted: **the container engine's socket.** A
+container-execution verb therefore cannot start sibling containers, which is
+deliberate and is the reason execution mode is a property of a verb. A tenant
+whose tests orchestrate containers runs that verb on the host.
 
 The two read-only entries are a boundary rather than tidiness. Anything a
 container can write, a container can replace -- so nothing the *guest* executes

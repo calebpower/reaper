@@ -1167,3 +1167,48 @@ fn the_cap_counts_the_cluster_and_not_just_this_workstation() {
         h.machines()
     );
 }
+
+#[test]
+fn test_can_reset_to_a_named_point() {
+    let h = Harness::new("loop-named");
+    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join("snapshots"), "pristine\nafter-stack-up\n", None);
+    h.ok(&["up"]);
+    h.forget_logs();
+
+    let out = h.ok(&["test", "--to", "after-stack-up"]);
+    assert!(out.contains("reset to after-stack-up"), "{out}");
+    assert!(
+        h.log("ssh.log").contains("rollback --dataset state --name after-stack-up"),
+        "{}",
+        h.log("ssh.log")
+    );
+
+    h.ok(&["down"]);
+}
+
+#[test]
+fn a_named_point_that_does_not_exist_is_an_error_not_a_skip() {
+    // Absent pristine is "this session has not run yet" and is skipped. A name
+    // the tenant typed and that is not there is very likely a typo, and
+    // skipping it would run the command against whatever state was lying about.
+    let h = Harness::new("loop-named-missing");
+    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join("snapshots"), "pristine\n", None);
+    h.ok(&["up"]);
+    h.forget_logs();
+
+    let err = h.fails(&["test", "--to", "no-such-point"]);
+    assert!(err.contains("no-such-point"), "{err}");
+    assert!(err.contains("REAPER_CONTROL/snapshot"), "should name both ways to make one: {err}");
+    // The build legitimately ran -- it comes before the reset step. What must
+    // not have happened is the *run*, which is the one that would have gone
+    // against whatever state was lying about.
+    let combined = format!("{}\n{}", h.log("rsync.log"), h.log("ssh.log"));
+    assert!(
+        !step_order(&combined).contains(&"run"),
+        "nothing may run against unreset state: {combined}"
+    );
+
+    h.ok(&["down"]);
+}

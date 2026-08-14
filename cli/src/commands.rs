@@ -840,6 +840,7 @@ fn existing_snapshots(ssh: &Ssh, dataset: &str) -> Result<Vec<String>> {
 /// from here. What this adds is the order, and the judgement about which steps
 /// have anything to do.
 pub fn test(
+    to: Option<String>,
     session: Option<String>,
     profile: Option<String>,
     manifest_path: Option<PathBuf>,
@@ -864,7 +865,7 @@ pub fn test(
         println!("{}: no build declared; skipping", manifest.project);
     }
 
-    reset_before_run(&manifest, session.clone(), manifest_path.clone())?;
+    reset_before_run(&manifest, to, session.clone(), manifest_path.clone())?;
 
     println!("{}: run", manifest.project);
     exec(Verb::Run, session, profile, manifest_path)?;
@@ -879,9 +880,11 @@ pub fn test(
 /// first pass, so every later `test` gets the full four steps.
 fn reset_before_run(
     manifest: &Manifest,
+    to: Option<String>,
     session: Option<String>,
     manifest_path: Option<PathBuf>,
 ) -> Result<()> {
+    let name = to.clone().unwrap_or_else(|| PRISTINE.to_string());
     if manifest.reset.is_empty() {
         println!("{}: no reset datasets declared; skipping", manifest.project);
         return Ok(());
@@ -898,7 +901,20 @@ fn reset_before_run(
         let ssh = ssh_for(&cfg, s)?;
         deliver_runner(&ssh)?;
         for d in &manifest.reset {
-            if !existing_snapshots(&ssh, d)?.iter().any(|n| n == PRISTINE) {
+            if !existing_snapshots(&ssh, d)?.iter().any(|n| n == &name) {
+                // A point the tenant asked for by name and that does not exist
+                // is a different thing from having no pristine yet: the first
+                // is very likely a typo, and skipping it silently would run the
+                // command against whatever state happened to be there.
+                if to.is_some() {
+                    return Err(format!(
+                        "{}: there is no {name:?} to reset to. `reaper snapshot {name}` \
+                         names one, or a run can name it for itself through \
+                         $REAPER_CONTROL/snapshot",
+                        s.name
+                    )
+                    .into());
+                }
                 println!(
                     "{}: nothing to reset to yet; this run will take {PRISTINE}",
                     s.name
@@ -908,8 +924,8 @@ fn reset_before_run(
         }
     }
 
-    println!("{}: reset", manifest.project);
-    reset(None, session, manifest_path)
+    println!("{}: reset to {name}", manifest.project);
+    reset(to, session, manifest_path)
 }
 
 pub fn snapshot(

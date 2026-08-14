@@ -507,6 +507,7 @@ log_has 'REAPER_STATE=/reaper/state'
 # read-only wrapper. Nothing the host executes is inside either.
 log_has "${WORK}/pool/control/a-project/io:/reaper/control/io"
 log_has "${WORK}/pool/control/a-project/reset:/reaper/control/reset:ro"
+log_has "${WORK}/pool/control/a-project/snapshot:/reaper/control/snapshot:ro"
 log_has 'REAPER_CONTROL=/reaper/control'
 log_has "${WORK}/pool/cache/cargo:/reaper/cache/cargo"
 log_has 'REAPER_CACHE_CARGO=/reaper/cache/cargo'
@@ -851,6 +852,52 @@ case "${mode}" in
 esac
 if [ -f "${ctl}/loop.pid" ]; then ok "recorded a pid"; else bad "no pid file"; fi
 outsays 'control='
+run_runner control --project a-project stop
+
+new_case "a tenant can mark a point from inside, and marking twice keeps the first"
+FAKE_PLATFORM=Linux
+with_engine
+# Nothing exists yet, so the first request should take one.
+: > "${WORK}/fix/zfs_snapshots"
+: > "${WORK}/fix/running_containers"
+run_runner control --project a-project start
+ctl="${WORK}/pool/control/a-project"
+if [ -x "${ctl}/snapshot" ]; then ok "a snapshot wrapper exists too"; else bad "no snapshot wrapper"; fi
+if ( PATH="${WORK}/bin:$PATH" FIX="${WORK}/fix" FIXLOG="${WORK}/log" \
+     FAKE_PLATFORM=Linux REAPER_SYSROOT="${WORK}/sysroot" \
+     REAPER_POOL_MOUNT="${WORK}/pool" REAPER_RESET_TIMEOUT=20 "${ctl}/snapshot" ) ; then
+    ok "the wrapper returned success"
+else
+    bad "the wrapper failed"
+fi
+log_has 'zfs snapshot tank/state@pristine'
+# It must not roll anything back on the way past.
+log_lacks 'zfs rollback'
+
+# Now say it already exists, and ask again: a named point does not move.
+printf 'tank/state@pristine\n' > "${WORK}/fix/zfs_snapshots"
+: > "${WORK}/log"
+if ( PATH="${WORK}/bin:$PATH" FIX="${WORK}/fix" FIXLOG="${WORK}/log" \
+     FAKE_PLATFORM=Linux REAPER_SYSROOT="${WORK}/sysroot" \
+     REAPER_POOL_MOUNT="${WORK}/pool" REAPER_RESET_TIMEOUT=20 "${ctl}/snapshot" ) ; then
+    ok "asking again still succeeds"
+else
+    bad "asking again should not be an error"
+fi
+log_lacks 'zfs snapshot'
+run_runner control --project a-project stop
+
+new_case "the wrapper refuses to be called by a name it does not know"
+FAKE_PLATFORM=Linux
+run_runner control --project a-project start
+ctl="${WORK}/pool/control/a-project"
+cp "${ctl}/reset" "${ctl}/destroy"
+if ( PATH="${WORK}/bin:$PATH" REAPER_POOL_MOUNT="${WORK}/pool" "${ctl}/destroy" ) 2>"${WORK}/err"; then
+    bad "should have refused"
+else
+    ok "refused"
+fi
+errsays "not a verb it knows"
 run_runner control --project a-project stop
 
 new_case "a caller id that is not one is refused, and nothing is rolled back"

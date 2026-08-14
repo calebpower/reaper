@@ -15,7 +15,7 @@ Last updated: 2026-08-13.
 | 2 | Guest templates + the runner | **Complete.** Both guests rebuilt, registered and proven live |
 | 3 | Sync, build, execution | **Accepted live.** sync, build and run against the real cluster, results flowing continuously |
 | 4 | `reset` and the `@pristine` snapshot | **Accepted live.** Reset, named checkpoints, and an in-guest trigger a container can call |
-| 5 | The loop as one verb, dogfooded | **Accepted live.** `reaper test`, and the payoff proven both ways |
+| 5 | The loop as one verb | **Accepted live**, and now proven by a tenant that is not reaper |
 | 6 | Hardening, `doctor`, third-tenant proof | Not started |
 
 Phase detail is in [`reaper-plan.md`](reaper-plan.md) §6, amended by the
@@ -257,6 +257,69 @@ Two of the five were bugs in reaper's own test suites, found only because
 reaper became its own tenant and tried to run them somewhere that was not this
 workstation. That is the whole argument for dogfooding, arriving on the first
 day of it.
+
+### The first tenant that is not reaper
+
+Onboarded 2026-08-14 from Arch on WSL2 — the first time the CLI has been driven
+from Linux. Findings are recorded in `reaper_bugs.md` beside this repository.
+
+**It needed no change to reaper.** One manifest and four tenant-side scripts;
+no framework patch, no plugin. The seam held, which is the claim the three lint
+guards exist to protect and the first time anything outside this repository has
+tested it.
+
+**And the cycle time came out the other way round.** Phase 5 could only measure
+reaper against itself, where the loop loses because reaper's own battery needs no
+machine. This tenant's battery **cannot run on the workstation at all** — a
+7.6 GiB WSL2 exhausts itself on the stack plus a browser — and the machine it
+replaces was a hand-kept VM that hard-reset under the same load.
+
+| | |
+|---|---|
+| the tenant's battery, on the workstation | does not run |
+| on the hand-kept VM it replaces | 8.7–10 min, when that VM survived the load |
+| `reaper test`, warm | **9m04s**, of which the suite is 8.6 min |
+
+So reaper's overhead on a warm session is **about 30 seconds on a nine-minute
+suite** — a sync, a no-op build, and result collection. That is the comparison
+the original plan asked for, and it is the tier a session is for.
+
+### Three things that tenant found
+
+**A false pass, waiting to happen.** A job runs under `/bin/sh`, which is dash
+on Ubuntu, and dash has no `pipefail` — so `make test | tee $REAPER_OUT/log`
+exits with *tee's* status. A failing suite reads as a pass, and on a tenant that
+declares a reset dataset `@pristine` is then taken on the strength of it, so
+every later reset returns to a broken state. Now documented in
+`docs/tenants.md`, with the reason reaper does not silently switch to bash:
+bash is not in the base system on every guest.
+
+**The guest is missing ordinary build plumbing**, and "no language toolchain"
+does not imply "no make". Recorded below and in `docs/guests.md`.
+
+**A wrong conclusion worth recording**, because the next tenant may draw it too:
+that no registered guest can run a containerized test stack. It does not follow.
+A container-execution verb gets no engine socket, so a tenant orchestrating
+containers must run that verb on the host — but `ubuntu-26.04` under
+`exec: host` has working podman and can orchestrate anything. What it lacks is a
+*toolchain*, and the answer is to containerize the test driver as well, which is
+the shape `manifest/examples/yasss.reaper.yaml` demonstrates. **No third guest is
+being built**; `docs/tenants.md` now spells the pattern out.
+
+### `ubuntu-26.04` as a tenant finds it
+
+Probed 2026-08-14 on template 9001. A tenant cannot see inside a template until
+a session exists, so this is written down rather than discovered a clone at a
+time.
+
+| | |
+|---|---|
+| Present | bash, curl, wget, tar, xz, rsync, zfs, podman 5.7.0, pgrep/pkill, ss, python3 3.14.4 |
+| **Absent** | **make**, git, gcc, unzip, node, npm, jq, lsof, fuser |
+| Resources | 4 cores, 15.5 GiB RAM, `/dev/shm` 7.6 GiB |
+| Root disk | 7.8 GiB, **~3.3 GiB free** — not scratch space; put caches on the pool |
+| Pool | `tank`, 62 GiB |
+| Egress | reachable: docker.io, archive.ubuntu.com, nodejs.org, npmjs, astral.sh, playwright |
 
 ### Phase 5: the loop, and an honest cycle time
 

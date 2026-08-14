@@ -74,6 +74,9 @@ enum Command {
     /// The whole loop: sync, build, reset, run.
     Test {
         session: Option<String>,
+        /// Reset to a named snapshot rather than the session's pristine.
+        #[arg(long)]
+        to: Option<String>,
         #[arg(long)]
         profile: Option<String>,
         #[arg(long)]
@@ -155,9 +158,10 @@ fn main() -> ExitCode {
         } => commands::exec(commands::Verb::Run, session, profile, manifest),
         Command::Test {
             session,
+            to,
             profile,
             manifest,
-        } => commands::test(session, profile, manifest),
+        } => commands::test(to, session, profile, manifest),
         Command::Reset {
             session,
             to,

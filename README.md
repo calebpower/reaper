@@ -259,6 +259,7 @@ Each step is also a verb of its own, for when you want one without the others:
 | `reaper build` | your build command, in your pinned toolchain |
 | `reaper run` | your run command; traces arrive *while* it runs |
 | `reaper reset [--to NAME]` | state back to a known point, in seconds |
+| `reaper test --to NAME` | the loop, resetting to a named point rather than pristine |
 | `reaper snapshot NAME` | name a point to come back to |
 | `reaper list` | what is up, how long it has left, whether its heartbeat is alive |
 | `reaper renew [--ttl 4h]` | more time |
@@ -281,10 +282,12 @@ succeeded keeps skipping until one does.
 between passes without knowing ZFS exists:
 
 ```sh
-"$REAPER_CONTROL/reset"      # blocks until the rollback is done
+"$REAPER_CONTROL/reset"      # roll back; blocks until it is done
+"$REAPER_CONTROL/snapshot"   # or mark *here*, once your stack is up
 ```
 
-The container that asks is spared when the others are stopped.
+The container that asks is spared when the others are stopped. `snapshot` is how
+you get a pristine taken at stack-up rather than at the end of a run.
 
 ### 5. When it goes wrong
 
@@ -299,6 +302,8 @@ The container that asks is spared when the others are stopped.
 | `… has N free and this session needs M, leaving less than the … floor` | The storage would be too full. Take a session down, or lower `min_free_gb` if you mean to run it close |
 | `N session(s) are already up on this provider … not yours` | The cap counts the whole cluster, so somebody else's sessions count against it |
 | `could not pre-fetch images` | A registry blip. The session is up and usable; the first build fetches them itself |
+| a suite that failed but `reaper test` exited 0 | Your `cmd` pipes, and `/bin/sh` is dash, which has no `pipefail`. See `docs/tenants.md` — this one also poisons `@pristine` |
+| `there is no "x" to reset to` from `test --to x` | A name that does not exist is an error, not a skip. Likely a typo |
 | `WARNING: TLS certificate verification is disabled` | Exactly what it says. Export the node's CA and switch `tls` to `ca-file` |
 
 If a session is unreachable and you want to know why, its console is readable

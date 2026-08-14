@@ -145,6 +145,47 @@ A container-execution `run` that names no `image` of its own runs in
 `build.image`, so a project whose two verbs share one toolchain writes the
 digest once. A host-execution verb never inherits one.
 
+### If your tests drive containers, containerize the driver too
+
+A container-execution verb is given **no container-engine socket**, so it cannot
+start sibling containers. That is deliberate, and it is why per-verb `exec`
+exists. But it leads somewhere that is worth spelling out, because the first
+tenant to meet it drew the wrong conclusion:
+
+> "My battery brings up three containers, so `run` must be `exec: host`. Host
+> execution forbids an image, so the toolchain has to come from the guest. No
+> guest here carries a toolchain — so no guest can run my tests."
+
+The last step does not follow. A host-execution `run` is a shell command on a
+guest that **does** have a container engine, so it can orchestrate as much as it
+likes. What it cannot do is supply node, or python, or a JDK.
+
+So put those in a container too. Bring up your stack *and your test driver* as
+containers from a `run.cmd` that uses nothing but the engine:
+
+```yaml
+exec: container
+build:
+  image: registry/toolchain@sha256:…   # compiles, bundles, produces artifacts
+  cmd: make build
+  cache: [deps]
+run:
+  exec: host                           # only needs the engine, no toolchain
+  cmd: e2e/run.sh                      # which starts db, app, and the driver
+```
+
+Now the guest needs no toolchain at all, and every version your tests depend on
+is digest-pinned by you rather than baked into a template by a sysadmin. This is
+the shape `manifest/examples/yasss.reaper.yaml` demonstrates.
+
+The alternative — a guest carrying node and python, registered as
+host-execution — is legitimate and the guest contract allows it. But weigh it:
+you move your toolchain from something you pin to something someone else
+upgrades, and it tends to multiply into a guest per toolchain combination.
+Bootstrapping a toolchain inside `build.cmd` is the third option, and an honest
+staging post; pin what you download by checksum, because the digest guarantee
+the schema enforces for `image` does not reach a `curl`.
+
 ## The loop
 
 Four verbs, and the first is the only one that costs minutes.
@@ -215,6 +256,35 @@ which one they got:
 Put anything you want `reset` to undo under `REAPER_STATE`, and nothing else
 there. A database's data directory belongs in it; your build output does not.
 
+### Your command runs under `/bin/sh` — mind the exit status
+
+This one has already caught somebody, and it fails in the worst direction.
+
+`/bin/sh` is dash on at least one guest here, and **dash has no `pipefail`**. So
+the obvious thing:
+
+```yaml
+cmd: make test-e2e | tee $REAPER_OUT/e2e.log      # WRONG
+```
+
+exits with **tee's** status. A failing suite is reported as a pass, `reaper
+test` exits zero, and — if you declare a reset dataset — `@pristine` is then
+taken *on the strength of that false pass*, so every later reset returns you to
+a broken state.
+
+Either avoid the pipe:
+
+```yaml
+cmd: make test-e2e > $REAPER_OUT/e2e.log 2>&1
+```
+
+or own the status explicitly, by pointing `cmd` at a script of your own with a
+`#!/bin/bash` line and `set -euo pipefail`. reaper does not run your command
+under bash for you: bash is not in the base system on every guest, and choosing
+a shell you did not ask for would be a worse surprise than this one.
+
+`&&` chains are safe, which is why reaper's own manifest happens to dodge this.
+
 Your `cmd` is handed to a shell, so it may use those:
 
 ```yaml
@@ -224,6 +294,14 @@ cmd: CARGO_TARGET_DIR=$REAPER_CACHE_TARGET cargo build --locked
 Values under `env` are **not** expanded -- they are passed through exactly as
 written, and the framework never interpolates or interprets one. If you want
 expansion, it belongs in the command.
+
+**Put anything large in a cache, not on the guest's root disk.** A template's
+boot disk is small — the Ubuntu one has under 4 GiB free — and it is not scratch
+space. Managed language runtimes, dependency trees and browser bundles all
+belong under `$REAPER_CACHE_*`, which lives on the session's own pool with tens
+of gibibytes. This is load-bearing rather than an optimisation: a tenant that
+lets `uv`, `npm` or Playwright write to the default location under `$HOME` will
+run the root filesystem out of space.
 
 Caches are declared once, under `build.cache`, and are given to every verb. A
 profile with `warm_cache: false` gives none of them to any verb: not an unset
@@ -305,12 +383,31 @@ without knowing that ZFS exists or being able to run commands on the guest. So
 the guest listens:
 
 ```sh
-"$REAPER_CONTROL/reset"            # blocks until the rollback is done
-"$REAPER_CONTROL/reset" some-name  # or to a named point
+"$REAPER_CONTROL/reset"             # roll back; blocks until it is done
+"$REAPER_CONTROL/reset" some-name   # or to a named point
+"$REAPER_CONTROL/snapshot"          # mark *here* as pristine
+"$REAPER_CONTROL/snapshot" mid      # or under a name of your own
 ```
 
 `REAPER_CONTROL` is set for you, and under container execution it is mounted.
 Mount it into your own containers if they need it.
+
+`snapshot` is how you get a **tight** pristine. Call it the moment your stack has
+finished coming up and before any test has touched anything, and that is the
+point every later reset returns to -- rather than the end-of-run point reaper
+takes for you if you never say. It keeps the first one it is given, so calling
+it on every run is the intended use: a named point does not move under you.
+
+Then drive the loop from it:
+
+```sh
+reaper test --to after-stack-up
+```
+
+`test` resets to `pristine` unless told otherwise. A name you pass that does not
+exist is an error rather than a skip -- far more likely a typo than an
+intention, and skipping it would run your tests against whatever state happened
+to be lying about.
 
 **The caller survives.** Stopping the container that asked for the reset would
 look exactly like the reset having crashed, so it is spared -- identified by
