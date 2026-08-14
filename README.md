@@ -126,25 +126,190 @@ since none of those tiers can see a defect that needs a real machine to surface.
 [`docs/testing-methodology.md`](docs/testing-methodology.md) sets out the full
 portfolio and what question each tier uniquely answers.
 
-## Getting started
+## How to use it
 
-1. A sysadmin builds a guest template and registers it
-   ([`docs/guests.md`](docs/guests.md), [`docs/site-config.md`](docs/site-config.md)).
-2. You write a `.reaper.yaml` in your project
-   ([`docs/tenants.md`](docs/tenants.md), `manifest/examples/`).
-3. Then, from your project:
+Three audiences, in the order they appear: whoever administers the cluster,
+whoever onboards a project, and whoever runs the loop all day.
+
+### 1. Build the CLI
 
 ```sh
-reaper up      # a machine of your own, with your images already fetched
-reaper test    # sync, build, reset, run -- the loop
-reaper down    # gone, and gone anyway if you vanish
+cargo build --release          # target/release/reaper
 ```
 
-Each step is also a verb of its own -- `sync`, `build`, `reset`, `run` -- for
-when you want one without the others. See [`docs/STATUS.md`](docs/STATUS.md).
+Nothing is installed into a guest. The runner is compiled into the binary and
+delivered over SSH on every operation, so upgrading reaper never means
+rebuilding a template.
 
-This repository is its own first tenant: the `.reaper.yaml` at the root is real,
-and `reaper run` here runs reaper's whole battery inside a session.
+> Building on FreeBSD or another BSD? Build natively. There is no
+> cross-compilation here, which is also why `rustls` is mandatory and
+> `native-tls` is banned -- an OpenSSL linkage difference between build hosts is
+> exactly the kind of portability failure that shows up late and confusingly.
+
+### 2. Set up a site *(sysadmin, once)*
+
+**Build a guest template** and register it. Follow
+[`docs/runbooks/`](docs/runbooks/) exactly; both runbooks record defects found
+the hard way, and both templates here shipped subtly broken at least once. The
+guest contract is [`docs/guests.md`](docs/guests.md).
+
+**Write the site registry** at `~/.config/reaper/config.toml`
+(`$XDG_CONFIG_HOME/reaper/`, `/etc/reaper/`, or `REAPER_CONFIG` to be explicit):
+
+```toml
+provider = "proxmox"
+
+[session]
+default_ttl        = "2h"     # how long a session lives without a heartbeat
+heartbeat_interval = "5m"     # must fit at least three times into the TTL
+ready_grace        = "30m"    # the first expiry, covering a slow clone
+max_concurrent     = 2
+default_disk_gb    = 64
+ssh_key            = "~/.config/reaper/session-key"
+
+[guests."ubuntu-26.04"]       # the name tenants ask for
+template = "9001"             # opaque; the provider reads it
+
+[proxmox]
+api          = "https://node.example:8006"
+node         = "somenode"
+pool         = "a/pool"
+id_range     = [9000, 9099]
+token_file   = "~/.config/reaper/token"
+data_storage = "some-storage"  # where each session's blank pool disk is made
+tls          = "ca-file"       # webpki | ca-file | insecure
+ca_file      = "~/.config/reaper/node-ca.pem"
+```
+
+`data_storage` is not optional in practice: without it, the first `up` that
+asks for a session disk is refused, and every session asks for one.
+
+The credential is one line, `user@realm!name=secret`, in a file only you can
+read. Full reference: [`docs/site-config.md`](docs/site-config.md).
+
+**Deploy the sweeper** from [`cull/`](cull/) on a *different* machine with its
+*own* credential. This is the backstop that destroys anything whose expiry has
+passed, and it is what makes every other failure mode survivable. Run it from
+cron; `--dry-run` first.
+
+### 3. Onboard a project *(once per project)*
+
+Write `.reaper.yaml` at its root. That is the entire integration surface -- no
+plugin, no callback, no framework edit:
+
+```yaml
+schema: 1
+project: my-project
+guests: [ubuntu-26.04]        # what the sysadmin registered
+exec: container               # or: host
+
+build:
+  image: docker.io/library/rust@sha256:3382bd…   # digest, never a tag
+  cmd: cargo build --locked --tests
+  cache: [cargo, target]
+
+run:
+  cmd: cargo test --workspace
+  images: []                  # pre-pulled for you if you list any
+
+sync:
+  exclude: [/target/]         # rsync patterns; out/ is always excluded
+
+reset:
+  datasets: [state]
+
+resources: { cores: 4, ram_gb: 8 }
+```
+
+Check it before you need it:
+
+```sh
+reaper-manifest-validate .reaper.yaml
+```
+
+Three things to get right, because they are where projects actually stumble:
+
+- **State must live under `$REAPER_STATE`.** `reset` rolls back that dataset and
+  nothing else. A database whose data directory sits inside its container has no
+  state reaper can roll back, and reset will appear to do nothing.
+- **`exec` is per verb.** A build often wants a pinned toolchain image while the
+  run needs the guest's own container engine -- a toolchain image has no engine
+  client in it. Say `run: { exec: host }` when that is the shape.
+- **Images are digest-pinned.** Tags are refused outright, including
+  `repo:tag@sha256:…`, where the tag is unverified and can drift away from the
+  digest while looking checked.
+
+Worked examples: [`manifest/examples/`](manifest/examples/). Full contract:
+[`docs/tenants.md`](docs/tenants.md).
+
+### 4. The loop *(all day)*
+
+```sh
+reaper up                    # a machine of your own, images already fetched
+reaper test                  # sync -> build -> reset -> run
+reaper down                  # gone, and gone anyway if you vanish
+```
+
+Each step is also a verb of its own, for when you want one without the others:
+
+| | |
+|---|---|
+| `reaper sync` | your uncommitted tree in, results back out |
+| `reaper build` | your build command, in your pinned toolchain |
+| `reaper run` | your run command; traces arrive *while* it runs |
+| `reaper reset [--to NAME]` | state back to a known point, in seconds |
+| `reaper snapshot NAME` | name a point to come back to |
+| `reaper list` | what is up, how long it has left, whether its heartbeat is alive |
+| `reaper renew [--ttl 4h]` | more time |
+
+Useful flags: `--profile nightly` picks a profile (its TTL, its environment, and
+whether caches are warm); `--manifest path` points at a project other than the
+current directory; most verbs take a session name to act on just one.
+
+**Results come back while a run is happening**, not at the end -- every few
+seconds into `out/` in your tree, again when the command stops whether it passed
+or failed, and once more on `down`. A failure trace should never exist only on a
+machine scheduled for destruction.
+
+**The first `test` on a session skips the reset**, because there is nothing to
+reset to yet; that run takes `@pristine` and every later `test` gets all four
+steps. A run that *fails* takes no snapshot, so a session whose first run never
+succeeded keeps skipping until one does.
+
+**Resetting from inside your own stack**, for a driver that wants a clean slate
+between passes without knowing ZFS exists:
+
+```sh
+"$REAPER_CONTROL/reset"      # blocks until the rollback is done
+```
+
+The container that asks is spared when the others are stopped.
+
+### 5. When it goes wrong
+
+| What you see | What it means |
+|---|---|
+| `no guest named "x" is registered here` | A typo, or a template nobody has built. Costs nothing -- it is refused before anything is created |
+| `waiting -- <v6 address>: No route to host` | Normal. A dual-stacked guest reports IPv6 before its DHCP lease; reaper keeps trying until something answers |
+| `created, but nothing answered on it within 30m` | The machine exists and carries an expiry, so nothing is leaked. `reaper list` shows it; `reaper down` removes it |
+| `<pid> DEAD` in `reaper list` | The heartbeat stopped, so the expiry stopped moving. Nothing is leaked -- the sweeper will collect it -- but you are on a countdown nobody is winding |
+| `refusing to roll … back: process(es) N still have files open` | Something is still using the dataset. Rolling back under it would leave it reading data that no longer exists |
+| `there is no tank/state@pristine to roll back to` | No run has succeeded on this session yet |
+| `could not pre-fetch images` | A registry blip. The session is up and usable; the first build fetches them itself |
+| `WARNING: TLS certificate verification is disabled` | Exactly what it says. Export the node's CA and switch `tls` to `ca-file` |
+
+If a session is unreachable and you want to know why, its console is readable
+through the API -- see
+[`providers/proxmox/tools/console.mjs`](providers/proxmox/tools/console.mjs).
+Note the limitation it documents: an API token cannot open a console, so it
+needs a user login.
+
+### 6. This repository is its own first tenant
+
+The `.reaper.yaml` at the root is real, not an example. `reaper test` here runs
+reaper's whole battery -- Rust suites, shell suites and seam guards -- inside a
+session. It has already caught three portability bugs that a workstation-only
+run could not, and that is the reason it exists.
 
 ## License
 
