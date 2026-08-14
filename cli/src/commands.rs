@@ -811,6 +811,95 @@ fn reset_datasets(manifest: &Manifest) -> &[String] {
     &manifest.reset
 }
 
+
+/// The points a session's state can be rolled back to.
+fn existing_snapshots(ssh: &Ssh, dataset: &str) -> Result<Vec<String>> {
+    let out = ssh.run(
+        &format!("{RUNNER_PATH} snapshots --dataset {dataset}"),
+        "listing snapshots",
+    )?;
+    Ok(out.split_whitespace().map(str::to_string).collect())
+}
+
+/// The loop, as one verb: sync, build, reset, run.
+///
+/// Composition rather than new machinery -- each step is the same code path the
+/// individual verb uses, so nothing behaves differently for having been called
+/// from here. What this adds is the order, and the judgement about which steps
+/// have anything to do.
+pub fn test(
+    session: Option<String>,
+    profile: Option<String>,
+    manifest_path: Option<PathBuf>,
+) -> Result<()> {
+    let (manifest, _) = load_manifest_at(manifest_path.clone())?;
+
+    println!("{}: sync", manifest.project);
+    sync(session.clone(), manifest_path.clone())?;
+
+    // A project with no build step is ordinary -- the smallest legal manifest
+    // has none -- so this is a skip rather than a failure.
+    let builds = manifest.guests.iter().any(|g| g.build.is_some());
+    if builds {
+        println!("{}: build", manifest.project);
+        exec(
+            Verb::Build,
+            session.clone(),
+            profile.clone(),
+            manifest_path.clone(),
+        )?;
+    } else {
+        println!("{}: no build declared; skipping", manifest.project);
+    }
+
+    reset_before_run(&manifest, session.clone(), manifest_path.clone())?;
+
+    println!("{}: run", manifest.project);
+    exec(Verb::Run, session, profile, manifest_path)?;
+    Ok(())
+}
+
+/// Roll state back, but only when there is somewhere to roll back to.
+///
+/// On a session that has never had a successful run there is no `@pristine`,
+/// and resetting would fail on the first pass of `test` for a reason that has
+/// nothing to do with the project. `run` takes the snapshot at the end of that
+/// first pass, so every later `test` gets the full four steps.
+fn reset_before_run(
+    manifest: &Manifest,
+    session: Option<String>,
+    manifest_path: Option<PathBuf>,
+) -> Result<()> {
+    if manifest.reset.is_empty() {
+        println!("{}: no reset datasets declared; skipping", manifest.project);
+        return Ok(());
+    }
+
+    let cfg = load_config()?;
+    let store = Store::open();
+    let sessions = implied_sessions(&store, session.clone(), Some(&manifest.project))?;
+
+    // Asked of the session rather than assumed, because "has this project ever
+    // completed a run here" is a fact about the machine and not about the
+    // manifest.
+    for s in &sessions {
+        let ssh = ssh_for(&cfg, s)?;
+        deliver_runner(&ssh)?;
+        for d in &manifest.reset {
+            if !existing_snapshots(&ssh, d)?.iter().any(|n| n == PRISTINE) {
+                println!(
+                    "{}: nothing to reset to yet; this run will take {PRISTINE}",
+                    s.name
+                );
+                return Ok(());
+            }
+        }
+    }
+
+    println!("{}: reset", manifest.project);
+    reset(None, session, manifest_path)
+}
+
 pub fn snapshot(
     name: String,
     session: Option<String>,

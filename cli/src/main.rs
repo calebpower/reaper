@@ -71,6 +71,15 @@ enum Command {
         manifest: Option<PathBuf>,
     },
 
+    /// The whole loop: sync, build, reset, run.
+    Test {
+        session: Option<String>,
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+    },
+
     /// Roll this project's state back.
     Reset {
         session: Option<String>,
@@ -144,6 +153,11 @@ fn main() -> ExitCode {
             profile,
             manifest,
         } => commands::exec(commands::Verb::Run, session, profile, manifest),
+        Command::Test {
+            session,
+            profile,
+            manifest,
+        } => commands::test(session, profile, manifest),
         Command::Reset {
             session,
             to,

@@ -137,7 +137,10 @@ zfs)
                                   case "${b}" in
                                       *@*) grep -qx "${b}" "${FIX}/zfs_snapshots" 2>/dev/null && exit 0 || exit 1 ;;
                                   esac
-                              done ;;
+                              done
+                              # No @ anywhere means a listing rather than an
+                              # existence check: `-r <dataset>`.
+                              fix zfs_snapshots; exit 0 ;;
                 esac
             done
             for a in "$@"; do
@@ -643,6 +646,26 @@ FAKE_PLATFORM=Linux
 if run_runner snapshot --dataset state --name pristine; then :; else bad "snapshot should have succeeded"; fi
 log_has 'zfs snapshot tank/state@pristine'
 outsays 'snapshot=tank/state@pristine'
+
+new_case "snapshots lists the points that exist, by name alone"
+FAKE_PLATFORM=Linux
+printf 'tank/state@pristine\ntank/state@mid\n' > "${WORK}/fix/zfs_snapshots"
+if run_runner snapshots --dataset state; then :; else bad "snapshots should have succeeded"; fi
+outsays '^pristine$'
+outsays '^mid$'
+# The full path is this script's business; a caller asked which points exist.
+if grep -q 'tank/state@' "${WORK}/out"; then bad "leaked the dataset path"; else ok "names only"; fi
+
+new_case "snapshots on a dataset with none says nothing, and succeeds"
+FAKE_PLATFORM=Linux
+: > "${WORK}/fix/zfs_snapshots"
+if run_runner snapshots --dataset state; then ok "succeeded"; else bad "an empty list is not a failure"; fi
+if [ -s "${WORK}/out" ]; then bad "should have printed nothing"; else ok "printed nothing"; fi
+
+new_case "snapshots refuses a dataset it does not know"
+FAKE_PLATFORM=Linux
+if run_runner snapshots --dataset work; then bad "should have refused"; else ok "refused"; fi
+exited 2
 
 new_case "--if-absent keeps the snapshot that is already there"
 FAKE_PLATFORM=Linux

@@ -57,6 +57,10 @@ for a in "$@"; do
         # The other reply the CLI reads rather than ignores: whether a snapshot
         # was actually taken. Deciding that is the runner's job and is tested
         # there; what is tested here is what the CLI does with the answer.
+        # Which points exist. A file the test controls, so both the
+        # never-run-yet case and the ordinary one can be modelled.
+        *"runner.sh snapshots"*)
+            cat "${here}/snapshots" 2>/dev/null || true ;;
         *"runner.sh snapshot"*)
             printf 'snapshot=tank/state@pristine\n' ;;
     esac
@@ -1018,5 +1022,123 @@ fn a_session_that_cannot_roll_anything_back_starts_no_trigger() {
         "{}",
         h.log("ssh.log")
     );
+    h.ok(&["down"]);
+}
+
+
+// ---------------------------------------------------------------------------
+// Phase 5: the loop as one verb
+// ---------------------------------------------------------------------------
+
+/// The order is the substance of this verb, so the order is what is asserted.
+fn step_order(log: &str) -> Vec<&'static str> {
+    let mut seen = Vec::new();
+    for line in log.lines() {
+        // rsync and ssh share one log here only in spirit; each step is
+        // recognisable by the command it runs.
+        if line.contains("--delete") && !seen.contains(&"sync") {
+            seen.push("sync");
+        }
+        if line.contains("--image") && line.contains("exec --project") && !seen.contains(&"build") {
+            seen.push("build");
+        }
+        if line.contains("rollback --dataset") && !seen.contains(&"reset") {
+            seen.push("reset");
+        }
+        if line.contains("exec --project") && !line.contains("--image") && !seen.contains(&"run") {
+            seen.push("run");
+        }
+    }
+    seen
+}
+
+#[test]
+fn test_runs_the_four_steps_in_order() {
+    let h = Harness::new("loop-order");
+    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    // A session that has already had a successful run, so there is a pristine
+    // and the reset step has somewhere to go.
+    write(&h.dir.join("snapshots"), "pristine\n", None);
+    h.ok(&["up"]);
+    h.forget_logs();
+
+    h.ok(&["test"]);
+
+    // One combined view: rsync's log carries the sync, ssh's the rest.
+    let combined = format!("{}\n{}", h.log("rsync.log"), h.log("ssh.log"));
+    let order = step_order(&combined);
+    assert_eq!(
+        order,
+        vec!["sync", "build", "reset", "run"],
+        "steps ran in the wrong order:\n{combined}"
+    );
+
+    h.ok(&["down"]);
+}
+
+#[test]
+fn the_first_test_on_a_session_does_not_reset() {
+    // There is no pristine yet, so a reset would fail for a reason that has
+    // nothing to do with the project. `run` takes the snapshot at the end of
+    // this pass, and every later `test` gets all four steps.
+    let h = Harness::new("loop-first");
+    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join("snapshots"), "", None);
+    h.ok(&["up"]);
+    h.forget_logs();
+
+    let out = h.ok(&["test"]);
+    assert!(out.contains("nothing to reset to yet"), "{out}");
+    assert!(
+        !h.log("ssh.log").contains("rollback --dataset"),
+        "no rollback may be attempted: {}",
+        h.log("ssh.log")
+    );
+    // But the run still happened, and still took the snapshot.
+    assert!(h.log("ssh.log").contains("snapshot --dataset state"), "{}", h.log("ssh.log"));
+
+    h.ok(&["down"]);
+}
+
+#[test]
+fn test_skips_the_steps_a_project_does_not_have() {
+    // The minimal manifest has no build and no reset datasets. Both are
+    // ordinary, so both are skips rather than failures.
+    let h = Harness::new("loop-minimal");
+    h.ok(&["up"]);
+    h.forget_logs();
+
+    let out = h.ok(&["test"]);
+    assert!(out.contains("no build declared"), "{out}");
+    assert!(out.contains("no reset datasets declared"), "{out}");
+    assert!(
+        !h.log("ssh.log").contains("--image"),
+        "nothing may be built: {}",
+        h.log("ssh.log")
+    );
+    // And the run still ran, which is the whole point of the verb.
+    assert!(h.log("ssh.log").contains("exec --project"), "{}", h.log("ssh.log"));
+
+    h.ok(&["down"]);
+}
+
+#[test]
+fn a_failing_step_stops_the_ones_after_it() {
+    let h = Harness::new("loop-stops");
+    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join("snapshots"), "pristine\n", None);
+    h.ok(&["up"]);
+    h.forget_logs();
+    // Break the build. Nothing after it should be attempted.
+    write(&h.dir.join("ssh.fail"), "--image docker.io/library/toolchain", None);
+
+    h.fails(&["test"]);
+    let ssh = h.log("ssh.log");
+    assert!(
+        !ssh.contains("rollback --dataset"),
+        "a failed build must not be followed by a reset: {ssh}"
+    );
+
+    let _ = std::fs::remove_file(h.dir.join("ssh.fail"));
     h.ok(&["down"]);
 }

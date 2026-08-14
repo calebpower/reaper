@@ -19,6 +19,7 @@
 #   runner.sh pull REF...                   fetch digest-pinned images
 #   runner.sh exec --project P --job PATH [--image REF] [--cache NAME]...
 #                                           run a delivered job script
+#   runner.sh snapshots --dataset D          list the points that exist
 #   runner.sh snapshot --dataset D --name N [--if-absent]
 #   runner.sh rollback --dataset D --name N [--except-container ID]
 #   runner.sh control --project P {start|stop}
@@ -619,6 +620,34 @@ snapshot_exists() {
     zfs list -t snapshot -H -o name "$1@$2" >/dev/null 2>&1
 }
 
+# What points this dataset can be rolled back to.
+#
+# The CLI needs this to answer a question it must not answer by guessing: on a
+# session that has never had a successful run there is no @pristine, and a
+# `test` that blindly reset would fail on its first pass for a reason that has
+# nothing to do with the tenant.
+cmd_snapshots() {
+    snaps_dataset=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dataset)
+                [ $# -ge 2 ] || usage "snapshots: --dataset needs a value"
+                snaps_dataset=$2; shift 2 ;;
+            *) usage "snapshots: unexpected argument $1" ;;
+        esac
+    done
+
+    [ -n "${snaps_dataset}" ] || usage "snapshots: no --dataset"
+    snaps_target=$(rollback_target "${snaps_dataset}") \
+        || usage "snapshots: ${snaps_dataset} is not a dataset this knows about (only: ${ROLLBACKABLE})"
+
+    # Names only. The full path is this script's business and the caller has no
+    # use for it -- it asked which points exist, not where they live.
+    zfs list -t snapshot -H -o name -r "${snaps_target}" 2>/dev/null \
+        | sed -n "s|^${snaps_target}@||p"
+}
+
 cmd_snapshot() {
     snap_dataset=""; snap_name=""; snap_if_absent=""
 
@@ -968,13 +997,14 @@ case "${1:-}" in
     pull)      shift; cmd_pull "$@" ;;
     exec)      shift; cmd_exec "$@" ;;
     snapshot)  shift; cmd_snapshot "$@" ;;
+    snapshots) shift; cmd_snapshots "$@" ;;
     rollback)  shift; cmd_rollback "$@" ;;
     control)   shift; cmd_control "$@" ;;
     -h|--help)
         sed -n '2,/^set -eu/p' "$0" | sed 's/^# \{0,1\}//;$d'
         ;;
     *)
-        printf 'usage: %s {firstboot|info|workspace|pull|exec|snapshot|rollback|control}\n' "$0" >&2
+        printf 'usage: %s {firstboot|info|workspace|pull|exec|snapshot|snapshots|rollback|control}\n' "$0" >&2
         exit 2
         ;;
 esac
