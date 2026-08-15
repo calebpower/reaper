@@ -27,6 +27,7 @@ run() { # run <label> <command...>
 
 run "shell lint"       ./tools/lint-shell.sh
 run "seam guards"      ./tools/guards.sh
+run "invariants"       ./tools/invariants.sh
 run "manifest schema"  ./manifest/test/run.sh
 run "runner decisions" ./runner/test/run.sh
 

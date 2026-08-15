@@ -513,14 +513,43 @@ fn an_unknown_key_in_the_provider_table_is_refused() {
 
 // --- the token file --------------------------------------------------------
 
-fn token_file(name: &str, contents: &str, mode: u32) -> std::path::PathBuf {
+/// A credential file that removes itself, however the test ends.
+///
+/// Deref so it stands in for a path at every call site. Drop rather than a
+/// tidy-up at the end of a test, because a panicking test never reaches the
+/// tidy-up -- which is how this suite came to leave hundreds of directories
+/// in /tmp.
+struct TokenFile(std::path::PathBuf);
+
+impl std::ops::Deref for TokenFile {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for TokenFile {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TokenFile {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+fn token_file(name: &str, contents: &str, mode: u32) -> TokenFile {
     use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("reaper-token-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("token");
     std::fs::write(&path, contents).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
-    path
+    TokenFile(path)
 }
 
 #[test]

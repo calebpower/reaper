@@ -34,6 +34,10 @@ max_concurrent     = 2       # counted across the provider, not per workstation
 default_disk_gb    = 64      # size of each session's storage pool
 rsync_command      = "rsync"  # the binary that moves the tree and the results
 results_interval   = "5s"    # how often results are pulled while a command runs
+ssh_user           = "root"  # who reaper connects as; see docs/guests.md
+ssh_key            = "~/.config/reaper/session-key"  # the key every template trusts
+ssh_command        = "ssh"   # or a wrapper
+ssh_connect_timeout = "15s"
 
 # The guest registry. Names are free-form and mean whatever you say they mean;
 # a tenant asks for one by name and the framework looks it up here. Quote keys
@@ -54,6 +58,8 @@ id_range   = [9000, 9099]
 token_file = "~/.config/reaper/token"
 data_storage = "some-storage"  # where each session's blank pool disk is made
 min_free_gb  = 10              # room to leave on a storage after a session takes its share
+task_timeout = "10m"           # how long to wait on a clone or a destroy
+request_timeout = "30s"        # a single API call
 data_bus     = "virtio1"       # which slot it hangs on; templates boot from virtio0
 tls        = "ca-file"       # webpki | ca-file | insecure
 ca_file    = "~/.config/reaper/node-ca.pem"

@@ -22,6 +22,18 @@ cull="${here}/../cull.sh"
 [ -x "${cull}" ] || { echo "no sweeper at ${cull}" >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "these tests need jq" >&2; exit 1; }
 
+
+# One parent for every case's scratch directory, and an exit path that removes
+# it. This suite leaked 976 directories before anyone counted -- the same
+# defect as the runner's suite and the Rust harnesses, found by the invariant
+# check written after the third instance.
+RUNDIR=$(mktemp -d "${TMPDIR:-/tmp}/reaper-cull-suite.XXXXXXXX")
+cleanup() {
+    pkill -f "${RUNDIR}" 2>/dev/null || true
+    rm -rf "${RUNDIR}"
+}
+trap cleanup EXIT HUP INT TERM
+
 pass=0
 fail=0
 CASE=""
@@ -36,7 +48,7 @@ new_case() {
     # system the argument is a prefix, on another it is a template that must
     # end in X's, and there it fails outright. A full template works on both,
     # and this suite has to run on the systems it tests.
-    WORK=$(mktemp -d "${TMPDIR:-/tmp}/reaper-cull.XXXXXXXX")
+    WORK=$(mktemp -d "${RUNDIR}/case.XXXXXXXX")
     mkdir -p "${WORK}/bin" "${WORK}/fix"
     : > "${WORK}/log"
 

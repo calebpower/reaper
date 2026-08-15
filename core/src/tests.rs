@@ -18,16 +18,49 @@ fn env_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn scratch_dir(label: &str) -> PathBuf {
-    static N: AtomicU32 = AtomicU32::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "reaper-core-test-{}-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::SeqCst),
-        label
-    ));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    dir
+/// A temporary directory that removes itself, however the test ends.
+///
+/// A `remove_dir_all` at the end of a test body does not run when the test
+/// panics, and tests panic -- that is what they are for. Three harnesses in
+/// this project leaked scratch directories for exactly that reason, nearly a
+/// thousand of them before anyone counted. Drop runs either way.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(label: &str) -> Scratch {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "reaper-core-test-{}-{}-{label}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        Scratch(dir)
+    }
+}
+
+impl AsRef<std::path::Path> for Scratch {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for Scratch {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scratch_dir(label: &str) -> Scratch {
+    Scratch::new(label)
 }
 
 // --- configuration ---------------------------------------------------------
@@ -257,7 +290,8 @@ fn session(name: &str, machine: &str) -> Session {
 
 #[test]
 fn a_session_round_trips_through_the_store() {
-    let store = Store::at(scratch_dir("roundtrip").join("sessions.json"));
+    let dir = scratch_dir("roundtrip");
+    let store = Store::at(dir.join("sessions.json"));
     store.put(session("alpha", "m-1")).unwrap();
 
     let got = store.get("alpha").unwrap().expect("stored session");
@@ -270,14 +304,16 @@ fn a_session_round_trips_through_the_store() {
 
 #[test]
 fn a_store_that_has_never_been_written_is_empty_rather_than_broken() {
-    let store = Store::at(scratch_dir("absent").join("sessions.json"));
+    let dir = scratch_dir("absent");
+    let store = Store::at(dir.join("sessions.json"));
     assert!(store.list().unwrap().is_empty());
     assert!(store.get("anything").unwrap().is_none());
 }
 
 #[test]
 fn sessions_accumulate_and_can_be_removed() {
-    let store = Store::at(scratch_dir("many").join("sessions.json"));
+    let dir = scratch_dir("many");
+    let store = Store::at(dir.join("sessions.json"));
     store.put(session("alpha", "m-1")).unwrap();
     store.put(session("beta", "m-2")).unwrap();
     assert_eq!(store.list().unwrap().len(), 2);
@@ -290,7 +326,8 @@ fn sessions_accumulate_and_can_be_removed() {
 
 #[test]
 fn putting_the_same_name_twice_replaces_rather_than_duplicates() {
-    let store = Store::at(scratch_dir("replace").join("sessions.json"));
+    let dir = scratch_dir("replace");
+    let store = Store::at(dir.join("sessions.json"));
     store.put(session("alpha", "m-1")).unwrap();
     store.put(session("alpha", "m-2")).unwrap();
     let all = store.list().unwrap();
@@ -300,7 +337,10 @@ fn putting_the_same_name_twice_replaces_rather_than_duplicates() {
 
 #[test]
 fn a_store_from_another_version_is_refused_rather_than_misread() {
-    let path = scratch_dir("version").join("sessions.json");
+    // The guard is bound, not chained off: `scratch_dir(..).join(..)` drops the
+    // directory at the end of the statement and leaves the path dangling.
+    let dir = scratch_dir("version");
+    let path = dir.join("sessions.json");
     std::fs::write(&path, r#"{"version":99,"sessions":{}}"#).unwrap();
     let e = Store::at(&path).list().expect_err("should refuse");
     assert!(e.to_string().contains("different version"), "{e}");
@@ -310,7 +350,8 @@ fn a_store_from_another_version_is_refused_rather_than_misread() {
 fn a_corrupt_store_is_reported_not_silently_emptied() {
     // Silently treating unreadable state as "no sessions" would strand live
     // machines, which is the one outcome the design must not produce quietly.
-    let path = scratch_dir("corrupt").join("sessions.json");
+    let dir = scratch_dir("corrupt");
+    let path = dir.join("sessions.json");
     std::fs::write(&path, "{ this is not json").unwrap();
     let e = Store::at(&path).list().expect_err("should refuse");
     assert!(e.to_string().contains("unreadable"), "{e}");
@@ -370,7 +411,8 @@ fn remaining_time_runs_out_rather_than_going_negative() {
 
 #[test]
 fn updating_a_session_moves_only_that_session() {
-    let store = Store::at(scratch_dir("update").join("sessions.json"));
+    let dir = scratch_dir("update");
+    let store = Store::at(dir.join("sessions.json"));
     store.put(session("alpha", "m-1")).unwrap();
     store.put(session("beta", "m-2")).unwrap();
 
@@ -388,7 +430,8 @@ fn updating_a_session_moves_only_that_session() {
 
 #[test]
 fn updating_a_session_that_is_not_there_says_so() {
-    let store = Store::at(scratch_dir("update-absent").join("sessions.json"));
+    let dir = scratch_dir("update-absent");
+    let store = Store::at(dir.join("sessions.json"));
     assert!(!store.update("ghost", |s| s.heartbeat_pid = None).unwrap());
 }
 
@@ -399,7 +442,8 @@ fn times_are_kept_to_whole_seconds_on_purpose() {
     // `date` is worth more than nanoseconds nobody will ever act on. Against a
     // TTL measured in hours the truncation is immaterial -- but it is a
     // guarantee, so it is asserted rather than left to be rediscovered.
-    let store = Store::at(scratch_dir("granularity").join("sessions.json"));
+    let dir = scratch_dir("granularity");
+    let store = Store::at(dir.join("sessions.json"));
     let ragged = UNIX_EPOCH + Duration::from_nanos(1_700_000_000_987_654_321);
     let mut s = session("alpha", "m-1");
     s.expires_at = ragged;
@@ -544,7 +588,8 @@ fn value_through_sh(value: &str) -> String {
     // and this test would then be measuring echo.
     let script = job::render("printf '%s' \"$V\" > \"$OUT\"", &env);
 
-    let out = std::env::temp_dir().join(format!("reaper-job-{}", std::process::id()));
+    let held = Scratch::new("job");
+    let out = held.join("out");
     let status = std::process::Command::new("/bin/sh")
         .arg("-c")
         .arg(&script)
@@ -553,9 +598,7 @@ fn value_through_sh(value: &str) -> String {
         .expect("run sh");
     assert!(status.success(), "script failed:\n{script}");
 
-    let got = std::fs::read_to_string(&out).expect("read output");
-    let _ = std::fs::remove_file(&out);
-    got
+    std::fs::read_to_string(&out).expect("read output")
 }
 
 #[test]
@@ -774,16 +817,8 @@ fn a_wrapper_path_with_whitespace_is_refused_rather_than_mangled() {
     assert!(message.contains("XDG_STATE_HOME"), "no remedy offered: {message}");
 }
 
-fn scratch(label: &str) -> PathBuf {
-    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!(
-        "reaper-sync-{}-{n}-{label}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch directory");
-    dir
+fn scratch(label: &str) -> Scratch {
+    Scratch::new(label)
 }
 
 /// A stand-in for ssh that drops the host and runs the command here.
@@ -911,5 +946,4 @@ fn a_real_round_trip_keeps_results_and_mirrors_deletions() {
         "the results channel adds; it does not mirror"
     );
 
-    let _ = std::fs::remove_dir_all(&dir);
 }
