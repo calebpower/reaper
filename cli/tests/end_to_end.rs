@@ -2384,3 +2384,109 @@ fn a_canary_nobody_collects_is_the_sweeper_absent() {
         "doctor cleans up its own canary on timeout"
     );
 }
+
+// ---------------------------------------------------------------------------
+// F5: doctor judges renewal by the expiry, never by the log. A heartbeat's
+// log receives output only when something goes wrong, so its mtime freezes
+// at spawn -- judging it stale reported every healthy session as stalled.
+// ---------------------------------------------------------------------------
+
+/// Rewrite one numeric field of the stored session, returning the old line.
+fn rewrite_session_field(h: &Harness, field: &str, value: u64) {
+    let p = h.dir.join("sessions.json");
+    let stored = std::fs::read_to_string(&p).unwrap();
+    let out: Vec<String> = stored
+        .lines()
+        .map(|l| {
+            if l.trim_start().starts_with(&format!("\"{field}\"")) {
+                let comma = if l.trim_end().ends_with(',') { "," } else { "" };
+                format!("      \"{field}\": {value}{comma}")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    std::fs::write(&p, out.join("\n")).unwrap();
+}
+
+#[test]
+fn a_healthy_heartbeat_with_a_silent_log_is_not_stalled() {
+    // The false positive from the field: expiry fresh, log mtime ancient --
+    // which is exactly what health looks like, because success says nothing.
+    let h = Harness::new("silentlog");
+    h.ok(&["up"]);
+    let log = h.dir.join("heartbeat-a-project.log");
+    assert!(log.exists(), "up starts the heartbeat, which owns a log");
+    // The heartbeat's startup takes seconds after `up` returns, and its one
+    // write -- the TLS warning -- lands in this log when it does, resetting
+    // any mtime a test set earlier. That lag is what made two prior attempts
+    // at this test vacuous, on two machines. Stage after the write; nothing
+    // writes again, because health is silent.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the heartbeat's startup write never landed"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let f = std::fs::File::options().write(true).open(&log).unwrap();
+    f.set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+        .unwrap();
+    drop(f);
+
+    let out = h.run(&["doctor"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        !stdout.contains("renewal may not be happening"),
+        "a silent log is what health looks like: {stdout}"
+    );
+    assert!(stdout.contains("record, machine and heartbeat agree"), "{stdout}");
+}
+
+#[test]
+fn a_live_heartbeat_whose_expiry_decays_is_reported_stalled() {
+    // The true positive the old check meant to catch and could not: the
+    // process is alive, but the expiry has decayed far below what a renewing
+    // heartbeat would ever allow (ttl - 2 intervals).
+    let h = Harness::new("decayedexpiry");
+    h.ok(&["up"]);
+    // The REAL heartbeat cannot stay for this test: its first tick lands
+    // seconds after `up` returns (binary startup, store lock) and re-renews
+    // the record underneath any doctored expiry -- which is precisely how
+    // two earlier attempts at this regression test came to prove nothing.
+    // It is replaced by a decoy that is alive and carries "heartbeat" in its
+    // argv -- everything the strict pid judgement checks -- but can renew
+    // nothing.
+    let stored = std::fs::read_to_string(h.dir.join("sessions.json")).unwrap();
+    if let Some(pid) = stored
+        .split("\"heartbeat_pid\": ")
+        .nth(1)
+        .and_then(|r| r.split(&[',', '\n'][..]).next())
+        .and_then(|x| x.trim().parse::<i32>().ok())
+    {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    let mut decoy = Command::new("sh")
+        .args(["-c", "sleep 60; exit 0", "reaper-test-heartbeat-decoy"])
+        .spawn()
+        .expect("spawn decoy");
+    rewrite_session_field(&h, "heartbeat_pid", u64::from(decoy.id()));
+    let soon = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 100; // 100s left of a 7200s ttl: far past the decay floor
+    rewrite_session_field(&h, "expires_at", soon);
+
+    let out = h.run(&["doctor"]);
+    decoy.kill().ok();
+    decoy.wait().ok();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "a decay is a warning, not a failure: {stdout}");
+    assert!(
+        stdout.contains("renewal may not be happening"),
+        "{stdout}"
+    );
+}
