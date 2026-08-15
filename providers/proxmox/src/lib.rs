@@ -107,6 +107,24 @@ impl Proxmox {
         }
     }
 
+    /// The 403 trap, in one place: on a pool-scoped token every per-VM route
+    /// answers a *gone* machine with "Permission check failed", because the
+    /// ACL check precedes the existence check. Any refusal for a machine the
+    /// cluster listing no longer shows means gone, not forbidden. Observed
+    /// live during acceptance; address() and destroy() learned it first, and
+    /// this is what holds their siblings to the same reading.
+    fn disambiguate(&self, id: u32, e: ProviderError) -> ProviderError {
+        if matches!(e, ProviderError::NotFound(_) | ProviderError::Unauthorized(_)) {
+            match self.occupied_in_range() {
+                Ok(listed) if !listed.contains(&id) => {
+                    return ProviderError::NotFound(format!("machine {id} no longer exists"));
+                }
+                _ => {}
+            }
+        }
+        e
+    }
+
     fn is_running(&self, id: u32) -> Result<bool> {
         let s = self
             .client
@@ -457,21 +475,26 @@ impl Provider for Proxmox {
         // Read-modify-write. This is a shared cluster and reaper is not the
         // only thing that writes tags; replacing the whole string would discard
         // somebody else's, invisibly.
-        let existing = self.tags_of(id)?;
+        let existing = self.tags_of(id).map_err(|e| self.disambiguate(id, e))?;
         let updated = tags::with_expiry(&existing, at);
-        self.client.put_form(
-            &format!("/nodes/{}/qemu/{id}/config", self.node()),
-            &[("tags", updated)],
-        )?;
+        self.client
+            .put_form(
+                &format!("/nodes/{}/qemu/{id}/config", self.node()),
+                &[("tags", updated)],
+            )
+            .map_err(|e| self.disambiguate(id, e))?;
         Ok(())
     }
 
     fn start(&self, machine: &MachineRef) -> Result<()> {
         let id = self.config.ids.check(machine)?;
-        let task = self.client.post_form(
-            &format!("/nodes/{}/qemu/{id}/status/start", self.node()),
-            &[],
-        )?;
+        let task = self
+            .client
+            .post_form(
+                &format!("/nodes/{}/qemu/{id}/status/start", self.node()),
+                &[],
+            )
+            .map_err(|e| self.disambiguate(id, e))?;
         self.wait(&task)
     }
 
@@ -479,7 +502,8 @@ impl Provider for Proxmox {
         let id = self.config.ids.check(machine)?;
         let task = self
             .client
-            .post_form(&format!("/nodes/{}/qemu/{id}/status/stop", self.node()), &[])?;
+            .post_form(&format!("/nodes/{}/qemu/{id}/status/stop", self.node()), &[])
+            .map_err(|e| self.disambiguate(id, e))?;
         self.wait(&task)
     }
 

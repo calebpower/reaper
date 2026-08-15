@@ -613,18 +613,39 @@ pub fn renew(
     let provider = provider_for(&cfg)?;
     let project = project_of(manifest_path)?;
 
+    // Per session, to the end: one machine the sweeper took must not leave
+    // its siblings unrenewed -- the surviving sessions are exactly the ones
+    // that still need their expiry moved.
+    let mut failures = 0;
     for s in implied_sessions(&store, session, project.as_deref())? {
         let ttl = match &ttl {
             Some(t) => duration::parse(t)?,
             None => s.ttl,
         };
         let expires_at = SystemTime::now() + ttl;
-        provider.set_expiry(&s.machine, expires_at)?;
-        store.update(&s.name, |st| {
-            st.expires_at = expires_at;
-            st.ttl = ttl;
-        })?;
-        println!("{}: expires in {}", s.name, duration::format(ttl));
+        match provider.set_expiry(&s.machine, expires_at) {
+            Ok(()) => {
+                store.update(&s.name, |st| {
+                    st.expires_at = expires_at;
+                    st.ttl = ttl;
+                })?;
+                println!("{}: expires in {}", s.name, duration::format(ttl));
+            }
+            Err(reaper_core::ProviderError::NotFound(_)) => {
+                failures += 1;
+                eprintln!(
+                    "{}: its machine is gone (the sweeper collects anything past                      its expiry); there is nothing left to renew. `reaper down {}`                      clears the record",
+                    s.name, s.name
+                );
+            }
+            Err(e) => {
+                failures += 1;
+                eprintln!("{}: could not renew: {e}", s.name);
+            }
+        }
+    }
+    if failures > 0 {
+        return Err(format!("{failures} session(s) could not be renewed").into());
     }
     Ok(())
 }
@@ -744,6 +765,16 @@ pub fn heartbeat(name: &str) -> Result<()> {
                     eprintln!("{name}: renewed, but could not record it: {e}");
                 }
             }
+            // Gone is not a blip: the cluster listing no longer shows the
+            // machine, and nothing this loop does will bring it back. Looping
+            // on warning every interval would be a leaked process wearing a
+            // log line.
+            Err(reaper_core::ProviderError::NotFound(_)) => {
+                eprintln!(
+                    "{name}: its machine is gone; nothing left to renew, so this                      heartbeat is ending. `reaper down {name}` clears the record"
+                );
+                return Ok(());
+            }
             Err(e) => {
                 // Keep going. A single failed renewal is survivable precisely
                 // because the interval fits several times into the TTL -- that
@@ -849,28 +880,41 @@ pub fn sync(session: Option<String>, manifest_path: Option<PathBuf>) -> Result<(
     let (manifest, tree) = load_manifest_at(manifest_path)?;
     let store = Store::open();
 
+    // Per session, to the end: an unreachable machine costs itself, never
+    // its siblings their copy of the tree.
+    let mut failures = 0;
     for s in implied_sessions(&store, session, Some(&manifest.project))? {
-        let ssh = ssh_for(&cfg, &s)?;
-        deliver_runner(&ssh)?;
-        let (work, results) = workspace(&ssh, &manifest.project)?;
-        let rsh = sync::rsh_wrapper(&ssh, &state_file(&s.name, "rsh")?)?;
+        let attempt = || -> Result<()> {
+            let ssh = ssh_for(&cfg, &s)?;
+            deliver_runner(&ssh)?;
+            let (work, results) = workspace(&ssh, &manifest.project)?;
+            let rsh = sync::rsh_wrapper(&ssh, &state_file(&s.name, "rsh")?)?;
 
-        println!("{}: {} -> {}", s.name, tree.display(), ssh.describe());
-        sync::push(
-            &cfg.session.rsync_command,
-            &rsh,
-            &ssh,
-            &tree,
-            &work,
-            &manifest.sync_exclude,
-        )
-        .run()?;
-        store.update(&s.name, |st| st.synced_at = Some(SystemTime::now()))?;
+            println!("{}: {} -> {}", s.name, tree.display(), ssh.describe());
+            sync::push(
+                &cfg.session.rsync_command,
+                &rsh,
+                &ssh,
+                &tree,
+                &work,
+                &manifest.sync_exclude,
+            )
+            .run()?;
+            store.update(&s.name, |st| st.synced_at = Some(SystemTime::now()))?;
 
-        // And straight back, so a session that already holds results hands them
-        // over on the first sync rather than waiting for a run.
-        results_plan(&cfg, &ssh, &rsh, &results, &tree)?.run()?;
-        println!("{}: synced", s.name);
+            // And straight back, so a session that already holds results hands
+            // them over on the first sync rather than waiting for a run.
+            results_plan(&cfg, &ssh, &rsh, &results, &tree)?.run()?;
+            println!("{}: synced", s.name);
+            Ok(())
+        };
+        if let Err(e) = attempt() {
+            failures += 1;
+            eprintln!("{}: could not sync: {e}", s.name);
+        }
+    }
+    if failures > 0 {
+        return Err(format!("{failures} session(s) could not be synced").into());
     }
     Ok(())
 }
@@ -1169,6 +1213,7 @@ pub fn exec(
         .into());
     }
 
+    let mut failures = 0;
     for s in implied_sessions(&store, session, Some(&manifest.project))? {
         let g = manifest.guest(&s.guest).ok_or_else(|| {
             format!(
@@ -1218,6 +1263,13 @@ pub fn exec(
         let env: BTreeMap<String, String> = job::overlay(verb_env, profile.map(|p| &p.env));
         let script = job::render(cmd, &env);
 
+        // Everything from here on is one session's business. A failure --
+        // unreachable machine, failed command, broken results channel --
+        // costs this session and is reported; its siblings still run, and
+        // the verb exits non-zero at the end. One dead machine silently
+        // cancelling every other session's run was the multi-session bug
+        // this file kept re-growing.
+        let attempt = || -> Result<()> {
         let ssh = ssh_for(&cfg, &s)?;
         deliver_runner(&ssh)?;
         let (_, results) = workspace(&ssh, &manifest.project)?;
@@ -1311,6 +1363,15 @@ pub fn exec(
                 }
             }
         }
+        Ok(())
+        };
+        if let Err(e) = attempt() {
+            failures += 1;
+            eprintln!("{}: {} failed: {e}", s.name, which.label());
+        }
+    }
+    if failures > 0 {
+        return Err(format!("{failures} session(s) failed to {}", which.label()).into());
     }
     Ok(())
 }

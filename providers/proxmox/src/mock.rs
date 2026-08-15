@@ -268,6 +268,16 @@ task_timeout = "5s"
         self.with_state(|s| s.tasks_never_finish = stalled);
     }
 
+    /// The machine carrying this name, if one does.
+    pub fn machine_named(&self, name: &str) -> Option<String> {
+        self.with_state(|s| {
+            s.vms
+                .iter()
+                .find(|(_, vm)| vm.name == name && !vm.template)
+                .map(|(id, _)| id.to_string())
+        })
+    }
+
     /// Forget a machine, as an external sweeper would.
     pub fn collect(&self, machine: &str) {
         let id: u32 = machine.parse().expect("handle this provider issued");
@@ -448,6 +458,9 @@ fn route(s: &mut State, method: &str, path: &str, body: &str) -> (u16, Value) {
         }
 
         ("GET", ["nodes", _node, "qemu", id, "config"]) => match lookup(s, id) {
+            // 403 for a machine that is gone, like every per-VM route: the
+            // ACL check precedes the existence check on a pool-scoped token.
+            None => return (403, json!({"message": format!("Permission check failed (/vms/{id}, VM.Audit)")})),
             Some(vm) => {
                 let mut cfg = json!({
                     "tags": vm.tags,
@@ -465,7 +478,7 @@ fn route(s: &mut State, method: &str, path: &str, body: &str) -> (u16, Value) {
                 }
                 (200, json!({ "data": cfg }))
             }
-            None => (404, json!({"errors": "no such machine"})),
+            None => unreachable!("handled above"),
         },
 
         // How much room a storage has. The stand-in is generous unless a test
@@ -490,8 +503,10 @@ fn route(s: &mut State, method: &str, path: &str, body: &str) -> (u16, Value) {
                 return (404, json!({"errors": "no such machine"}));
             };
             let form = parse_form(body);
+            // 403 for a machine that is gone, like every per-VM route: the
+            // ACL check precedes the existence check on a pool-scoped token.
             let Some(vm) = s.vms.get_mut(&key) else {
-                return (404, json!({"errors": "no such machine"}));
+                return (403, json!({"message": format!("Permission check failed (/vms/{key}, VM.Config.Options)")}));
             };
             if let Some(t) = form.get("tags") {
                 vm.tags = t.clone();
@@ -537,8 +552,9 @@ fn route(s: &mut State, method: &str, path: &str, body: &str) -> (u16, Value) {
                 "stop" => false,
                 _ => return (404, json!({"errors": "no such action"})),
             };
+            // Same 403-before-existence rule as every per-VM route.
             let Some(vm) = s.vms.get_mut(&key) else {
-                return (404, json!({"errors": "no such machine"}));
+                return (403, json!({"message": format!("Permission check failed (/vms/{key}, VM.PowerMgmt)")}));
             };
             vm.running = running;
             let t = new_task(s);
@@ -559,7 +575,8 @@ fn route(s: &mut State, method: &str, path: &str, body: &str) -> (u16, Value) {
                 return (500, json!({"message": "VM is running - destroy failed"}));
             }
             if s.vms.remove(&key).is_none() {
-                return (404, json!({"errors": "no such machine"}));
+                // Same 403-before-existence rule as every per-VM route.
+                return (403, json!({"message": format!("Permission check failed (/vms/{key}, VM.Allocate)")}));
             }
             let t = new_task(s);
             (200, json!({ "data": t }))

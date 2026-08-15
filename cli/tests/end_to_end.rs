@@ -1604,3 +1604,222 @@ fn a_heartbeat_for_a_forgotten_session_exits_quietly() {
         String::from_utf8_lossy(&out.stdout),
     );
 }
+
+// ---------------------------------------------------------------------------
+// Battery: the cluster changed underneath you. One dead or vanished session
+// must cost exactly itself, never its siblings' verb; and every surprise must
+// arrive as a sentence, not a raw refusal. Written before the fixes and
+// watched failing.
+// ---------------------------------------------------------------------------
+
+impl Harness {
+    /// Rewrite one `[session]` key in the site config.
+    fn amend_config(&self, key: &str, value: &str) {
+        let p = self.dir.join("config.toml");
+        let cfg = std::fs::read_to_string(&p).unwrap();
+        let mut hit = false;
+        let out: Vec<String> = cfg
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with(key) {
+                    hit = true;
+                    format!("{key} = \"{value}\"")
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect();
+        assert!(hit, "no {key} in the harness config");
+        std::fs::write(&p, out.join("\n")).unwrap();
+    }
+}
+
+#[test]
+fn renew_survives_a_machine_the_sweeper_took() {
+    // Two sessions; the sweeper (played by the stand-in) took a-guest's
+    // machine. Renewing used to abort at the first refusal, leaving b-guest's
+    // expiry unmoved -- the session most in need of renewal punished for its
+    // sibling's death.
+    let h = Harness::new("renewgone");
+    h.add_guest("b-guest");
+    write(&h.dir.join(".reaper.toml"), TWO_GUESTS, None);
+    h.ok(&["up"]);
+    let gone = h
+        .hypervisor
+        .machine_named("a-project-a-guest")
+        .expect("a-guest's machine");
+    h.hypervisor.collect(&gone);
+
+    let out = h.run(&["renew", "--ttl", "1h"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a vanished machine is worth a non-zero exit"
+    );
+    assert!(
+        stdout.contains("a-project-b-guest: expires in 1h"),
+        "the surviving session still renews: {stdout}"
+    );
+    assert!(
+        stderr.contains("a-project-a-guest") && stderr.contains("gone"),
+        "and the dead one is named, as gone: {stderr}"
+    );
+    assert!(
+        stderr.contains("reaper down"),
+        "with the way out: {stderr}"
+    );
+}
+
+#[test]
+fn sync_survives_a_session_that_cannot_be_reached() {
+    let h = Harness::new("syncgone");
+    h.add_guest("b-guest");
+    write(&h.dir.join(".reaper.toml"), TWO_GUESTS, None);
+    h.ok(&["up"]);
+    // Every connection to a-guest's session refuses; b-guest's works.
+    h.make_ssh_fail("known-hosts-a-project-a-guest");
+
+    let out = h.run(&["sync"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "a failed push is a failure");
+    assert!(
+        stdout.contains("a-project-b-guest: synced"),
+        "the reachable session still gets the tree: {stdout}"
+    );
+    assert!(
+        stderr.contains("a-project-a-guest"),
+        "the unreachable one is named: {stderr}"
+    );
+}
+
+#[test]
+fn run_survives_a_session_that_cannot_be_reached() {
+    let h = Harness::new("rungone");
+    h.add_guest("b-guest");
+    write(&h.dir.join(".reaper.toml"), TWO_GUESTS, None);
+    h.ok(&["up"]);
+    h.ok(&["sync"]);
+    h.make_ssh_fail("known-hosts-a-project-a-guest");
+
+    let out = h.run(&["run"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        stdout.contains("a-project-b-guest: run finished"),
+        "the reachable session still runs: {stdout}"
+    );
+    assert!(
+        stderr.contains("a-project-a-guest"),
+        "the unreachable one is named: {stderr}"
+    );
+}
+
+#[test]
+fn a_heartbeat_whose_machine_is_gone_ends_itself() {
+    // set_expiry now says NotFound for a machine the cluster no longer
+    // lists. A heartbeat hearing that has nothing left to renew, ever --
+    // looping forever warning every interval is a leaked process wearing a
+    // log line. It must end, and say why.
+    let h = Harness::new("hbmachinegone");
+    h.amend_config("heartbeat_interval", "1s");
+    h.amend_config("default_ttl", "10s");
+    h.ok(&["up"]);
+    let machine = h.hypervisor.machine_named("a-project").expect("machine");
+    // Stop the up-started heartbeat before the scenario, so it does not race.
+    let stored = std::fs::read_to_string(h.dir.join("sessions.json")).unwrap();
+    if let Some(pid) = stored
+        .split("\"heartbeat_pid\": ")
+        .nth(1)
+        .and_then(|r| r.split(&[',', '\n'][..]).next())
+        .and_then(|p| p.trim().parse::<i32>().ok())
+    {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    h.hypervisor.collect(&machine);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_reaper"))
+        .args(["heartbeat", "--session", "a-project"])
+        .current_dir(&h.dir)
+        .env("REAPER_CONFIG", h.dir.join("config.toml"))
+        .env("REAPER_STATE", h.dir.join("sessions.json"))
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn heartbeat");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(st) = child.try_wait().expect("wait") {
+            break Some(st);
+        }
+        if std::time::Instant::now() > deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let Some(status) = status else {
+        child.kill().ok();
+        panic!("the heartbeat is still running against a machine that is gone");
+    };
+    assert!(status.success(), "ending is the correct outcome, not a crash");
+    let mut err = String::new();
+    use std::io::Read as _;
+    child.stderr.take().unwrap().read_to_string(&mut err).ok();
+    assert!(err.contains("gone"), "say why it ended: {err}");
+}
+
+#[test]
+fn the_cap_message_counts_strangers() {
+    let h = Harness::new("capstrangers");
+    h.hypervisor.add_foreign_session(POOL);
+    h.hypervisor.add_foreign_session(POOL);
+    let err = h.fails(&["up"]);
+    assert!(err.contains("2 of them not yours"), "{err}");
+}
+
+#[test]
+fn a_corrupt_store_is_a_sentence_not_a_panic() {
+    let h = Harness::new("corruptstore");
+    write(&h.dir.join("sessions.json"), "{ definitely not json", None);
+    let err = h.fails(&["list"]);
+    assert!(!err.contains("panicked"), "{err}");
+    assert!(
+        err.contains("sessions.json"),
+        "name the file somebody must look at: {err}"
+    );
+}
+
+#[test]
+fn an_up_nobody_answers_leaves_an_inspectable_tagged_session() {
+    let h = Harness::new("neveranswers");
+    h.amend_config("ready_grace", "1s");
+    // The agent never comes up, so no address is ever reported and the wait
+    // can only time out.
+    h.hypervisor.with_state(|s| s.agent_unavailable = true);
+    let out = h.ok(&["up"]);
+    assert!(
+        out.contains("nothing answered"),
+        "say what happened and what to do: {out}"
+    );
+    assert_eq!(h.machines().len(), 1, "the machine exists, tagged, for autopsy");
+    let list = h.ok(&["list"]);
+    assert!(list.contains("a-project"), "{list}");
+    h.ok(&["down"]);
+    assert!(h.machines().is_empty(), "and down clears it");
+}
+
+#[test]
+fn a_destroy_the_hypervisor_refuses_keeps_the_session_visible() {
+    let h = Harness::new("downrefused");
+    h.ok(&["up"]);
+    let m = h.hypervisor.machine_named("a-project").expect("machine");
+    h.hypervisor.protect(&m);
+    let err = h.fails(&["down"]);
+    assert!(err.contains("could not destroy"), "{err}");
+    assert!(
+        h.ok(&["list"]).contains("a-project"),
+        "forgetting a machine that still exists would hide it"
+    );
+}

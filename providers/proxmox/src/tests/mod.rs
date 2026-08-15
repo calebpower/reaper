@@ -1222,3 +1222,55 @@ fn a_stopped_machine_has_no_address_yet_rather_than_an_error() {
     // Created and never started.
     assert_eq!(p.address(&m).expect("not an error"), None);
 }
+
+// ---------------------------------------------------------------------------
+// Battery: the cluster changed underneath you. The 403-for-a-gone-machine
+// trap was fixed in address() and destroy(); these hold every sibling to the
+// same standard. Written before the fix and watched failing.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn renewing_a_gone_machine_says_gone_not_permission_denied() {
+    let pve = pve_with_template();
+    let p = provider_for(&pve);
+    let m = p.create(&request("a-session", 1)).expect("create");
+    pve.collect(m.as_str());
+    let e = p.set_expiry(&m, at(2_000_000_000)).unwrap_err();
+    assert!(
+        matches!(e, reaper_core::ProviderError::NotFound(_)),
+        "a pool-scoped token gets 403 for a missing machine; the caller must \
+         hear \"gone\", not \"permission denied\": {e}"
+    );
+}
+
+#[test]
+fn starting_or_stopping_a_gone_machine_says_gone() {
+    let pve = pve_with_template();
+    let p = provider_for(&pve);
+    let m = p.create(&request("a-session", 1)).expect("create");
+    pve.collect(m.as_str());
+    for (what, e) in [("start", p.start(&m).unwrap_err()), ("stop", p.stop(&m).unwrap_err())] {
+        assert!(
+            matches!(e, reaper_core::ProviderError::NotFound(_)),
+            "{what}: {e}"
+        );
+    }
+}
+
+#[test]
+fn a_machine_that_exists_still_renews_and_starts() {
+    // The disambiguation must not make the ordinary path slower to be wrong:
+    // a real permission problem on an existing machine stays a permission
+    // problem, and a healthy machine still works.
+    let pve = pve_with_template();
+    let p = provider_for(&pve);
+    let m = p.create(&request("a-session", 1)).expect("create");
+    p.set_expiry(&m, at(2_000_000_000)).expect("renew works");
+    p.start(&m).expect("start works");
+    pve.with_state(|s| s.unauthorized = true);
+    let e = p.set_expiry(&m, at(2_000_000_001)).unwrap_err();
+    assert!(
+        matches!(e, reaper_core::ProviderError::Unauthorized(_)),
+        "a refusal for a machine that IS listed stays a refusal: {e}"
+    );
+}
