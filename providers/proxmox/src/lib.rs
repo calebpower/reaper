@@ -170,8 +170,14 @@ impl Proxmox {
                 continue;
             }
             let Some(spec) = value.as_str() else { continue };
-            if let Some((storage, bytes)) = disk_storage_and_size(spec) {
-                *need.entry(storage).or_default() += bytes;
+            match disk_storage_and_size(spec) {
+                Some((storage, bytes)) => *need.entry(storage).or_default() += bytes,
+                // A disk that cannot be priced must not silently cost zero:
+                // the whole check approves sessions on these numbers.
+                None if !spec.contains("media=cdrom") => eprintln!(
+                    "reaper: could not price {key}={spec}; it is not counted toward the room this session needs"
+                ),
+                None => {}
             }
         }
 
@@ -317,6 +323,16 @@ impl Provider for Proxmox {
                 ))
             })?;
 
+        // Pure-configuration refusals come before anything exists. This one
+        // used to run after the clone, and the error return leaked an
+        // untagged machine -- the one state nothing ever collects.
+        if req.data_disk_gb.is_some() && self.config.data_storage.is_none() {
+            return Err(ProviderError::Config(
+                "a session disk was requested but [proxmox].data_storage is not set, so there is nowhere to put it"
+                    .into(),
+            ));
+        }
+
         let id = self.free_id()?;
 
         // Before anything is created, not after. A clone that runs a shared
@@ -336,9 +352,36 @@ impl Provider for Proxmox {
             &format!("/nodes/{}/qemu/{template}/clone", self.node()),
             &form,
         )?;
-        self.wait(&task)?;
-
         let machine = MachineRef::new(id.to_string());
+        if let Err(e) = self.wait(&task) {
+            return Err(match e {
+                // Unknown outcome: leave it alone, but do not repeat the
+                // generic timeout's claim that the expiry tag covers this --
+                // no tag has been applied yet, so if the clone does finish,
+                // nothing will ever collect it.
+                ProviderError::Timeout(t) => ProviderError::Timeout(format!(
+                    "{t}. CAUTION: this was the clone making {id}, which has no expiry tag yet -- if it did finish, {id} exists and nothing will collect it. Check for {id} and destroy it by hand"
+                )),
+                // Known failure: the task itself said so, which licenses a
+                // cleanup the way a timeout does not. PVE usually removes the
+                // half-made target itself, in which case this is a NotFound
+                // and there was nothing to do.
+                failed => match self.destroy(&machine) {
+                    Ok(()) | Err(ProviderError::NotFound(_)) => ProviderError::Api {
+                        status: 0,
+                        message: format!(
+                            "cloning {template} into {id} failed ({failed}); nothing was left behind"
+                        ),
+                    },
+                    Err(also) => ProviderError::Api {
+                        status: 0,
+                        message: format!(
+                            "cloning {template} into {id} failed ({failed}), and the leftover could not be destroyed either ({also}). It carries no expiry, so nothing will collect it: destroy {id} by hand"
+                        ),
+                    },
+                },
+            });
+        }
 
         // Expiry first, before anything else and before the machine is ever
         // started. Between the clone finishing and this succeeding the machine
@@ -482,8 +525,21 @@ impl Provider for Proxmox {
         let data = match self.client.get(&path) {
             Ok(d) => d,
             // Before the guest agent is up, asking is not an error -- it is the
-            // ordinary state of a machine that has only just been started.
-            Err(ProviderError::NotFound(_)) | Err(ProviderError::Api { .. }) => return Ok(None),
+            // ordinary state of a machine that has only just been started. PVE
+            // answers that state with a 500 naming the agent, and a *missing*
+            // machine with a 500 naming its configuration file -- so the text
+            // is, regrettably, the only thing that separates "keep waiting"
+            // from "it was destroyed under you".
+            Err(ProviderError::Api { message, .. })
+                if message.contains("guest agent") =>
+            {
+                return Ok(None);
+            }
+            Err(ProviderError::Api { message, .. })
+                if message.contains("does not exist") =>
+            {
+                return Err(ProviderError::NotFound(message));
+            }
             Err(e) => return Err(e),
         };
 
@@ -589,7 +645,10 @@ fn gib(bytes: u64) -> String {
 /// Disk keys, and only disk keys. `virtio0` is one; `virtiofs0` is not, and
 /// neither is anything else that merely starts with a bus name.
 fn is_disk_key(key: &str) -> bool {
-    for bus in ["virtio", "scsi", "sata", "ide"] {
+    // efidisk, tpmstate and unused volumes are copied by a full clone just
+    // as the bus disks are; leaving them out made every template look
+    // slightly cheaper than it is (and an unused0 can be arbitrarily large).
+    for bus in ["virtio", "scsi", "sata", "ide", "efidisk", "tpmstate", "unused"] {
         if let Some(rest) = key.strip_prefix(bus) {
             return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit());
         }
@@ -616,14 +675,23 @@ fn disk_storage_and_size(spec: &str) -> Option<(String, u64)> {
     Some((storage, size))
 }
 
-/// `8G`, `512M`, `1T`, or a bare byte count.
+/// `8G`, `512M`, `1T`, `4.5G`, or a bare byte count.
 fn parse_size(text: &str) -> Option<u64> {
     let (digits, scale) = match text.chars().last()? {
-        'K' | 'k' => (&text[..text.len() - 1], 1024),
+        'K' | 'k' => (&text[..text.len() - 1], 1024u64),
         'M' | 'm' => (&text[..text.len() - 1], 1024 * 1024),
         'G' | 'g' => (&text[..text.len() - 1], GIB),
         'T' | 't' => (&text[..text.len() - 1], GIB * 1024),
         _ => (text, 1),
     };
-    digits.trim().parse::<u64>().ok().map(|n| n * scale)
+    // Through f64, because PVE will happily write `4.5G`; disk sizes are far
+    // inside f64's exact-integer range. Guarded, because `n * scale` on an
+    // absurd digit string would wrap in release and price a disk at almost
+    // nothing.
+    let n: f64 = digits.trim().parse().ok()?;
+    let bytes = n * scale as f64;
+    if !(0.0..=(u64::MAX / 2) as f64).contains(&bytes) {
+        return None;
+    }
+    Some(bytes.ceil() as u64)
 }

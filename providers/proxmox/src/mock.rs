@@ -64,6 +64,13 @@ pub struct State {
     /// that care about the floor have to arrange anything; zero means the
     /// storage refuses to answer at all.
     pub storage_avail_bytes: u64,
+    /// Per-storage overrides, so a test can starve one storage while its
+    /// neighbour stays roomy -- without this, an accounting bug that summed
+    /// everything against one figure would pass every test.
+    pub storage_avail_named: BTreeMap<String, u64>,
+    /// Answer the next N task-status polls with a 502. How a test says "the
+    /// API blinked mid-wait" without breaking the operation itself.
+    pub flake_next: u32,
 }
 
 pub struct MockPve {
@@ -78,6 +85,8 @@ impl MockPve {
         let addr = listener.local_addr().expect("addr");
         let state = Arc::new(Mutex::new(State {
             storage_avail_bytes: 4 * 1024 * 1024 * 1024 * 1024,
+            storage_avail_named: BTreeMap::new(),
+            flake_next: 0,
             task_seq: 1,
             ..State::default()
         }));
@@ -230,6 +239,20 @@ task_timeout = "5s"
         self.state.lock().expect("mock state").storage_avail_bytes = bytes;
     }
 
+    /// One storage's free space, leaving every other storage on the default.
+    pub fn storage_named_has(&self, name: &str, bytes: u64) {
+        self.state
+            .lock()
+            .expect("mock state")
+            .storage_avail_named
+            .insert(name.to_string(), bytes);
+    }
+
+    /// Answer the next N requests with a 502, whoever asks.
+    pub fn flake_next(&self, n: u32) {
+        self.state.lock().expect("mock state").flake_next = n;
+    }
+
     pub fn reports_address(&self, addr: &str) {
         self.with_state(|s| {
             s.agent_interfaces = Some(serde_json::json!([
@@ -314,7 +337,12 @@ fn serve(mut stream: TcpStream, state: &Arc<Mutex<State>>) -> std::io::Result<()
         if let Some(v) = lower.strip_prefix("content-length:") {
             length = v.trim().parse().unwrap_or(0);
         }
-        if lower.starts_with("authorization:") && line.contains("PVEAPIToken=") {
+        // The value, not just the scheme: a provider change that corrupted
+        // the token while keeping the prefix must fail here the way the real
+        // API would fail it.
+        if lower.starts_with("authorization:")
+            && line.contains("PVEAPIToken=someone@realm!test=secret")
+        {
             authorized = true;
         }
     }
@@ -328,7 +356,10 @@ fn serve(mut stream: TcpStream, state: &Arc<Mutex<State>>) -> std::io::Result<()
     let (status, payload) = {
         let mut s = state.lock().expect("state lock");
         s.requests.push((method.clone(), path.clone()));
-        if !authorized {
+        if s.flake_next > 0 && path.contains("/tasks/") {
+            s.flake_next -= 1;
+            (502u16, json!({"errors": "bad gateway (mock flake)"}))
+        } else if !authorized {
             (401u16, json!({"errors": "no ticket"}))
         } else if s.unauthorized {
             (403, json!({"errors": "permission denied"}))
@@ -440,11 +471,15 @@ fn route(s: &mut State, method: &str, path: &str, body: &str) -> (u16, Value) {
         // How much room a storage has. The stand-in is generous unless a test
         // says otherwise, so only the tests that care have to arrange it.
         ("GET", ["nodes", _node, "storage", storage, "status"]) => {
-            if s.storage_avail_bytes == 0 {
+            let avail = s
+                .storage_avail_named
+                .get(*storage)
+                .copied()
+                .unwrap_or(s.storage_avail_bytes);
+            if avail == 0 {
                 return (500, json!({"errors": "storage is not online"}));
             }
-            let _ = storage;
-            (200, json!({"data": {"avail": s.storage_avail_bytes, "total": s.storage_avail_bytes}}))
+            (200, json!({"data": {"avail": avail, "total": avail}}))
         }
 
         ("PUT", ["nodes", _node, "qemu", id, "config"]) => {
@@ -530,7 +565,15 @@ fn route(s: &mut State, method: &str, path: &str, body: &str) -> (u16, Value) {
             (200, json!({ "data": t }))
         }
 
-        ("GET", ["nodes", _node, "qemu", _id, "agent", "network-get-interfaces"]) => {
+        ("GET", ["nodes", _node, "qemu", id, "agent", "network-get-interfaces"]) => {
+            // Real PVE answers a missing machine with a 500 naming its
+            // configuration file, not a 404 -- the text is all a caller gets.
+            if lookup(s, id).is_none() {
+                return (
+                    500,
+                    json!({"errors": format!("Configuration file 'nodes/x/qemu-server/{id}.conf' does not exist")}),
+                );
+            }
             if s.agent_unavailable {
                 return (500, json!({"errors": "QEMU guest agent is not running"}));
             }

@@ -31,7 +31,7 @@ fn provider_for(pve: &MockPve) -> Proxmox {
         task_timeout: Duration::from_secs(2),
         request_timeout: Duration::from_secs(5),
     };
-    let mut p = Proxmox::with_token(config, "cal@pve!test=secret".into()).expect("provider");
+    let mut p = Proxmox::with_token(config, "someone@realm!test=secret".into()).expect("provider");
     p.set_poll_interval(Duration::from_millis(5));
     p
 }
@@ -574,7 +574,7 @@ fn a_token_that_is_not_shaped_like_a_credential_is_refused() {
     // hunting for a permissions problem they do not have.
     for (label, body) in [
         ("empty", ""),
-        ("blank", "   \n"),
+        ("blank", " \n"),
         ("no bang", "cal@pve=secret"),
         ("no equals", "cal@pve!harness"),
         ("internal space", "cal@pve!harness= secret"),
@@ -653,7 +653,7 @@ fn asking_for_a_disk_with_nowhere_to_put_it_is_refused_clearly() {
         request_timeout: Duration::from_secs(5),
     };
     config.data_storage = None;
-    let mut p = Proxmox::with_token(config, "someone@realm!t=s".into()).unwrap();
+    let mut p = Proxmox::with_token(config, "someone@realm!test=secret".into()).unwrap();
     p.set_poll_interval(Duration::from_millis(5));
 
     let e = p.create(&request("a-session", 1)).unwrap_err();
@@ -672,7 +672,7 @@ fn the_disk_slot_is_configurable() {
     )))
     .expect("config");
     config.task_timeout = Duration::from_secs(2);
-    let mut p = Proxmox::with_token(config, "someone@realm!t=s".into()).unwrap();
+    let mut p = Proxmox::with_token(config, "someone@realm!test=secret".into()).unwrap();
     p.set_poll_interval(Duration::from_millis(5));
 
     let m = p.create(&request("a-session", 1)).expect("create");
@@ -923,4 +923,219 @@ fn disk_specs_are_read_the_way_proxmox_writes_them() {
     );
     // Nor is an entry with no size at all.
     assert_eq!(super::disk_storage_and_size("none,media=cdrom"), None);
+}
+
+// ---------------------------------------------------------------------------
+// Hardening: defects found by adversarial review. Every test here was watched
+// failing against the code as first written.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refusing_a_disk_with_nowhere_to_put_it_creates_nothing() {
+    // The data_storage check used to run *after* the clone, and the error
+    // return leaked an untagged machine -- the one state nothing collects.
+    // The refusal is pure configuration, so it must precede every request
+    // that makes anything.
+    let pve = pve_with_template();
+    let mut config = Config {
+        api: pve.url(),
+        node: NODE.to_string(),
+        pool: POOL.to_string(),
+        ids: IdRange::new(9000, 9099).unwrap(),
+        token_file: "/dev/null".into(),
+        data_storage: None,
+        data_bus: "virtio1".to_string(),
+        min_free_gb: 10,
+        tls: Tls::Insecure,
+        task_timeout: Duration::from_secs(2),
+        request_timeout: Duration::from_secs(5),
+    };
+    config.data_storage = None;
+    let mut p = Proxmox::with_token(config, "someone@realm!test=secret".into()).unwrap();
+    p.set_poll_interval(Duration::from_millis(5));
+
+    let e = p.create(&request("a-session", 1)).unwrap_err();
+    assert!(e.to_string().contains("data_storage"), "{e}");
+    assert!(
+        pve.session_machines().is_empty(),
+        "a refused create must leave nothing: {:?}",
+        pve.session_machines()
+    );
+    assert!(
+        !pve.paths().iter().any(|p| p.contains("/clone")),
+        "the refusal must come before the network, not after the clone"
+    );
+}
+
+#[test]
+fn a_failed_clone_leaves_nothing_behind() {
+    // The task reported failure, so the outcome is known -- which licenses
+    // the cleanup a timeout does not. Whatever the hypervisor left of the
+    // half-made machine is destroyed rather than abandoned untagged.
+    let pve = pve_with_template();
+    pve.with_state(|s| s.next_task_fails = Some("clone failed: no space".into()));
+    let p = provider_for(&pve);
+
+    let e = p.create(&request("a-session", 1)).unwrap_err();
+    assert!(e.to_string().contains("no space"), "{e}");
+    assert!(e.to_string().contains("nothing was left behind"), "{e}");
+    assert!(
+        pve.session_machines().is_empty(),
+        "the leftover must be destroyed: {:?}",
+        pve.session_machines()
+    );
+}
+
+#[test]
+fn a_clone_timeout_names_the_possible_orphan() {
+    // A timeout's outcome is unknown, so nothing is destroyed -- but the
+    // generic "the expiry tag means nothing is leaked" is FALSE for this one
+    // path, because no tag has been applied yet. The message must say so
+    // instead of reassuring.
+    let pve = pve_with_template();
+    pve.with_state(|s| s.tasks_never_finish = true);
+    let p = provider_for(&pve);
+
+    let e = p.create(&request("a-session", 1)).unwrap_err();
+    assert!(
+        e.to_string().contains("no expiry tag yet"),
+        "the one untagged window must not be papered over: {e}"
+    );
+    assert!(e.to_string().contains("destroy"), "{e}");
+}
+
+#[test]
+fn a_blinking_api_does_not_fail_a_running_task() {
+    // One 502 on a status poll used to abort the whole wait, reporting an
+    // operation as failed whose task was still running -- and, on create's
+    // path, leaking the untagged clone.
+    let pve = pve_with_template();
+    pve.flake_next(2);
+    let p = provider_for(&pve);
+
+    p.create(&request("a-session", 1))
+        .expect("two blinks inside the deadline are absorbed");
+}
+
+#[test]
+fn a_third_partys_expires_tag_is_not_ours_to_delete() {
+    // with_expiry deleted anything starting "expires-", including forms
+    // expiry_of() itself refuses to read. What this module cannot read it
+    // may not delete.
+    let out = crate::tags::with_expiry("expires-soon;owner-x;expires-1700000000", at(1_800_000_000));
+    assert!(out.contains("expires-soon"), "{out}");
+    assert!(out.contains("owner-x"), "{out}");
+    assert!(out.contains("expires-1800000000"), "{out}");
+    assert!(!out.contains("expires-1700000000"), "{out}");
+}
+
+#[test]
+fn a_machine_destroyed_mid_wait_is_gone_not_pending() {
+    // PVE answers the agent query for a missing machine with a 500 naming its
+    // configuration file. Swallowing that as "agent not up yet" made a
+    // destroyed machine look forever pending to anything polling for an
+    // address.
+    let pve = pve_with_template();
+    let p = provider_for(&pve);
+    let e = p
+        .address(&reaper_core::MachineRef::new("9042"))
+        .expect_err("a missing machine is an answer, not a wait");
+    assert!(
+        matches!(e, reaper_core::ProviderError::NotFound(_)),
+        "wanted NotFound, got {e}"
+    );
+}
+
+#[test]
+fn room_is_checked_against_the_storage_that_is_actually_short() {
+    // Each storage against its own figure. The mock used to answer one shared
+    // number for every storage name, so an accounting bug that summed
+    // everything against one figure would have passed.
+    let pve = pve_with_template();
+    // The template's own disk lives on STORAGE and has room; the data disk's
+    // storage is nearly full.
+    pve.storage_named_has("some-storage", 10 * 1024 * 1024 * 1024);
+    let p = provider_for(&pve);
+
+    let e = p.create(&request("a-session", 1)).unwrap_err();
+    let msg = e.to_string();
+    assert!(msg.contains("some-storage"), "{msg}");
+    assert!(
+        pve.session_machines().is_empty(),
+        "refused before anything was made"
+    );
+}
+
+#[test]
+fn every_kind_of_disk_a_clone_copies_is_priced() {
+    // efidisk, tpmstate and unused volumes ride along in a full clone.
+    for key in ["efidisk0", "tpmstate0", "unused0", "virtio0", "scsi12"] {
+        assert!(crate::is_disk_key(key), "{key} is copied, so it is priced");
+    }
+    for key in ["virtiofs0", "efidisk", "unused", "net0", "ide"] {
+        assert!(!crate::is_disk_key(key), "{key} is not a disk");
+    }
+}
+
+#[test]
+fn fractional_sizes_count_instead_of_costing_zero() {
+    // PVE writes `size=4.5G` without embarrassment. A disk whose size cannot
+    // be parsed used to contribute zero bytes, silently, to a check whose
+    // whole job is refusing sessions that do not fit.
+    assert_eq!(
+        crate::parse_size("4.5G"),
+        Some((4.5 * (1u64 << 30) as f64) as u64)
+    );
+    assert_eq!(crate::parse_size("528K"), Some(528 * 1024));
+    assert_eq!(crate::parse_size("8G"), Some(8 * (1u64 << 30)));
+    // Unknown suffixes stay unknown -- and the caller now says so out loud
+    // rather than counting the disk at nothing.
+    assert_eq!(crate::parse_size("2P"), None);
+    assert_eq!(crate::parse_size(""), None);
+    // The absurd does not wrap into the tiny.
+    assert_eq!(crate::parse_size("99999999999999999999T"), None);
+}
+
+#[test]
+fn every_certificate_in_a_ca_bundle_is_loaded() {
+    // ureq's from_pem takes the FIRST certificate and drops the rest, so a
+    // bundle (a rotation, or intermediate-then-root) silently trusted less
+    // than the operator configured. The blocks are split first now.
+    let bundle = "\
+-----BEGIN CERTIFICATE-----\naaa\n-----END CERTIFICATE-----\n\
+# a comment between blocks\n\
+-----BEGIN CERTIFICATE-----\nbbb\n-----END CERTIFICATE-----\n";
+    let blocks = crate::http::pem_blocks(bundle);
+    assert_eq!(blocks.len(), 2, "{blocks:?}");
+    assert!(blocks[0].contains("aaa"));
+    assert!(blocks[1].contains("bbb"));
+    assert!(crate::http::pem_blocks("not pem at all").is_empty());
+}
+
+#[test]
+fn a_wrong_token_is_refused_by_the_stand_in() {
+    // The stand-in used to authorize any request whose header merely
+    // contained the scheme prefix, so a provider change that corrupted the
+    // token value would have passed the whole suite.
+    let pve = pve_with_template();
+    let mut config = Config {
+        api: pve.url(),
+        node: NODE.to_string(),
+        pool: POOL.to_string(),
+        ids: IdRange::new(9000, 9099).unwrap(),
+        token_file: "/dev/null".into(),
+        data_storage: Some("some-storage".to_string()),
+        data_bus: "virtio1".to_string(),
+        min_free_gb: 10,
+        tls: Tls::Insecure,
+        task_timeout: Duration::from_secs(2),
+        request_timeout: Duration::from_secs(5),
+    };
+    config.data_storage = Some("some-storage".to_string());
+    let p = Proxmox::with_token(config, "someone@realm!test=WRONG".into()).unwrap();
+    let e = p.list().unwrap_err();
+    assert!(
+        matches!(e, reaper_core::ProviderError::Unauthorized(_)),
+        "{e}"
+    );
 }

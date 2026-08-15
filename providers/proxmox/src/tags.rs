@@ -50,9 +50,16 @@ pub fn expiry_of(tags: &str) -> Option<SystemTime> {
 /// reaper is not the only thing that writes tags; clobbering somebody else's
 /// would be both rude and invisible.
 pub fn with_expiry(existing: &str, at: SystemTime) -> String {
+    // Only the tags expiry_of() itself recognizes -- prefix plus digits --
+    // are ours to replace. A third party's "expires-soon" is not an expiry
+    // this module can read, so it is not one this module may delete.
     let mut out: Vec<String> = split(existing)
         .into_iter()
-        .filter(|t| !t.starts_with(PREFIX))
+        .filter(|t| {
+            !t.strip_prefix(PREFIX)
+                .map(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+                .unwrap_or(false)
+        })
         .map(str::to_string)
         .collect();
     out.push(encode(at));

@@ -30,14 +30,29 @@ impl Client {
                 let pem = std::fs::read(path).map_err(|e| {
                     ProviderError::Config(format!("cannot read ca_file {}: {e}", path.display()))
                 })?;
-                let cert = Certificate::from_pem(&pem).map_err(|e| {
-                    ProviderError::Config(format!(
-                        "ca_file {} is not a PEM certificate: {e}",
+                // Every certificate in the file, not just the first: a ca_file
+                // is routinely a bundle (a rotation in progress, or an
+                // intermediate stapled ahead of the root), and silently
+                // trusting only block one fails the handshake with a message
+                // that blames the wrong thing.
+                let mut certs = Vec::new();
+                for block in pem_blocks(&String::from_utf8_lossy(&pem)) {
+                    let cert = Certificate::from_pem(block.as_bytes()).map_err(|e| {
+                        ProviderError::Config(format!(
+                            "ca_file {} holds a block that is not a certificate: {e}",
+                            path.display()
+                        ))
+                    })?;
+                    certs.push(cert);
+                }
+                if certs.is_empty() {
+                    return Err(ProviderError::Config(format!(
+                        "ca_file {} holds no certificate at all",
                         path.display()
-                    ))
-                })?;
+                    )));
+                }
                 TlsConfig::builder()
-                    .root_certs(RootCerts::new_with_certs(&[cert]))
+                    .root_certs(RootCerts::new_with_certs(&certs))
                     .build()
             }
             Tls::Insecure => {
@@ -159,6 +174,27 @@ impl Client {
     }
 }
 
+/// The PEM blocks of a bundle, each with its BEGIN/END lines intact.
+pub(crate) fn pem_blocks(text: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current: Option<String> = None;
+    for line in text.lines() {
+        if line.starts_with("-----BEGIN ") {
+            current = Some(String::new());
+        }
+        if let Some(b) = current.as_mut() {
+            b.push_str(line);
+            b.push('\n');
+        }
+        if line.starts_with("-----END ") {
+            if let Some(b) = current.take() {
+                blocks.push(b);
+            }
+        }
+    }
+    blocks
+}
+
 /// Wait for an asynchronous operation to finish.
 ///
 /// Proxmox answers most mutations with a task handle rather than a result, so
@@ -174,8 +210,28 @@ pub fn wait_for_task(
     let deadline = std::time::Instant::now() + timeout;
     let path = format!("/nodes/{node}/tasks/{task}/status");
 
+    // A single failed status poll used to abort the whole wait -- reporting
+    // an operation as failed whose task was still running, and in create()'s
+    // case leaking the untagged clone. The deadline loop exists to absorb
+    // time, so it absorbs a few bad polls too; only a *persistently*
+    // unreachable API is worth giving up on early.
+    let mut consecutive_failures = 0u32;
+
     loop {
-        let data = client.get(&path)?;
+        let data = match client.get(&path) {
+            Ok(d) => {
+                consecutive_failures = 0;
+                d
+            }
+            Err(e) => {
+                consecutive_failures += 1;
+                if consecutive_failures >= 3 || std::time::Instant::now() >= deadline {
+                    return Err(e);
+                }
+                std::thread::sleep(poll);
+                continue;
+            }
+        };
         let status = data.get("status").and_then(Value::as_str).unwrap_or("");
 
         if status == "stopped" {

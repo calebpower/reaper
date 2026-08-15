@@ -710,6 +710,13 @@ operating system and had nowhere to run under a single-guest design.
   explicitly rather than silently.
 - **Ubuntu 26.04 is a young LTS.** Pin to point-release media, record exact
   package versions in the template's notes.
+- **A migrated session cannot be operated on.** Listing is cluster-wide, but
+  every mutation addresses the configured node -- so a session VM that has been
+  live-migrated elsewhere still shows in `reaper list` while stop, destroy and
+  address queries fail against the node it left. Sessions are ephemeral and
+  nothing reaper does migrates them, so this takes deliberate operator
+  interference to hit; if it ever matters, the fix is resolving each machine's
+  node from the cluster listing instead of the config. Recorded, not fixed.
 - **The provider seam has exactly one implementation**, so it is a hypothesis
   rather than a proof. The lint guard tests that hypervisor vocabulary has not
   leaked across the boundary; it cannot test that the boundary is in the right
