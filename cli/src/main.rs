@@ -104,6 +104,23 @@ enum Command {
     /// Show live sessions.
     List,
 
+    /// Judge the site end to end: configuration, credentials, templates,
+    /// storage, records -- and say what is wrong. Exit 0 healthy (warnings
+    /// permitted), 1 if anything failed, 2 if doctor itself could not run.
+    Doctor {
+        /// A manifest to judge along with the site. Defaults to .reaper.toml
+        /// here, when one exists.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+        /// Prove the sweeper by making an already-expired machine and
+        /// watching for it to be collected. Creates one real machine.
+        #[arg(long)]
+        canary: bool,
+        /// How long the canary waits before calling the sweeper absent.
+        #[arg(long)]
+        within: Option<String>,
+    },
+
     /// Push a session's expiry further out.
     Renew {
         /// Which session. Defaults to every session for this project.
@@ -139,6 +156,19 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     let outcome = match cli.command {
+        // Doctor has its own exit contract -- 0 healthy / 1 failed findings /
+        // 2 could-not-run -- which the shared Ok/Err mapping below cannot
+        // express, and its report must not gain a "reaper:" prefix line.
+        Command::Doctor { manifest, canary, within } => {
+            return match commands::doctor(manifest, canary, within) {
+                Ok(v) if v.fail == 0 => ExitCode::SUCCESS,
+                Ok(_) => ExitCode::FAILURE,
+                Err(e) => {
+                    eprintln!("reaper: {e}");
+                    ExitCode::from(2)
+                }
+            };
+        }
         Command::Up {
             guest,
             profile,

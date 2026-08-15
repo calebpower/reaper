@@ -2241,3 +2241,146 @@ exclude = ["/target/", "*.tmp"]
         assert!(p.contains("--exclude=/out/"), "out/ is always protected: {p}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// doctor. Assertions here are on health words, counts and the CLI's own
+// labels -- never on provider sentences, which are the provider's vocabulary
+// and the seam guard scans this file too.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn doctor_judges_a_healthy_site_clean() {
+    let h = Harness::new("doctorclean");
+    let out = h.run(&["doctor"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("0 failed"), "{stdout}");
+    // The honest warns: an unexercised sweeper and this harness's TLS mode.
+    assert!(stdout.contains("WARN"), "{stdout}");
+    for label in ["site configuration", "session store", "manifest", "sessions"] {
+        assert!(stdout.contains(label), "missing {label}: {stdout}");
+    }
+}
+
+#[test]
+fn doctor_counts_a_refused_credential_as_one_failure() {
+    let h = Harness::new("doctorauth");
+    h.hypervisor.with_state(|s| s.unauthorized = true);
+    let out = h.run(&["doctor"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("1 failed"), "one cause, one failure: {stdout}");
+    assert!(stdout.contains("skipped"), "{stdout}");
+}
+
+#[test]
+fn doctor_flags_a_record_whose_machine_is_gone() {
+    let h = Harness::new("doctorgone");
+    h.ok(&["up"]);
+    let m = h.hypervisor.machine_named("a-project").expect("machine");
+    h.hypervisor.collect(&m);
+    let out = h.run(&["doctor"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("session a-project"), "{stdout}");
+    assert!(stdout.contains("reaper down"), "the way out is named: {stdout}");
+}
+
+#[test]
+fn doctor_warns_about_a_dead_heartbeat_without_failing() {
+    let h = Harness::new("doctorhb");
+    h.ok(&["up"]);
+    let stored = std::fs::read_to_string(h.dir.join("sessions.json")).unwrap();
+    if let Some(pid) = stored
+        .split("\"heartbeat_pid\": ")
+        .nth(1)
+        .and_then(|r| r.split(&[',', '\n'][..]).next())
+        .and_then(|x| x.trim().parse::<i32>().ok())
+    {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let out = h.run(&["doctor"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "a dead heartbeat is a warning: {stdout}");
+    assert!(stdout.contains("heartbeat is dead"), "{stdout}");
+}
+
+#[test]
+fn doctor_fails_a_missing_transport_binary() {
+    let h = Harness::new("doctorrsync");
+    h.amend_config("rsync_command", "/nonexistent/reaper-doctor-rsync");
+    let out = h.run(&["doctor"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("rsync command"), "{stdout}");
+}
+
+#[test]
+fn doctor_exits_two_when_it_cannot_run_at_all() {
+    let h = Harness::new("doctorusage");
+    let out = h.run(&["doctor", "--within", "nonsense"]);
+    assert_eq!(out.status.code(), Some(2), "a malformed flag is doctor's own failure");
+}
+
+#[test]
+fn a_canary_collected_is_the_sweeper_proven() {
+    let h = Harness::new("canaryok");
+    let dir = h.dir.clone();
+    // The stand-in itself must not be cloned -- its Drop stops the server --
+    // but its state is shared, which is all a pretend sweeper needs.
+    let state = h.hypervisor.state.clone();
+    let sweeper = std::thread::spawn(move || {
+        // Play the sweeper: take the canary once it exists.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let taken = {
+                let mut s = state.lock().unwrap();
+                let id = s
+                    .vms
+                    .iter()
+                    .find(|(_, vm)| vm.name == "reaper-doctor-canary")
+                    .map(|(id, _)| *id);
+                match id {
+                    Some(id) => {
+                        s.vms.remove(&id);
+                        true
+                    }
+                    None => false,
+                }
+            };
+            if taken {
+                return true;
+            }
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    });
+    let out = Command::new(env!("CARGO_BIN_EXE_reaper"))
+        .args(["doctor", "--canary", "--within", "1m"])
+        .current_dir(&dir)
+        .env("REAPER_CONFIG", dir.join("config.toml"))
+        .env("REAPER_STATE", dir.join("sessions.json"))
+        .output()
+        .expect("run doctor");
+    assert!(sweeper.join().unwrap(), "the stand-in sweeper saw no canary");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("canary"), "{stdout}");
+    assert!(stdout.contains("collected"), "{stdout}");
+}
+
+#[test]
+fn a_canary_nobody_collects_is_the_sweeper_absent() {
+    let h = Harness::new("canarydead");
+    let out = h.run(&["doctor", "--canary", "--within", "1s"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("canary"), "{stdout}");
+    assert!(
+        h.hypervisor.machine_named("reaper-doctor-canary").is_none(),
+        "doctor cleans up its own canary on timeout"
+    );
+}

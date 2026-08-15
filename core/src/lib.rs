@@ -15,7 +15,10 @@ pub mod sync;
 pub mod transport;
 
 pub use config::{Config, ConfigError};
-pub use provider::{CreateRequest, MachineRef, MachineSummary, Provider, ProviderError};
+pub use provider::{
+    CreateRequest, Finding, Health, MachineRef, MachineSummary, Provider, ProviderError,
+    RegisteredGuest,
+};
 pub use session::{Session, Store};
 pub use transport::{Ssh, Transport};
 

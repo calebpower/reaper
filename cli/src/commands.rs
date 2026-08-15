@@ -112,15 +112,8 @@ pub fn up(
     // should cost nothing, and it certainly should not leave one machine
     // running while the second name turns out to be wrong.
     for g in &wanted {
-        if cfg.template_for(&g.name).is_none() {
-            return Err(format!(
-                "no guest named {:?} is registered here; this site offers: {}. \
-                 Registering one is a template build and an entry in {} -- see docs/guests.md",
-                g.name,
-                cfg.guest_names().join(", "),
-                cfg.path.display()
-            )
-            .into());
+        if let Some(complaint) = unregistered_guest(&cfg, &g.name) {
+            return Err(complaint.into());
         }
     }
 
@@ -128,15 +121,8 @@ pub fn up(
     // these failing is a machine wasted -- unreachable forever without the
     // key, or unfindable later without a writable record.
     store.probe_writable()?;
-    if let Some(key) = &cfg.session.ssh_key {
-        if !key.exists() {
-            return Err(format!(
-                "session.ssh_key {} does not exist, so no session could ever be reached. Fix the path in {} before creating machines",
-                key.display(),
-                cfg.path.display()
-            )
-            .into());
-        }
+    if let Some(complaint) = missing_ssh_key(&cfg) {
+        return Err(complaint.into());
     }
 
     let ttl = ttl_for(&cfg, &manifest, profile.as_deref(), ttl.as_deref())?;
@@ -405,6 +391,36 @@ const PRISTINE: &str = "pristine";
 const JOB_PATH: &str = "/tmp/reaper-job.sh";
 
 /// A file this session owns, beside the session store.
+/// The sentence for a guest the site does not register, or None if it does.
+/// Shared by `up` (a refusal) and `doctor` (a finding) so the two can never
+/// drift into disagreeing about what registered means.
+fn unregistered_guest(cfg: &Config, guest: &str) -> Option<String> {
+    if cfg.template_for(guest).is_some() {
+        return None;
+    }
+    Some(format!(
+        "no guest named {guest:?} is registered here; this site offers: {}. \
+         Registering one is a template build and an entry in {} -- see docs/guests.md",
+        cfg.guest_names().join(", "),
+        cfg.path.display()
+    ))
+}
+
+/// The sentence for a configured ssh key that does not exist, or None.
+/// Shared by `up` and `doctor` for the same no-drift reason.
+fn missing_ssh_key(cfg: &Config) -> Option<String> {
+    let key = cfg.session.ssh_key.as_ref()?;
+    if key.exists() {
+        return None;
+    }
+    Some(format!(
+        "session.ssh_key {} does not exist, so no session could ever be reached. \
+         Fix the path in {} before creating machines",
+        key.display(),
+        cfg.path.display()
+    ))
+}
+
 /// Remove what a session accumulated on the workstation, when the session
 /// itself is forgotten: its known-hosts file, its rsh wrapper, its heartbeat
 /// log. Tied to the forgetting, not the destroying -- a kept session keeps
@@ -1490,4 +1506,425 @@ fn collect_last_results(cfg: &Config, s: &Session, manifest_path: Option<&Path>)
             s.name
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// doctor: the site, judged
+// ---------------------------------------------------------------------------
+
+/// What the report added up to. `main` maps this to the exit contract
+/// (0 healthy-or-warned / 1 any failure / 2 doctor itself could not run),
+/// which the generic Ok/Err mapping cannot express.
+pub struct DoctorVerdict {
+    pub ok: usize,
+    pub warn: usize,
+    pub fail: usize,
+}
+
+struct Report {
+    ok: usize,
+    warn: usize,
+    fail: usize,
+}
+
+impl Report {
+    fn new() -> Report {
+        Report { ok: 0, warn: 0, fail: 0 }
+    }
+
+    fn section(&mut self, title: &str) {
+        println!("\n--- {title} ---\n");
+    }
+
+    fn line(&mut self, label: &str, health: reaper_core::Health, detail: &str) {
+        let word = match health {
+            reaper_core::Health::Ok => {
+                self.ok += 1;
+                "ok  "
+            }
+            reaper_core::Health::Warn => {
+                self.warn += 1;
+                "WARN"
+            }
+            reaper_core::Health::Fail => {
+                self.fail += 1;
+                "FAIL"
+            }
+        };
+        println!("{word}  {label}");
+        for l in detail.lines() {
+            println!(" {l}");
+        }
+    }
+}
+
+/// Judge the site end to end and say what is wrong, in one pass. Every
+/// problem is a finding rather than an abort -- knowing that three things
+/// broke is worth more than knowing that one did -- and nothing here creates
+/// anything unless `--canary` asks for the one deliberate exception.
+pub fn doctor(
+    manifest_path: Option<PathBuf>,
+    canary: bool,
+    within: Option<String>,
+) -> Result<DoctorVerdict> {
+    use reaper_core::Health;
+    // A malformed flag is doctor failing to run, not a site finding.
+    let within = match within.as_deref() {
+        Some(t) => duration::parse(t)?,
+        None => Duration::from_secs(15 * 60),
+    };
+
+    let mut r = Report::new();
+    r.section("workstation");
+
+    // The config is the root of everything else; unparseable means one Fail
+    // and the shortest honest report there is.
+    let cfg = match reaper_core::config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            r.line("site configuration", Health::Fail, &e.to_string());
+            println!("\n{} ok, {} warnings, {} failed", r.ok, r.warn, r.fail);
+            return Ok(DoctorVerdict { ok: r.ok, warn: r.warn, fail: r.fail });
+        }
+    };
+    r.line(
+        "site configuration",
+        Health::Ok,
+        &format!("{} parses, {} guest(s) registered", cfg.path.display(), cfg.guests.len()),
+    );
+
+    match missing_ssh_key(&cfg) {
+        Some(complaint) => r.line("session key", Health::Fail, &complaint),
+        None => match &cfg.session.ssh_key {
+            Some(k) => r.line("session key", Health::Ok, &format!("{} exists", k.display())),
+            None => r.line(
+                "session key",
+                Health::Warn,
+                "no session.ssh_key is configured; whatever identities ssh \
+                 offers will be tried, which works until it quietly does not",
+            ),
+        },
+    }
+
+    for (what, cmd) in [
+        ("ssh command", &cfg.session.ssh_command),
+        ("rsync command", &cfg.session.rsync_command),
+    ] {
+        match resolvable(cmd) {
+            Some(path) => r.line(what, Health::Ok, &format!("{cmd} is {}", path.display())),
+            None => r.line(
+                what,
+                Health::Fail,
+                &format!("{cmd} is not on PATH and is not an executable path; \
+                          every session operation needs it"),
+            ),
+        }
+    }
+
+    let store = Store::open();
+    match store.probe_writable() {
+        Ok(()) => r.line(
+            "session store",
+            Health::Ok,
+            &format!("{} is writable", store.path().display()),
+        ),
+        Err(e) => r.line("session store", Health::Fail, &e.to_string()),
+    }
+
+    // Registry coherence: two guests naming one template is legal and worth a
+    // person's eyes -- their sessions clone the same machine.
+    {
+        let mut by_template: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for name in cfg.guest_names() {
+            if let Some(t) = cfg.template_for(name) {
+                by_template.entry(t).or_default().push(name);
+            }
+        }
+        let shared: Vec<String> = by_template
+            .iter()
+            .filter(|(_, gs)| gs.len() > 1)
+            .map(|(t, gs)| format!("{t} is registered for {}", gs.join(" and ")))
+            .collect();
+        if shared.is_empty() {
+            r.line("guest registry", Health::Ok, "every guest has its own template");
+        } else {
+            r.line("guest registry", Health::Warn, &shared.join("\n"));
+        }
+    }
+
+    // The manifest, when one is in reach. Its absence is a normal state for a
+    // doctor run from anywhere, not an unchecked hazard.
+    let manifest_at = manifest_path.unwrap_or_else(|| PathBuf::from(".reaper.toml"));
+    if manifest_at.exists() {
+        match reaper_manifest::load(&manifest_at) {
+            Ok(m) => {
+                let complaints: Vec<String> = m
+                    .guests
+                    .iter()
+                    .filter_map(|g| unregistered_guest(&cfg, &g.name))
+                    .collect();
+                if complaints.is_empty() {
+                    r.line(
+                        "manifest",
+                        Health::Ok,
+                        &format!("{} is valid and every guest it names is registered",
+                                 manifest_at.display()),
+                    );
+                } else {
+                    r.line("manifest", Health::Fail, &complaints.join("\n"));
+                }
+            }
+            Err(e) => r.line("manifest", Health::Fail, &e.to_string()),
+        }
+    } else {
+        r.line(
+            "manifest",
+            Health::Ok,
+            &format!("no manifest at {}; nothing to judge", manifest_at.display()),
+        );
+    }
+
+    // The provider. Construction failure IS the credential/config finding --
+    // the token is read and permission-checked on this path.
+    r.section("provider");
+    let provider = match provider_for(&cfg) {
+        Ok(p) => p,
+        Err(e) => {
+            r.line("provider", Health::Fail, &e.to_string());
+            r.line(
+                "sessions",
+                Health::Warn,
+                "skipped: without the provider, records cannot be checked \
+                 against the machines they claim",
+            );
+            println!("\n{} ok, {} warnings, {} failed", r.ok, r.warn, r.fail);
+            return Ok(DoctorVerdict { ok: r.ok, warn: r.warn, fail: r.fail });
+        }
+    };
+    let guests: Vec<reaper_core::RegisteredGuest> = cfg
+        .guest_names()
+        .iter()
+        .filter_map(|n| {
+            cfg.template_for(n).map(|t| reaper_core::RegisteredGuest {
+                name: (*n).to_string(),
+                template: t.to_string(),
+            })
+        })
+        .collect();
+    for f in provider.diagnose(&guests) {
+        r.line(&f.label, f.health, &f.detail);
+    }
+
+    // The records, judged against the machines they claim.
+    r.section("sessions");
+    let live = provider.list().ok();
+    match store.list() {
+        Err(e) => r.line("session store", Health::Fail, &e.to_string()),
+        Ok(sessions) if sessions.is_empty() => {
+            r.line("sessions", Health::Ok, "no sessions recorded");
+        }
+        Ok(sessions) => {
+            let now = SystemTime::now();
+            for s in sessions {
+                let mut notes = Vec::new();
+                let mut worst = Health::Ok;
+                match &live {
+                    Some(l) if !l.iter().any(|m| m.machine == s.machine) => {
+                        worst = Health::Fail;
+                        notes.push(format!(
+                            "its machine is gone; `reaper down {}` clears the record",
+                            s.name
+                        ));
+                    }
+                    Some(_) => {}
+                    None => notes.push("machine check skipped: the provider \
+                                        could not list".to_string()),
+                }
+                if s.remaining(now).is_none() {
+                    if worst == Health::Ok {
+                        worst = Health::Warn;
+                    }
+                    notes.push("its record is expired: the sweeper may take \
+                                the machine at any moment".to_string());
+                }
+                match s.heartbeat_pid {
+                    Some(pid) if proc::looks_like_heartbeat(pid) == Some(true) => {
+                        // Renewal claims to be running; the log should agree.
+                        let log = store
+                            .path()
+                            .with_file_name(format!("heartbeat-{}.log", s.name));
+                        if let Ok(meta) = std::fs::metadata(&log) {
+                            if let Ok(age) = meta
+                                .modified()
+                                .ok()
+                                .and_then(|m| now.duration_since(m).ok())
+                                .ok_or(())
+                            {
+                                if age > cfg.session.heartbeat_interval * 2 {
+                                    if worst == Health::Ok {
+                                        worst = Health::Warn;
+                                    }
+                                    notes.push(format!(
+                                        "its heartbeat is alive but the log has \
+                                         not moved in {}s -- renewal may not be \
+                                         happening",
+                                        age.as_secs()
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        if worst == Health::Ok {
+                            worst = Health::Warn;
+                        }
+                        notes.push("its heartbeat is dead: the expiry has \
+                                    stopped moving".to_string());
+                    }
+                    None => {
+                        if worst == Health::Ok {
+                            worst = Health::Warn;
+                        }
+                        notes.push("it has no heartbeat: the expiry never \
+                                    moves".to_string());
+                    }
+                }
+                if notes.is_empty() {
+                    notes.push("record, machine and heartbeat agree".to_string());
+                }
+                r.line(&format!("session {}", s.name), worst, &notes.join("\n"));
+            }
+        }
+    }
+
+    if canary {
+        r.section("canary");
+        run_canary(&mut r, &cfg, provider.as_ref(), within);
+    }
+
+    println!("\n{} ok, {} warnings, {} failed", r.ok, r.warn, r.fail);
+    Ok(DoctorVerdict { ok: r.ok, warn: r.warn, fail: r.fail })
+}
+
+/// The active sweeper check: make a machine that is expired from birth, and
+/// watch for the sweeper to take it. Inherently safe -- even a crashed doctor
+/// leaves nothing the sweeper will not collect -- and the strongest evidence
+/// there is: a canary disappearing IS the sweeper working.
+fn run_canary(
+    r: &mut Report,
+    cfg: &Config,
+    provider: &dyn Provider,
+    within: Duration,
+) {
+    use reaper_core::Health;
+    let Some((guest, template)) = cfg
+        .guest_names()
+        .first()
+        .and_then(|n| cfg.template_for(n).map(|t| ((*n).to_string(), t.to_string())))
+    else {
+        r.line("canary", Health::Fail, "no guest is registered to clone from");
+        return;
+    };
+
+    let born_expired = SystemTime::now() - Duration::from_secs(1);
+    let machine = match provider.create(&CreateRequest {
+        name: "reaper-doctor-canary".into(),
+        template,
+        cores: None,
+        ram_gb: None,
+        data_disk_gb: None,
+        expires_at: born_expired,
+    }) {
+        Ok(m) => m,
+        Err(e) => {
+            r.line(
+                "canary",
+                Health::Fail,
+                &format!("could not create the canary (from {guest}'s template): {e}"),
+            );
+            return;
+        }
+    };
+    println!(
+        "      canary {machine} created, already expired; waiting up to {} \
+         for the sweeper",
+        duration::format(within)
+    );
+
+    let started = std::time::Instant::now();
+    let deadline = started + within;
+    loop {
+        match provider.list() {
+            Ok(l) if !l.iter().any(|m| m.machine == machine) => {
+                r.line(
+                    "canary",
+                    Health::Ok,
+                    &format!(
+                        "the sweeper collected it after {}s -- the dead-man's \
+                         switch is live",
+                        started.elapsed().as_secs()
+                    ),
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // A blink mid-wait is absorbed; the deadline bounds it.
+                eprintln!("reaper: canary poll failed ({e}); retrying");
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    }
+
+    let cleanup = match provider.destroy(&machine) {
+        Ok(()) => "the canary has been destroyed by hand".to_string(),
+        Err(reaper_core::ProviderError::NotFound(_)) => {
+            // Collected between the last poll and now: late, but alive.
+            r.line(
+                "canary",
+                Health::Warn,
+                &format!(
+                    "the sweeper took it only as the wait expired (~{}s) -- \
+                     alive, but slower than sweep_within expects",
+                    started.elapsed().as_secs()
+                ),
+            );
+            return;
+        }
+        Err(e) => format!("and destroying it failed too ({e}); it is expired, so \
+                           a working sweeper would still collect it"),
+    };
+    r.line(
+        "canary",
+        Health::Fail,
+        &format!(
+            "nothing collected an expired machine in {}: the sweeper is absent \
+             or stopped; {cleanup}",
+            duration::format(within)
+        ),
+    );
+}
+
+/// A command as configured: an explicit path must exist and be executable, a
+/// bare name must be findable on PATH. Checked nowhere else, and a missing
+/// rsync surfaces today only mid-verb with rsync's own error.
+fn resolvable(cmd: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let executable = |p: &Path| {
+        std::fs::metadata(p)
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    };
+    if cmd.contains('/') {
+        let p = PathBuf::from(cmd);
+        return executable(&p).then_some(p);
+    }
+    std::env::var_os("PATH")?
+        .to_str()?
+        .split(':')
+        .map(|d| Path::new(d).join(cmd))
+        .find(|p| executable(p))
 }
