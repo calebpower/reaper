@@ -1751,26 +1751,35 @@ pub fn doctor(
                 }
                 match s.heartbeat_pid {
                     Some(pid) if proc::looks_like_heartbeat(pid) == Some(true) => {
-                        // Renewal claims to be running; the log should agree.
-                        let log = store
-                            .path()
-                            .with_file_name(format!("heartbeat-{}.log", s.name));
-                        if let Ok(meta) = std::fs::metadata(&log) {
-                            if let Ok(age) = meta
-                                .modified()
-                                .ok()
-                                .and_then(|m| now.duration_since(m).ok())
-                                .ok_or(())
-                            {
-                                if age > cfg.session.heartbeat_interval * 2 {
+                        // Ask the expiry, not the log. A heartbeat writes to
+                        // its log only when it has something to SAY -- a
+                        // successful renewal says nothing -- so the log's mtime
+                        // freezes at session creation and reports every healthy
+                        // session as stalled once it is older than two
+                        // intervals. Measured: over 341s the expiry moved 301s
+                        // and the log moved 0s.
+                        //
+                        // Renewal pushes the expiry to now + ttl every
+                        // interval, so remaining should stay within an interval
+                        // or so of the full ttl. Letting it decay past two is
+                        // the symptom of a heartbeat that is running but no
+                        // longer renewing -- which is exactly what the old
+                        // check meant to catch, and could not.
+                        if let Some(remaining) = s.remaining(now) {
+                            let floor = s
+                                .ttl
+                                .checked_sub(cfg.session.heartbeat_interval * 2);
+                            if let Some(floor) = floor {
+                                if remaining < floor {
                                     if worst == Health::Ok {
                                         worst = Health::Warn;
                                     }
                                     notes.push(format!(
-                                        "its heartbeat is alive but the log has \
-                                         not moved in {}s -- renewal may not be \
-                                         happening",
-                                        age.as_secs()
+                                        "its heartbeat is alive but the expiry \
+                                         has decayed to {}s of a {}s ttl -- \
+                                         renewal may not be happening",
+                                        remaining.as_secs(),
+                                        s.ttl.as_secs()
                                     ));
                                 }
                             }
