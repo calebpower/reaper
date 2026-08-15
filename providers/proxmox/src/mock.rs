@@ -489,7 +489,6 @@ fn route(s: &mut State, method: &str, path: &str, body: &str) -> (u16, Value) {
                 }
                 (200, json!({ "data": cfg }))
             }
-            None => unreachable!("handled above"),
         },
 
         // How much room a storage has. The stand-in is generous unless a test

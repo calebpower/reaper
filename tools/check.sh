@@ -25,6 +25,16 @@ run() { # run <label> <command...>
     fi
 }
 
+# Warnings are errors here, every target -- tests and benches included. A
+# warning the compiler prints and nobody reads is a decision this project
+# quietly made; a release build that fails on a stricter machine is how that
+# decision got noticed. Its own target directory, so the strict flags do not
+# thrash the ordinary build cache.
+rust_warnings() {
+    RUSTFLAGS="-D warnings" CARGO_TARGET_DIR=target/warnings         cargo build --workspace --all-targets --locked --quiet
+}
+
+run "rust warnings"    rust_warnings
 run "shell lint"       ./tools/lint-shell.sh
 run "seam guards"      ./tools/guards.sh
 run "invariants"       ./tools/invariants.sh

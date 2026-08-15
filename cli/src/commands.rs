@@ -1514,10 +1514,10 @@ fn collect_last_results(cfg: &Config, s: &Session, manifest_path: Option<&Path>)
 
 /// What the report added up to. `main` maps this to the exit contract
 /// (0 healthy-or-warned / 1 any failure / 2 doctor itself could not run),
-/// which the generic Ok/Err mapping cannot express.
+/// which the generic Ok/Err mapping cannot express. Only the failure count
+/// crosses this boundary: the ok/warn tallies live in the printed report,
+/// and a field nothing reads is a warning the strict build rightly refuses.
 pub struct DoctorVerdict {
-    pub ok: usize,
-    pub warn: usize,
     pub fail: usize,
 }
 
@@ -1586,7 +1586,7 @@ pub fn doctor(
         Err(e) => {
             r.line("site configuration", Health::Fail, &e.to_string());
             println!("\n{} ok, {} warnings, {} failed", r.ok, r.warn, r.fail);
-            return Ok(DoctorVerdict { ok: r.ok, warn: r.warn, fail: r.fail });
+            return Ok(DoctorVerdict { fail: r.fail });
         }
     };
     r.line(
@@ -1700,7 +1700,7 @@ pub fn doctor(
                  against the machines they claim",
             );
             println!("\n{} ok, {} warnings, {} failed", r.ok, r.warn, r.fail);
-            return Ok(DoctorVerdict { ok: r.ok, warn: r.warn, fail: r.fail });
+            return Ok(DoctorVerdict { fail: r.fail });
         }
     };
     let guests: Vec<reaper_core::RegisteredGuest> = cfg
@@ -1814,7 +1814,7 @@ pub fn doctor(
     }
 
     println!("\n{} ok, {} warnings, {} failed", r.ok, r.warn, r.fail);
-    Ok(DoctorVerdict { ok: r.ok, warn: r.warn, fail: r.fail })
+    Ok(DoctorVerdict { fail: r.fail })
 }
 
 /// The active sweeper check: make a machine that is expired from birth, and
