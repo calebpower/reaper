@@ -217,6 +217,32 @@ impl Store {
         &self.path
     }
 
+    /// Refuse early if this store could not be written to.
+    ///
+    /// The record is the only thing that lets `down` find a machine later, so
+    /// a caller about to spend one wants this answered first. The probe never
+    /// creates the store file itself: an empty sessions.json would read as
+    /// corrupt, so an absent file is probed through its parent directory.
+    pub fn probe_writable(&self) -> Result<()> {
+        let io_err = |path: &Path, e: std::io::Error| StoreError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        };
+        if self.path.exists() {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&self.path)
+                .map_err(|e| io_err(&self.path, e))?;
+            return Ok(());
+        }
+        let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(dir).map_err(|e| io_err(dir, e))?;
+        let probe = dir.join(format!(".reaper-probe.{}", std::process::id()));
+        fs::write(&probe, b"").map_err(|e| io_err(&self.path, e))?;
+        let _ = fs::remove_file(&probe);
+        Ok(())
+    }
+
     pub fn list(&self) -> Result<Vec<Session>> {
         Ok(self.read()?.sessions.into_values().collect())
     }

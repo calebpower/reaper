@@ -124,6 +124,21 @@ pub fn up(
         }
     }
 
+    // Cheap checks before expensive spending: a machine created ahead of
+    // these failing is a machine wasted -- unreachable forever without the
+    // key, or unfindable later without a writable record.
+    store.probe_writable()?;
+    if let Some(key) = &cfg.session.ssh_key {
+        if !key.exists() {
+            return Err(format!(
+                "session.ssh_key {} does not exist, so no session could ever                  be reached. Fix the path in {} before creating machines",
+                key.display(),
+                cfg.path.display()
+            )
+            .into());
+        }
+    }
+
     let ttl = ttl_for(&cfg, &manifest, profile.as_deref(), ttl.as_deref())?;
     // From the manifest, not the selection: `up --guest a` in a two-guest
     // manifest must produce the same name a plain `up` would, or the two
@@ -364,6 +379,22 @@ const PRISTINE: &str = "pristine";
 const JOB_PATH: &str = "/tmp/reaper-job.sh";
 
 /// A file this session owns, beside the session store.
+/// Remove what a session accumulated on the workstation, when the session
+/// itself is forgotten: its known-hosts file, its rsh wrapper, its heartbeat
+/// log. Tied to the forgetting, not the destroying -- a kept session keeps
+/// its files, because the rsh wrapper is how the next attempt reaches it.
+/// Best-effort: a file that will not delete is not worth failing a down over.
+fn forget_workstation_files(session: &str) {
+    let store = Store::open();
+    for name in [
+        format!("known-hosts-{session}"),
+        format!("rsh-{session}"),
+        format!("heartbeat-{session}.log"),
+    ] {
+        let _ = std::fs::remove_file(store.path().with_file_name(name));
+    }
+}
+
 fn state_file(session: &str, prefix: &str) -> Result<PathBuf> {
     let path = Store::open()
         .path()
@@ -699,6 +730,7 @@ pub fn down(session: Option<String>, all: bool, manifest_path: Option<PathBuf>) 
         match provider.destroy(&s.machine) {
             Ok(()) => {
                 store.remove(&s.name)?;
+                forget_workstation_files(&s.name);
                 println!("{}: destroyed", s.name);
             }
             // Already gone. The usual reason is the happy one: the session
@@ -707,6 +739,7 @@ pub fn down(session: Option<String>, all: bool, manifest_path: Option<PathBuf>) 
             // cannot get rid of, so destroy is idempotent.
             Err(reaper_core::ProviderError::NotFound(_)) => {
                 store.remove(&s.name)?;
+                forget_workstation_files(&s.name);
                 println!("{}: already gone; forgotten", s.name);
             }
             Err(e) => {

@@ -1823,3 +1823,109 @@ fn a_destroy_the_hypervisor_refuses_keeps_the_session_visible() {
         "forgetting a machine that still exists would hide it"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Battery: what `up` spends before checking, and what a session leaves
+// behind on the workstation. Written before the fixes and watched failing.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn down_leaves_no_per_session_droppings_on_the_workstation() {
+    // Fourteen files from long-destroyed sessions were sitting in the real
+    // state directory when somebody finally looked: a heartbeat log, a
+    // known-hosts file and an rsh wrapper per session, kept forever. The
+    // project that counts leaked directories does not get to litter its own.
+    let h = Harness::new("droppings");
+    h.ok(&["up"]);
+    h.ok(&["sync"]);
+    h.ok(&["down"]);
+    for leftover in ["known-hosts-a-project", "rsh-a-project", "heartbeat-a-project.log"] {
+        assert!(
+            !h.dir.join(leftover).exists(),
+            "{leftover} outlived its session"
+        );
+    }
+}
+
+#[test]
+fn a_failed_down_keeps_the_sessions_workstation_files() {
+    // The cleanup must be tied to the forgetting: a session that could not
+    // be destroyed keeps its record, and its files with it -- the rsh
+    // wrapper is how the next attempt will reach the machine.
+    let h = Harness::new("keepfiles");
+    h.ok(&["up"]);
+    h.ok(&["sync"]);
+    let m = h.hypervisor.machine_named("a-project").expect("machine");
+    h.hypervisor.protect(&m);
+    h.fails(&["down"]);
+    assert!(
+        h.dir.join("rsh-a-project").exists(),
+        "a kept session keeps its transport"
+    );
+}
+
+#[test]
+fn up_refuses_an_unwritable_store_before_spending_a_machine() {
+    // The session record is the only thing that lets `down` find the machine
+    // later. Discovering the store is unwritable AFTER the clone leaves a
+    // machine running on its grace with no record -- the exact shape of loss
+    // the record exists to prevent. Refuse first; a machine is the expensive
+    // half.
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new("rostore");
+    let ro = h.dir.join("ro-state");
+    std::fs::create_dir_all(&ro).unwrap();
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // Root ignores modes (the in-guest suite runs as root); assert only what
+    // this world can enforce, and never a spent machine either way.
+    let wedge_holds = std::fs::write(ro.join("probe"), "").is_err();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_reaper"))
+        .args(["up"])
+        .current_dir(&h.dir)
+        .env("REAPER_CONFIG", h.dir.join("config.toml"))
+        .env("REAPER_STATE", ro.join("sessions.json"))
+        .output()
+        .expect("run reaper");
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    if wedge_holds {
+        assert!(!out.status.success(), "an unwritable store is a refusal");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("sessions.json"), "name the path: {err}");
+        assert!(
+            h.machines().is_empty(),
+            "the refusal must come before the machine is spent"
+        );
+    } else {
+        assert!(out.status.success(), "writable after all, so up proceeds");
+    }
+}
+
+#[test]
+fn up_refuses_a_missing_ssh_key_before_spending_a_machine() {
+    // Without the key no session is ever reachable, so a machine created
+    // first is a machine wasted -- it would sit for the whole readiness
+    // grace failing every connection, then need a manual down.
+    let h = Harness::new("nokey");
+    // Short, so a regression fails in seconds; the bug this test was written
+    // against polled the full grace with a key that could never work.
+    h.amend_config("ready_grace", "2s");
+    h.amend_config("ssh_command", "/nonexistent/reaper-test-ssh");
+    let cfg = std::fs::read_to_string(h.dir.join("config.toml")).unwrap();
+    let cfg = cfg.replace(
+        "ssh_user = \"root\"",
+        "ssh_user = \"root\"\nssh_key = \"/nonexistent/reaper-test-key\"",
+    );
+    std::fs::write(h.dir.join("config.toml"), cfg).unwrap();
+
+    let err = h.fails(&["up"]);
+    assert!(
+        err.contains("/nonexistent/reaper-test-key"),
+        "name the missing key: {err}"
+    );
+    assert!(
+        h.machines().is_empty(),
+        "the refusal must come before the machine is spent"
+    );
+}
