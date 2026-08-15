@@ -524,16 +524,30 @@ impl Provider for Proxmox {
 
         let data = match self.client.get(&path) {
             Ok(d) => d,
-            // Before the guest agent is up, asking is not an error -- it is the
-            // ordinary state of a machine that has only just been started. PVE
-            // answers that state with a 500 naming the agent, and a *missing*
-            // machine with a 500 naming its configuration file -- so the text
-            // is, regrettably, the only thing that separates "keep waiting"
-            // from "it was destroyed under you".
+            // Before the guest agent is up, asking is not an error -- it is
+            // the ordinary state of a machine that has only just been started.
+            // Observed live: "QEMU guest agent is not running" while booting,
+            // and "VM <id> is not running" for a machine that is (perhaps
+            // momentarily) stopped. Neither has an address to report yet.
             Err(ProviderError::Api { message, .. })
-                if message.contains("guest agent") =>
+                if message.contains("guest agent") || message.contains("is not running") =>
             {
                 return Ok(None);
+            }
+            // A machine that is *gone* answers differently depending on the
+            // token: a pool-scoped one gets 403, because the ACL check
+            // precedes the existence check (the same trap still_exists
+            // documents); a root-ish one gets a 500 naming the missing
+            // configuration file. Text alone cannot be trusted for the 403 --
+            // it reads like a permission problem -- so the cluster listing
+            // disambiguates, exactly as it does for destroy.
+            Err(e @ (ProviderError::NotFound(_) | ProviderError::Unauthorized(_))) => {
+                if self.still_exists(id)? {
+                    return Err(e);
+                }
+                return Err(ProviderError::NotFound(format!(
+                    "machine {id} no longer exists"
+                )));
             }
             Err(ProviderError::Api { message, .. })
                 if message.contains("does not exist") =>

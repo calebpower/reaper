@@ -315,7 +315,12 @@ fn wait_until_reachable(
             // still polling. Saying so beats surfacing a raw NotFound.
             Err(reaper_core::ProviderError::NotFound(_)) => {
                 return Err(format!(
-                    "{session}: the machine was destroyed while waiting for it to answer -- its readiness grace ({}) ran out, most likely because the clone itself took most of it. session.ready_grace in the site config is the knob",
+                    "{session}: the machine was destroyed while waiting for it \
+                     to answer. The usual reason is the readiness grace ({}) \
+                     running out and the sweeper collecting it -- a slow clone \
+                     eats most of the grace, and session.ready_grace in the \
+                     site config is the knob -- but anything with access may \
+                     have destroyed it",
                     duration::format(cfg.session.ready_grace)
                 )
                 .into());

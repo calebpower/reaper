@@ -328,7 +328,7 @@ fn an_address_is_none_until_the_guest_agent_answers() {
 fn loopback_and_link_local_addresses_are_skipped() {
     let pve = MockPve::start();
     pve.with_state(|s| {
-        s.vms.insert(9001, Vm { name: "a-session".into(), pool: POOL.into(), ..Vm::default() });
+        s.vms.insert(9001, Vm { name: "a-session".into(), pool: POOL.into(), running: true, ..Vm::default() });
         s.agent_interfaces = Some(json!([
             {"name": "lo", "ip-addresses": [
                 {"ip-address": "127.0.0.1", "ip-address-type": "ipv4"},
@@ -354,7 +354,7 @@ fn loopback_and_link_local_addresses_are_skipped() {
 fn an_ipv4_address_is_preferred_over_ipv6() {
     let pve = MockPve::start();
     pve.with_state(|s| {
-        s.vms.insert(9001, Vm { name: "a-session".into(), pool: POOL.into(), ..Vm::default() });
+        s.vms.insert(9001, Vm { name: "a-session".into(), pool: POOL.into(), running: true, ..Vm::default() });
         s.agent_interfaces = Some(json!([
             {"name": "eth0", "ip-addresses": [
                 {"ip-address": "2001:db8::5", "ip-address-type": "ipv6"},
@@ -1177,6 +1177,7 @@ fn a_v6_only_guest_still_yields_its_address() {
     });
     let p = provider_for(&pve);
     let m = p.create(&request("a-session", 1)).expect("create");
+    p.start(&m).expect("start");
     let a = p.address(&m).expect("query").expect("an address");
     assert_eq!(a.to_string(), "2001:db8::7", "global v6 beats loopback and link-local");
 }
@@ -1206,4 +1207,18 @@ fn from_table_refuses_what_its_pieces_refuse() {
         matches!(e, reaper_core::ProviderError::Config(_)),
         "{e}"
     );
+}
+
+#[test]
+fn a_stopped_machine_has_no_address_yet_rather_than_an_error() {
+    // Observed live: PVE answers "VM <id> is not running" (no mention of the
+    // agent) for a machine that exists but is stopped -- momentarily, during
+    // a reboot, or because it crashed. Either way the honest answer to
+    // "what is its address" is "none yet", not a raw API error that kills
+    // the caller's wait loop.
+    let pve = pve_with_template();
+    let p = provider_for(&pve);
+    let m = p.create(&request("a-session", 1)).expect("create");
+    // Created and never started.
+    assert_eq!(p.address(&m).expect("not an error"), None);
 }

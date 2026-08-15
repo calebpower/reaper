@@ -1032,16 +1032,26 @@ fn an_unstealable_stale_lock_ends_in_locked_not_a_spin() {
     // When the stale lock cannot be removed (unwritable directory), the old
     // code skipped both the deadline and the sleep and span forever at 100%
     // CPU. It must give up with Locked like any other contended lock.
+    //
+    // The wedge is an unwritable directory, and that binds only where DAC
+    // binds: run as root -- which is exactly how this suite runs inside a
+    // session -- the "unstealable" lock is simply stolen. Found by the live
+    // loop, not the workstation. So the environment is probed first, and the
+    // assertion matches the world it runs in; what neither world may do is
+    // spin.
     use std::os::unix::fs::PermissionsExt;
     let dir = scratch_dir("wedgedlock");
     let path = dir.join("sessions.json");
     let lock = dir.join("sessions.lock");
+    let probe = dir.join("probe");
     std::fs::write(&lock, "").unwrap();
+    std::fs::write(&probe, "").unwrap();
     let f = std::fs::File::open(&lock).unwrap();
     f.set_modified(SystemTime::now() - Duration::from_secs(3600))
         .unwrap();
     drop(f);
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let wedge_holds = std::fs::remove_file(&probe).is_err();
 
     let store = Store::with_timeouts(&path, Duration::from_millis(300), Duration::from_secs(120));
     let started = std::time::Instant::now();
@@ -1049,12 +1059,18 @@ fn an_unstealable_stale_lock_ends_in_locked_not_a_spin() {
     // Permissions come back BEFORE any assertion: a test that can only be
     // cleaned up when it passes leaks an unremovable directory when it fails.
     std::fs::set_permissions(&*dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let e = result.expect_err("should refuse");
 
-    assert!(
-        matches!(e, crate::session::StoreError::Locked { .. }),
-        "wanted Locked, got {e}"
-    );
+    if wedge_holds {
+        let e = result.expect_err("should refuse");
+        assert!(
+            matches!(e, crate::session::StoreError::Locked { .. }),
+            "wanted Locked, got {e}"
+        );
+    } else {
+        // Privileged: the stale lock is stealable after all, and stealing it
+        // promptly is the correct behavior.
+        result.expect("a stealable stale lock is stolen, not fatal");
+    }
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "took {:?}, which looks like the spin",

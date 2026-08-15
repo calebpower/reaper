@@ -566,13 +566,19 @@ fn route(s: &mut State, method: &str, path: &str, body: &str) -> (u16, Value) {
         }
 
         ("GET", ["nodes", _node, "qemu", id, "agent", "network-get-interfaces"]) => {
-            // Real PVE answers a missing machine with a 500 naming its
-            // configuration file, not a 404 -- the text is all a caller gets.
+            // Observed live on a pool-scoped token: a missing machine answers
+            // 403, because the ACL check precedes the existence check -- same
+            // as status/current below. The permission text is all a caller
+            // gets, and it reads like the wrong problem entirely.
             if lookup(s, id).is_none() {
                 return (
-                    500,
-                    json!({"errors": format!("Configuration file 'nodes/x/qemu-server/{id}.conf' does not exist")}),
+                    403,
+                    json!({"message": format!("Permission check failed (/vms/{id}, VM.GuestAgent.Audit)")}),
                 );
+            }
+            // Observed live: a machine that exists but is stopped.
+            if !s.vms.get(&id.parse::<u32>().unwrap_or(0)).map(|v| v.running).unwrap_or(false) {
+                return (500, json!({"message": format!("VM {id} is not running")}));
             }
             if s.agent_unavailable {
                 return (500, json!({"errors": "QEMU guest agent is not running"}));

@@ -572,6 +572,35 @@ on the sweeper's own VM, which is deliberately not a deploy target for anything
 here, so `cull.sh --dry-run` can only be run there. The cluster was verified
 clean through the API instead.
 
+## Live acceptance, 2026-08-14 (post-hardening, post-TOML)
+
+The ~40 review-driven fixes and the TOML conversion were accepted against the
+real cluster in one session, created and destroyed by the same run:
+
+- `up` from `.reaper.toml` in 1m32s; reuse; a killed heartbeat restarted by
+  the next `up`. Cold `test` loop 1m26s, warm 1m47s, warm-with-rollback 1m09s
+  -- the live rollback to `@pristine` took 3s.
+- The first `test` run FAILED honestly (exit 1) and did not take `@pristine`:
+  the in-guest suite runs as root, and the new wedged-lock test assumed an
+  unwritable directory binds. The workstation could never have shown this;
+  the loop found it in one pass, the test now probes which world it is in,
+  and the next loop was green and took the snapshot.
+- `snapshot 'x;touch /tmp/...'` arrived in the guest as data, was refused by
+  name validation, exit 1, nothing executed. Named reset worked; a missing
+  point was refused with the runner's sentence, exit 1.
+- `renew --ttl 30m` moved the machine's own tag (verified at the API).
+- A machine destroyed mid-wait (deliberately, via the API) surfaced as "the
+  machine was destroyed while waiting" with exit 1, and `down` then said
+  "already gone; forgotten". This path was REWRITTEN during acceptance:
+  observed live, a pool-scoped token gets 403 for a missing machine -- the
+  ACL check precedes the existence check -- not the 500 the fix had assumed,
+  so address() now disambiguates refusals through the cluster listing instead
+  of trusting message text. A stopped machine ("VM <id> is not running") is
+  "no address yet", not an error.
+- Sweeper dry-run against the live API: saw the session, would reap 0.
+- `down`: results collected, machine destroyed, store empty, zero heartbeat
+  processes, pool restored to exactly the two templates.
+
 ## Decisions taken
 
 | Question | Answer | When |
