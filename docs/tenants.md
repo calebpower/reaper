@@ -6,36 +6,38 @@ do for you.
 
 ## The integration surface is one file
 
-`.reaper.yaml` at your project root. That is the whole of it. There is no
+`.reaper.toml` at your project root. That is the whole of it. There is no
 plugin to write, no interface to implement, no callback to register. If running
 your project here requires editing framework code, the framework has a bug.
 
 See `manifest/schema/v1.json` for the normative schema and
 `manifest/examples/` for worked examples.
 
-```yaml
-schema: 1
-project: my-project
+```toml
+schema = 1
+project = "my-project"
 
-guests: [some-guest-name]        # what the sysadmin registered
-exec: container                  # or: host
+guests = ["some-guest-name"]     # what the sysadmin registered
+exec = "container"               # or: "host"
 
-build:
-  image: registry/toolchain@sha256:...   # container exec only
-  cmd: make build
-  cache: [whatever-you-call-it]
+[build]
+image = "registry.example.com/toolchain@sha256:..."   # container exec only
+cmd = "make build"
+cache = ["whatever-you-call-it"]
 
-run:
-  cmd: make e2e
-  images: [registry/thing@sha256:...]    # optional; pre-pulled for you
+[run]
+cmd = "make e2e"
+images = ["registry.example.com/thing@sha256:..."]    # optional; pre-pulled for you
 
-sync:
-  exclude: [/target/]              # optional; rsync patterns
+[sync]
+exclude = ["/target/"]           # optional; rsync patterns
 
-reset:
-  datasets: [state]
+[reset]
+datasets = ["state"]
 
-resources: { cores: 4, ram_gb: 8 }
+[resources]
+cores = 4
+ram_gb = 8
 ```
 
 ## What the framework promises
@@ -82,28 +84,41 @@ work on more than one operating system says so, and gets a session per guest.
 
 Two forms. Shorthand, when every guest runs the same way:
 
-```yaml
-guests: [ubuntu-lts]
-exec: container
-build: { image: ..., cmd: ..., cache: [...] }
-run:   { cmd: ... }
+```toml
+guests = ["ubuntu-lts"]
+exec = "container"
+build = { image = "...", cmd = "...", cache = ["..."] }
+run = { cmd = "..." }
 ```
 
 Expanded, when they differ:
 
-```yaml
-guests:
-  - name: some-bsd
-    exec: host                  # no container indirection
-  - name: ubuntu-lts
-    exec: container
-    build: { image: ... }       # this guest needs a toolchain image
-build: { cmd: make test, cache: [obj] }   # defaults both guests inherit
-run:   { cmd: make e2e }
+```toml
+[[guests]]
+name = "some-bsd"
+exec = "host"                   # no container indirection
+
+[[guests]]
+name = "ubuntu-lts"
+exec = "container"
+build = { image = "..." }       # this guest needs a toolchain image
+
+[build]                         # defaults both guests inherit
+cmd = "make test"
+cache = ["obj"]
+
+[run]
+cmd = "make e2e"
 ```
 
+One TOML note: an array cannot mix bare strings with tables that span lines,
+so a guests list mixing shorthand and overrides writes the overrides as inline
+tables -- `guests = ["plain", { name = "other", exec = "host" }]` -- and a list
+where every guest carries overrides reads best as `[[guests]]` tables, as
+above.
+
 Per-guest keys override the top-level defaults, key by key within the block:
-override `build: {env: ...}` and the top level's `cmd` is still inherited. But
+override `build = { env = ... }` and the top level's `cmd` is still inherited. But
 each key is replaced whole, and `env` is one key -- override one variable and
 every top-level variable the guest did not restate is gone, not merged under
 yours. Restate the whole `env` you mean.
@@ -111,12 +126,12 @@ yours. Restate the whole `env` you mean.
 ## Container execution or host execution
 
 `exec` must be stated -- at the top level, per guest, or per verb; a manifest
-that never says is refused rather than guessed at. `exec: container` is the
+that never says is refused rather than guessed at. `exec = "container"` is the
 better answer where it fits: your toolchain arrives as a digest-pinned image,
 the guest template stays generic, and what you build with is exactly what you
 declared.
 
-`exec: host` runs your commands directly in the guest, with the toolchain
+`exec = "host"` runs your commands directly in the guest, with the toolchain
 supplied by the template. Choose it when containers cannot give you what you
 need -- a suite that must exercise the host operating system's own facilities is
 the clear case, and a guest whose container engine cannot run native binaries is
@@ -131,14 +146,16 @@ you said it was. Pick deliberately.
 
 `exec` at the top level is a default. Either verb may override it:
 
-```yaml
-exec: container
-build:
-  image: registry/jdk@sha256:...
-  cmd: ./gradlew shadowJar
-run:
-  exec: host                 # brings up a pod, so it needs the engine
-  cmd: e2e/run.sh
+```toml
+exec = "container"
+
+[build]
+image = "registry.example.com/jdk@sha256:..."
+cmd = "./gradlew shadowJar"
+
+[run]
+exec = "host"              # brings up a pod, so it needs the engine
+cmd = "e2e/run.sh"
 ```
 
 This is not a nicety. A toolchain image carries a compiler and no
@@ -168,20 +185,22 @@ likes. What it cannot do is supply node, or python, or a JDK.
 So put those in a container too. Bring up your stack *and your test driver* as
 containers from a `run.cmd` that uses nothing but the engine:
 
-```yaml
-exec: container
-build:
-  image: registry/toolchain@sha256:…   # compiles, bundles, produces artifacts
-  cmd: make build
-  cache: [deps]
-run:
-  exec: host                           # only needs the engine, no toolchain
-  cmd: e2e/run.sh                      # which starts db, app, and the driver
+```toml
+exec = "container"
+
+[build]
+image = "registry.example.com/toolchain@sha256:…"  # compiles, bundles, produces artifacts
+cmd = "make build"
+cache = ["deps"]
+
+[run]
+exec = "host"       # only needs the engine, no toolchain
+cmd = "e2e/run.sh"  # which starts db, app, and the driver
 ```
 
 Now the guest needs no toolchain at all, and every version your tests depend on
 is digest-pinned by you rather than baked into a template by a sysadmin. This is
-the shape `manifest/examples/yasss.reaper.yaml` demonstrates.
+the shape `manifest/examples/yasss.reaper.toml` demonstrates.
 
 The alternative — a guest carrying node and python, registered as
 host-execution — is legitimate and the guest contract allows it. But weigh it:
@@ -268,8 +287,8 @@ This one has already caught somebody, and it fails in the worst direction.
 `/bin/sh` is dash on at least one guest here, and **dash has no `pipefail`**. So
 the obvious thing:
 
-```yaml
-cmd: make test-e2e | tee $REAPER_OUT/e2e.log      # WRONG
+```toml
+cmd = "make test-e2e | tee $REAPER_OUT/e2e.log"   # WRONG
 ```
 
 exits with **tee's** status. A failing suite is reported as a pass, `reaper
@@ -279,8 +298,8 @@ a broken state.
 
 Either avoid the pipe:
 
-```yaml
-cmd: make test-e2e > $REAPER_OUT/e2e.log 2>&1
+```toml
+cmd = "make test-e2e > $REAPER_OUT/e2e.log 2>&1"
 ```
 
 or own the status explicitly, by pointing `cmd` at a script of your own with a
@@ -292,8 +311,8 @@ a shell you did not ask for would be a worse surprise than this one.
 
 Your `cmd` is handed to a shell, so it may use those:
 
-```yaml
-cmd: CARGO_TARGET_DIR=$REAPER_CACHE_TARGET cargo build --locked
+```toml
+cmd = "CARGO_TARGET_DIR=$REAPER_CACHE_TARGET cargo build --locked"
 ```
 
 Values under `env` are **not** expanded -- they are passed through exactly as

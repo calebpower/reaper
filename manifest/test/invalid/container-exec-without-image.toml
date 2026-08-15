@@ -1,10 +1,13 @@
 # Container execution with no toolchain image. The other half of the exec
 # conditional: reaper will not guess a base image on the tenant's behalf.
-schema: 1
-project: no-toolchain
-guests: [some-guest]
-exec: container
-build:
-  cmd: make build
-run:
-  cmd: make e2e
+
+schema = 1
+project = "no-toolchain"
+guests = ["some-guest"]
+exec = "container"
+
+[build]
+cmd = "make build"
+
+[run]
+cmd = "make e2e"

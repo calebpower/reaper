@@ -1,4 +1,4 @@
-//! Reading and validating a tenant manifest (`.reaper.yaml`).
+//! Reading and validating a tenant manifest (`.reaper.toml`).
 //!
 //! The manifest is the entire integration surface between a project and reaper,
 //! so this crate is deliberately the only place that knows its shape. The
@@ -34,7 +34,7 @@ pub const SCHEMA: &str = include_str!("../schema/v1.json");
 pub enum Error {
     /// The file could not be read.
     Read { path: String, source: std::io::Error },
-    /// The file is not parseable as YAML, or is not expressible as JSON.
+    /// The file is not parseable as TOML, or is not expressible as JSON.
     Parse { path: String, message: String },
     /// The manifest is well-formed but does not satisfy the schema. Every
     /// problem is reported, not just the first: a caller fixing one at a time
@@ -187,10 +187,15 @@ pub fn load(path: &Path) -> Result<Manifest, Error> {
 
 /// As [`load`], for a manifest already in memory. `origin` names it in errors.
 pub fn from_str(text: &str, origin: &str) -> Result<Manifest, Error> {
-    // YAML in, JSON model out. A YAML document that cannot be represented as
-    // JSON -- a non-string mapping key, say -- fails here, which is right: the
-    // schema describes a JSON shape.
-    let doc: Value = serde_yaml_ng::from_str(text).map_err(|e| Error::Parse {
+    // TOML in, JSON model out -- the same language as the site config, so a
+    // tenant never has to remember which file speaks which syntax. The schema
+    // describes a JSON shape, and everything a manifest may contain (tables,
+    // arrays, strings, integers, booleans) crosses to JSON exactly.
+    let parsed: toml::Value = toml::from_str(text).map_err(|e| Error::Parse {
+        path: origin.to_string(),
+        message: e.to_string(),
+    })?;
+    let doc: Value = serde_json::to_value(parsed).map_err(|e| Error::Parse {
         path: origin.to_string(),
         message: e.to_string(),
     })?;

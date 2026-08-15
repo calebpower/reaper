@@ -2,12 +2,15 @@
 # the guest builds on the host, so there is no build.image to fall back to.
 # Caught here rather than deep inside a guest, where it would read as an engine
 # fault rather than a manifest one.
-schema: 1
-project: no-image-anywhere
-guests: [some-guest]
-exec: host
-build:
-  cmd: make
-run:
-  exec: container
-  cmd: make check
+
+schema = 1
+project = "no-image-anywhere"
+guests = ["some-guest"]
+exec = "host"
+
+[build]
+cmd = "make"
+
+[run]
+exec = "container"
+cmd = "make check"

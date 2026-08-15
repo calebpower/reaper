@@ -3,13 +3,16 @@
 # toolchain image does not carry. This is the shape a real containerized web
 # service takes, and it was unexpressible before execution mode became a
 # property of a verb.
-schema: 1
-project: split-modes
-guests: [some-guest]
-exec: container
-build:
-  image: docker.io/library/example@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
-  cmd: ./build.sh
-run:
-  exec: host
-  cmd: e2e/run.sh
+
+schema = 1
+project = "split-modes"
+guests = ["some-guest"]
+exec = "container"
+
+[build]
+image = "docker.io/library/example@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+cmd = "./build.sh"
+
+[run]
+exec = "host"
+cmd = "e2e/run.sh"

@@ -1,0 +1,15 @@
+# The duration parser refuses anything past ten years; a profile TTL the
+# parser would refuse should not validate and then fail at `up`.
+
+schema = 1
+project = "forever"
+guests = ["some-guest"]
+exec = "host"
+
+[run]
+cmd = "make check"
+
+[profiles]
+
+[profiles.dev]
+ttl = "9999999999s"

@@ -22,7 +22,7 @@ be a worse kind of wrong -- an example that looks verified and is not.
 
 ## What each one demonstrates
 
-|  | `yasss.reaper.yaml` | `bgone.reaper.yaml` |
+|  | `yasss.reaper.toml` | `bgone.reaper.toml` |
 |---|---|---|
 | Shape | JVM web service | Rust command-line tool |
 | Stack | database + mail catcher + app in one pod | none: a process and temp trees |

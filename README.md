@@ -37,7 +37,7 @@ Fixed, because the three components are easy to conflate:
 Three components, strictly layered; each knows less than the one above it.
 
 **The CLI** runs on your workstation, in your project's checkout. It reads
-`.reaper.yaml`, talks to a provider, and talks to the runner over SSH. It owns
+`.reaper.toml`, talks to a provider, and talks to the runner over SSH. It owns
 session lifecycle, working-tree sync (which must handle uncommitted trees --
 committing to run your tests is not a thing this asks of you), heartbeat renewal
 of the expiry tag, and pulling result artifacts back into your tree.
@@ -195,37 +195,39 @@ cron; `--dry-run` first.
 
 ### 3. Onboard a project *(once per project)*
 
-Write `.reaper.yaml` at its root. That is the entire integration surface -- no
+Write `.reaper.toml` at its root. That is the entire integration surface -- no
 plugin, no callback, no framework edit:
 
-```yaml
-schema: 1
-project: my-project
-guests: [ubuntu-26.04]        # what the sysadmin registered
-exec: container               # or: host
+```toml
+schema = 1
+project = "my-project"
+guests = ["ubuntu-26.04"]     # what the sysadmin registered
+exec = "container"            # or: "host"
 
-build:
-  image: docker.io/library/rust@sha256:3382bd…   # digest, never a tag
-  cmd: cargo build --locked --tests
-  cache: [cargo, target]
+[build]
+image = "docker.io/library/rust@sha256:3382bd…"   # digest, never a tag
+cmd = "cargo build --locked --tests"
+cache = ["cargo", "target"]
 
-run:
-  cmd: cargo test --workspace
-  images: []                  # pre-pulled for you if you list any
+[run]
+cmd = "cargo test --workspace"
+images = []                   # pre-pulled for you if you list any
 
-sync:
-  exclude: [/target/]         # rsync patterns; out/ is always excluded
+[sync]
+exclude = ["/target/"]        # rsync patterns; out/ is always excluded
 
-reset:
-  datasets: [state]
+[reset]
+datasets = ["state"]
 
-resources: { cores: 4, ram_gb: 8 }
+[resources]
+cores = 4
+ram_gb = 8
 ```
 
 Check it before you need it:
 
 ```sh
-reaper-manifest-validate .reaper.yaml
+reaper-manifest-validate .reaper.toml
 ```
 
 Three things to get right, because they are where projects actually stumble:
@@ -314,7 +316,7 @@ needs a user login.
 
 ### 6. This repository is its own first tenant
 
-The `.reaper.yaml` at the root is real, not an example. `reaper test` here runs
+The `.reaper.toml` at the root is real, not an example. `reaper test` here runs
 reaper's whole battery -- Rust suites, shell suites and seam guards -- inside a
 session. It has already caught three portability bugs that a workstation-only
 run could not, and that is the reason it exists.

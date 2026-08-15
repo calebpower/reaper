@@ -52,20 +52,20 @@ echo "this project's own manifest -- must be accepted"
 # reaper is a tenant of itself, and that manifest is the only one in this
 # repository that a session actually runs. A change that broke it would
 # otherwise be found by a nine-minute clone rather than by this suite.
-expect 0 "accepted" "${root}/.reaper.yaml"
+expect 0 "accepted" "${root}/.reaper.toml"
 
 echo "worked examples -- must be accepted"
-for f in "${root}"/manifest/examples/*.yaml; do
+for f in "${root}"/manifest/examples/*.toml; do
     expect 0 "accepted" "${f}"
 done
 
 echo "valid fixtures -- must be accepted"
-for f in "${here}"/valid/*.yaml; do
+for f in "${here}"/valid/*.toml; do
     expect 0 "accepted" "${f}"
 done
 
 echo "invalid fixtures -- must be rejected"
-for f in "${here}"/invalid/*.yaml; do
+for f in "${here}"/invalid/*.toml; do
     expect 1 "rejected" "${f}"
 done
 

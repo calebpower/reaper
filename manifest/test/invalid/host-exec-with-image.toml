@@ -1,0 +1,14 @@
+# exec: host on the guest, build.image at the top level. Neither location is
+# wrong on its own; only the merged form is incoherent. This fixture fails only
+# if the second validation pass resolves before checking.
+
+schema = 1
+project = "split-across-scopes"
+guests = [{ name = "some-guest", exec = "host" }]
+
+[build]
+image = "docker.io/library/example@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+cmd = "cargo build"
+
+[run]
+cmd = "cargo test"

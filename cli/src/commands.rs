@@ -31,7 +31,7 @@ fn provider_for(cfg: &Config) -> Result<Box<dyn Provider>> {
 /// synced. Taken from the manifest rather than from the current directory, so
 /// `--manifest` points at a project rather than just at a file.
 fn load_manifest_at(explicit: Option<PathBuf>) -> Result<(Manifest, PathBuf)> {
-    let path = explicit.clone().unwrap_or_else(|| PathBuf::from(".reaper.yaml"));
+    let path = explicit.clone().unwrap_or_else(|| PathBuf::from(".reaper.toml"));
     let root = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -41,7 +41,7 @@ fn load_manifest_at(explicit: Option<PathBuf>) -> Result<(Manifest, PathBuf)> {
 }
 
 fn load_manifest(explicit: Option<PathBuf>) -> Result<Manifest> {
-    let path = explicit.unwrap_or_else(|| PathBuf::from(".reaper.yaml"));
+    let path = explicit.unwrap_or_else(|| PathBuf::from(".reaper.toml"));
     if !path.exists() {
         return Err(format!(
             "no manifest at {}. reaper is run from inside a project; \
@@ -568,18 +568,18 @@ fn implied_sessions(
 
     // The project is passed in by any verb that has already read a manifest, so
     // that `--manifest` means the same thing everywhere. It used to be read
-    // from `.reaper.yaml` here regardless, which made `--manifest` decide what
+    // from `.reaper.toml` here regardless, which made `--manifest` decide what
     // to run while the current directory decided where to run it -- and pointed
-    // at a project with no sessions, `reaper sync --manifest other.yaml` failed
+    // at a project with no sessions, `reaper sync --manifest other.toml` failed
     // saying there were no sessions for a project it had not been asked about.
     let project = match project {
         Some(p) => p.to_string(),
         None => {
-            let here = Path::new(".reaper.yaml");
+            let here = Path::new(".reaper.toml");
             if !here.exists() {
                 return Err(
                     "not inside a project, so there is nothing implied. Name a session, or run \
-                     this where a .reaper.yaml is"
+                     this where a .reaper.toml is"
                         .into(),
                 );
             }
@@ -815,7 +815,7 @@ fn tree_for(s: &Session, manifest_path: Option<&Path>) -> Option<PathBuf> {
         }
         return None;
     }
-    let here = Path::new(".reaper.yaml");
+    let here = Path::new(".reaper.toml");
     let project = reaper_manifest::load(here).ok()?.project;
     (project == s.project).then(|| PathBuf::from("."))
 }
@@ -1045,7 +1045,7 @@ pub fn snapshot(
     if datasets.is_empty() {
         return Err(format!(
             "{} declares no reset datasets, so there is no state to name a point in. \
-             Add `reset: {{ datasets: [state] }}` to the manifest",
+             Add `[reset]` with `datasets = [\"state\"]` to the manifest",
             manifest.project
         )
         .into());
@@ -1081,7 +1081,7 @@ pub fn reset(
     if datasets.is_empty() {
         return Err(format!(
             "{} declares no reset datasets, so there is nothing to roll back. \
-             Add `reset: {{ datasets: [state] }}` to the manifest",
+             Add `[reset]` with `datasets = [\"state\"]` to the manifest",
             manifest.project
         )
         .into());

@@ -135,14 +135,15 @@ exit 0
             None,
         );
         write(
-            &dir.join(".reaper.yaml"),
+            &dir.join(".reaper.toml"),
             r#"
-schema: 1
-project: a-project
-guests: [a-guest]
-exec: host
-run:
-  cmd: make check
+schema = 1
+project = "a-project"
+guests = ["a-guest"]
+exec = "host"
+
+[run]
+cmd = "make check"
 "#,
             None,
         );
@@ -296,14 +297,15 @@ fn an_unregistered_guest_is_refused_before_anything_is_created() {
     // A typo should cost nothing, and certainly not a machine.
     let h = Harness::new("unregistered");
     write(
-        &h.dir.join(".reaper.yaml"),
+        &h.dir.join(".reaper.toml"),
         r#"
-schema: 1
-project: a-project
-guests: [never-registered]
-exec: host
-run:
-  cmd: make check
+schema = 1
+project = "a-project"
+guests = ["never-registered"]
+exec = "host"
+
+[run]
+cmd = "make check"
 "#,
         None,
     );
@@ -320,15 +322,15 @@ fn the_concurrency_cap_is_enforced() {
     // The cap is two; three projects cannot all be up.
     for project in ["one", "two"] {
         write(
-            &h.dir.join(".reaper.yaml"),
-            &format!("schema: 1\nproject: {project}\nguests: [a-guest]\nexec: host\nrun:\n  cmd: make check\n"),
+            &h.dir.join(".reaper.toml"),
+            &format!("schema = 1\nproject = \"{project}\"\nguests = [\"a-guest\"]\nexec = \"host\"\n[run]\ncmd = \"make check\"\n"),
             None,
         );
         h.ok(&["up"]);
     }
     write(
-        &h.dir.join(".reaper.yaml"),
-        "schema: 1\nproject: three\nguests: [a-guest]\nexec: host\nrun:\n  cmd: make check\n",
+        &h.dir.join(".reaper.toml"),
+        "schema = 1\nproject = \"three\"\nguests = [\"a-guest\"]\nexec = \"host\"\n[run]\ncmd = \"make check\"\n",
         None,
     );
 
@@ -380,7 +382,7 @@ fn down_forgets_a_session_whose_machine_something_else_already_collected() {
 #[test]
 fn a_missing_manifest_says_what_to_do_about_it() {
     let h = Harness::new("no-manifest");
-    std::fs::remove_file(h.dir.join(".reaper.yaml")).unwrap();
+    std::fs::remove_file(h.dir.join(".reaper.toml")).unwrap();
     let err = h.fails(&["up"]);
     assert!(err.contains("docs/tenants.md"), "{err}");
 }
@@ -444,9 +446,9 @@ fn a_tenant_can_ask_for_a_bigger_pool_than_the_site_default() {
     // needs more -- so the manifest wins over the site's default.
     let h = Harness::new("disk-override");
     write(
-        &h.dir.join(".reaper.yaml"),
-        "schema: 1\nproject: a-project\nguests: [a-guest]\nexec: host\n\
-         run:\n  cmd: make check\nresources:\n  disk_gb: 200\n",
+        &h.dir.join(".reaper.toml"),
+        "schema = 1\nproject = \"a-project\"\nguests = [\"a-guest\"]\nexec = \"host\"\n\
+         [run]\ncmd = \"make check\"\n[resources]\ndisk_gb = 200\n",
         None,
     );
     h.ok(&["up"]);
@@ -532,37 +534,42 @@ fn a_session_whose_storage_cannot_be_built_is_not_reported_as_ready() {
 
 /// A manifest with both verbs, two caches, a sync exclusion and a cold profile.
 const FULL: &str = r#"
-schema: 1
-project: a-project
-guests: [a-guest]
-exec: container
-build:
-  image: docker.io/library/toolchain@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-  cmd: make build
-  cache: [deps, build-dir]
-  env:
-    SHARED: from-the-build
-    ONLY_BUILD: "1"
-run:
-  exec: host
-  cmd: make check
-  images:
-    - docker.io/library/db@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-sync:
-  exclude: [/scratch/]
-reset:
-  datasets: [state]
-profiles:
-  nightly:
-    warm_cache: false
-    env:
-      SHARED: from-the-profile
+schema = 1
+project = "a-project"
+guests = ["a-guest"]
+exec = "container"
+
+[build]
+image = "docker.io/library/toolchain@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+cmd = "make build"
+cache = ["deps", "build-dir"]
+
+[build.env]
+SHARED = "from-the-build"
+ONLY_BUILD = "1"
+
+[run]
+exec = "host"
+cmd = "make check"
+images = ["docker.io/library/db@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+
+[sync]
+exclude = ["/scratch/"]
+
+[reset]
+datasets = ["state"]
+
+[profiles]
+
+[profiles.nightly]
+warm_cache = false
+env = { SHARED = "from-the-profile" }
 "#;
 
 #[test]
 fn a_sync_pushes_the_tree_and_brings_results_back() {
     let h = Harness::new("sync");
-    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join(".reaper.toml"), FULL, None);
     h.ok(&["up"]);
     h.forget_logs();
 
@@ -599,7 +606,7 @@ fn a_sync_pushes_the_tree_and_brings_results_back() {
 #[test]
 fn a_build_runs_in_the_declared_image_with_its_caches() {
     let h = Harness::new("build");
-    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join(".reaper.toml"), FULL, None);
     h.ok(&["up"]);
     h.ok(&["sync"]);
     h.forget_logs();
@@ -633,7 +640,7 @@ fn a_build_runs_in_the_declared_image_with_its_caches() {
 #[test]
 fn a_run_may_execute_on_the_host_of_a_container_guest() {
     let h = Harness::new("run-host");
-    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join(".reaper.toml"), FULL, None);
     h.ok(&["up"]);
     h.ok(&["sync"]);
     h.forget_logs();
@@ -656,7 +663,7 @@ fn a_run_may_execute_on_the_host_of_a_container_guest() {
 #[test]
 fn a_cold_profile_mounts_no_cache_and_wins_on_environment() {
     let h = Harness::new("cold");
-    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join(".reaper.toml"), FULL, None);
     h.ok(&["up"]);
     h.ok(&["sync"]);
     h.forget_logs();
@@ -686,7 +693,7 @@ fn a_cold_profile_mounts_no_cache_and_wins_on_environment() {
 #[test]
 fn an_unknown_profile_is_refused_by_name() {
     let h = Harness::new("bad-profile");
-    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join(".reaper.toml"), FULL, None);
     h.ok(&["up"]);
 
     let err = h.fails(&["build", "--profile", "does-not-exist"]);
@@ -710,7 +717,7 @@ fn a_project_with_no_build_is_told_so_rather_than_failing_in_the_guest() {
 #[test]
 fn every_declared_image_is_fetched_when_a_session_first_comes_up() {
     let h = Harness::new("prepull");
-    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join(".reaper.toml"), FULL, None);
 
     h.ok(&["up"]);
     let ssh = h.log("ssh.log");
@@ -727,7 +734,7 @@ fn a_session_that_cannot_pre_fetch_is_still_a_usable_session() {
     // A registry outage must cost a slow first build, never a machine that
     // took nine minutes to clone.
     let h = Harness::new("prefetch-refused");
-    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join(".reaper.toml"), FULL, None);
     // Narrow on purpose: the stand-in fails any invocation whose arguments
     // contain this, and every invocation carries the session directory in a
     // path, so a loose pattern breaks steps it was never meant to touch.
@@ -744,7 +751,7 @@ fn a_session_that_cannot_pre_fetch_is_still_a_usable_session() {
 #[test]
 fn results_are_collected_before_a_machine_is_destroyed() {
     let h = Harness::new("down-collects");
-    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join(".reaper.toml"), FULL, None);
     h.ok(&["up"]);
     h.ok(&["sync"]);
     h.forget_logs();
@@ -766,7 +773,7 @@ fn a_session_that_was_never_synced_is_not_asked_for_results() {
     // The workspace was never made, so a pull would fail on a directory that
     // never existed -- and read as though results had been lost.
     let h = Harness::new("down-never-synced");
-    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join(".reaper.toml"), FULL, None);
     h.ok(&["up"]);
     h.forget_logs();
 
@@ -781,7 +788,7 @@ fn a_failed_command_still_gets_its_results_out() {
     // and running `down`, so the trace has to leave before the failure is
     // reported rather than after.
     let h = Harness::new("failure-collects");
-    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join(".reaper.toml"), FULL, None);
     h.ok(&["up"]);
     h.ok(&["sync"]);
     h.forget_logs();
@@ -858,8 +865,8 @@ fn a_machine_that_never_answers_is_left_tagged_rather_than_torn_down() {
 /// `--manifest` has to mean the same thing to every verb.
 ///
 /// It used to decide *what* to run while the current directory decided *which
-/// session to run it on*, so `reaper sync --manifest other.yaml` looked up
-/// sessions for whichever project happened to be in `.reaper.yaml` and failed
+/// session to run it on*, so `reaper sync --manifest other.toml` looked up
+/// sessions for whichever project happened to be in `.reaper.toml` and failed
 /// saying there were none -- naming a project it had not been asked about.
 /// Found live, driving a second guest from a scratch manifest.
 #[test]
@@ -868,28 +875,29 @@ fn a_manifest_elsewhere_decides_the_project_too() {
 
     // The directory's own manifest names one project; the one we pass names
     // another. Only the second has a session.
-    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join(".reaper.toml"), FULL, None);
     write(
-        &h.dir.join("other.yaml"),
+        &h.dir.join("other.toml"),
         r#"
-schema: 1
-project: elsewhere
-guests: [a-guest]
-exec: host
-run:
-  cmd: make check
+schema = 1
+project = "elsewhere"
+guests = ["a-guest"]
+exec = "host"
+
+[run]
+cmd = "make check"
 "#,
         None,
     );
 
-    h.ok(&["up", "--manifest", "other.yaml"]);
+    h.ok(&["up", "--manifest", "other.toml"]);
     assert_eq!(h.machines().len(), 1);
 
     // Both must find the session the passed manifest describes, rather than
     // looking for one belonging to the directory's project.
-    let synced = h.ok(&["sync", "--manifest", "other.yaml"]);
+    let synced = h.ok(&["sync", "--manifest", "other.toml"]);
     assert!(synced.contains("elsewhere"), "{synced}");
-    let ran = h.ok(&["run", "--manifest", "other.yaml"]);
+    let ran = h.ok(&["run", "--manifest", "other.toml"]);
     assert!(ran.contains("elsewhere"), "{ran}");
 
     // And the directory's own project still has no session, which is the
@@ -900,8 +908,8 @@ run:
     // down and renew take it too. They did not, so `reaper down --manifest x`
     // was rejected outright -- and in a script that reads as a session that
     // was taken down when it was not.
-    h.ok(&["renew", "--manifest", "other.yaml"]);
-    h.ok(&["down", "--manifest", "other.yaml"]);
+    h.ok(&["renew", "--manifest", "other.toml"]);
+    h.ok(&["down", "--manifest", "other.toml"]);
     assert!(h.machines().is_empty(), "down must have acted on the right project");
 }
 
@@ -912,7 +920,7 @@ run:
 #[test]
 fn a_run_takes_the_pristine_snapshot_and_says_what_it_captured() {
     let h = Harness::new("pristine");
-    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join(".reaper.toml"), FULL, None);
     h.ok(&["up"]);
     h.ok(&["sync"]);
     h.forget_logs();
@@ -941,7 +949,7 @@ fn a_failed_run_takes_no_snapshot() {
     // Snapshotting a failed run would make every later reset return to a
     // broken state, which is far worse than having no pristine at all.
     let h = Harness::new("pristine-not-after-failure");
-    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join(".reaper.toml"), FULL, None);
     h.ok(&["up"]);
     h.ok(&["sync"]);
     h.forget_logs();
@@ -961,7 +969,7 @@ fn a_failed_run_takes_no_snapshot() {
 #[test]
 fn reset_rolls_back_every_declared_dataset() {
     let h = Harness::new("reset");
-    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join(".reaper.toml"), FULL, None);
     h.ok(&["up"]);
     h.forget_logs();
 
@@ -988,7 +996,7 @@ fn reset_rolls_back_every_declared_dataset() {
 #[test]
 fn snapshot_names_a_point() {
     let h = Harness::new("snapshot");
-    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join(".reaper.toml"), FULL, None);
     h.ok(&["up"]);
     h.forget_logs();
 
@@ -1020,7 +1028,7 @@ fn a_project_with_no_reset_datasets_is_told_so() {
 #[test]
 fn the_reset_trigger_is_started_with_a_session_that_wants_one() {
     let h = Harness::new("trigger");
-    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join(".reaper.toml"), FULL, None);
 
     h.ok(&["up"]);
     assert!(
@@ -1076,7 +1084,7 @@ fn step_order(log: &str) -> Vec<&'static str> {
 #[test]
 fn test_runs_the_four_steps_in_order() {
     let h = Harness::new("loop-order");
-    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join(".reaper.toml"), FULL, None);
     // A session that has already had a successful run, so there is a pristine
     // and the reset step has somewhere to go.
     write(&h.dir.join("snapshots"), "pristine\n", None);
@@ -1103,7 +1111,7 @@ fn the_first_test_on_a_session_does_not_reset() {
     // nothing to do with the project. `run` takes the snapshot at the end of
     // this pass, and every later `test` gets all four steps.
     let h = Harness::new("loop-first");
-    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join(".reaper.toml"), FULL, None);
     write(&h.dir.join("snapshots"), "", None);
     h.ok(&["up"]);
     h.forget_logs();
@@ -1146,7 +1154,7 @@ fn test_skips_the_steps_a_project_does_not_have() {
 #[test]
 fn a_failing_step_stops_the_ones_after_it() {
     let h = Harness::new("loop-stops");
-    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join(".reaper.toml"), FULL, None);
     write(&h.dir.join("snapshots"), "pristine\n", None);
     h.ok(&["up"]);
     h.forget_logs();
@@ -1192,7 +1200,7 @@ fn the_cap_counts_the_cluster_and_not_just_this_workstation() {
 #[test]
 fn test_can_reset_to_a_named_point() {
     let h = Harness::new("loop-named");
-    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join(".reaper.toml"), FULL, None);
     write(&h.dir.join("snapshots"), "pristine\nafter-stack-up\n", None);
     h.ok(&["up"]);
     h.forget_logs();
@@ -1214,7 +1222,7 @@ fn a_named_point_that_does_not_exist_is_an_error_not_a_skip() {
     // the tenant typed and that is not there is very likely a typo, and
     // skipping it would run the command against whatever state was lying about.
     let h = Harness::new("loop-named-missing");
-    write(&h.dir.join(".reaper.yaml"), FULL, None);
+    write(&h.dir.join(".reaper.toml"), FULL, None);
     write(&h.dir.join("snapshots"), "pristine\n", None);
     h.ok(&["up"]);
     h.forget_logs();
@@ -1251,12 +1259,13 @@ impl Harness {
 }
 
 const TWO_GUESTS: &str = r#"
-schema: 1
-project: a-project
-guests: [a-guest, b-guest]
-exec: host
-run:
-  cmd: make check
+schema = 1
+project = "a-project"
+guests = ["a-guest", "b-guest"]
+exec = "host"
+
+[run]
+cmd = "make check"
 "#;
 
 #[test]
@@ -1266,7 +1275,7 @@ fn selecting_one_guest_of_two_names_the_session_the_same_way() {
     // not see it and brought up a second machine for the same guest.
     let h = Harness::new("guestname");
     h.add_guest("b-guest");
-    write(&h.dir.join(".reaper.yaml"), TWO_GUESTS, None);
+    write(&h.dir.join(".reaper.toml"), TWO_GUESTS, None);
 
     let out = h.ok(&["up", "--guest", "a-guest"]);
     assert!(
@@ -1292,18 +1301,15 @@ fn a_guest_without_a_build_is_skipped_not_fatal() {
     let h = Harness::new("mixedbuild");
     h.add_guest("b-guest");
     write(
-        &h.dir.join(".reaper.yaml"),
+        &h.dir.join(".reaper.toml"),
         r#"
-schema: 1
-project: a-project
-guests:
-  - name: a-guest
-    build:
-      cmd: make prep
-  - b-guest
-exec: host
-run:
-  cmd: make check
+schema = 1
+project = "a-project"
+guests = [{ name = "a-guest", build = { cmd = "make prep" } }, "b-guest"]
+exec = "host"
+
+[run]
+cmd = "make check"
 "#,
         None,
     );
@@ -1332,16 +1338,18 @@ fn a_session_without_the_point_skips_only_itself() {
     let h = Harness::new("resetpair");
     h.add_guest("b-guest");
     write(
-        &h.dir.join(".reaper.yaml"),
+        &h.dir.join(".reaper.toml"),
         r#"
-schema: 1
-project: a-project
-guests: [a-guest, b-guest]
-exec: host
-run:
-  cmd: make check
-reset:
-  datasets: [state]
+schema = 1
+project = "a-project"
+guests = ["a-guest", "b-guest"]
+exec = "host"
+
+[run]
+cmd = "make check"
+
+[reset]
+datasets = ["state"]
 "#,
         None,
     );
@@ -1380,16 +1388,18 @@ fn a_snapshot_name_reaches_the_guest_as_data_not_shell() {
     // the command line. Unquoted, `a;boom` runs boom.
     let h = Harness::new("snapquote");
     write(
-        &h.dir.join(".reaper.yaml"),
+        &h.dir.join(".reaper.toml"),
         r#"
-schema: 1
-project: a-project
-guests: [a-guest]
-exec: host
-run:
-  cmd: make check
-reset:
-  datasets: [state]
+schema = 1
+project = "a-project"
+guests = ["a-guest"]
+exec = "host"
+
+[run]
+cmd = "make check"
+
+[reset]
+datasets = ["state"]
 "#,
         None,
     );
@@ -1420,18 +1430,19 @@ fn an_explicit_session_of_another_project_is_refused() {
     let h = Harness::new("crossproj");
     h.ok(&["up"]);
     write(
-        &h.dir.join("other.yaml"),
+        &h.dir.join("other.toml"),
         r#"
-schema: 1
-project: b-project
-guests: [a-guest]
-exec: host
-run:
-  cmd: make check
+schema = 1
+project = "b-project"
+guests = ["a-guest"]
+exec = "host"
+
+[run]
+cmd = "make check"
 "#,
         None,
     );
-    let err = h.fails(&["sync", "a-project", "--manifest", "other.yaml"]);
+    let err = h.fails(&["sync", "a-project", "--manifest", "other.toml"]);
     assert!(err.contains("belongs to"), "{err}");
     assert!(
         !h.log("rsync.log").contains("--delete"),
@@ -1485,7 +1496,7 @@ fn down_with_a_manifest_collects_results_from_anywhere() {
 
     let elsewhere = h.dir.join("elsewhere");
     std::fs::create_dir_all(&elsewhere).unwrap();
-    let manifest = h.dir.join(".reaper.yaml");
+    let manifest = h.dir.join(".reaper.toml");
     let out = h.run_from(&elsewhere, &["down", "--manifest", manifest.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{stdout}");
@@ -1507,17 +1518,20 @@ fn down_with_a_manifest_collects_results_from_anywhere() {
 fn a_profile_ttl_reaches_the_machine() {
     let h = Harness::new("profilettl");
     write(
-        &h.dir.join(".reaper.yaml"),
+        &h.dir.join(".reaper.toml"),
         r#"
-schema: 1
-project: a-project
-guests: [a-guest]
-exec: host
-run:
-  cmd: make check
-profiles:
-  quick:
-    ttl: 1h
+schema = 1
+project = "a-project"
+guests = ["a-guest"]
+exec = "host"
+
+[run]
+cmd = "make check"
+
+[profiles]
+
+[profiles.quick]
+ttl = "1h"
 "#,
         None,
     );

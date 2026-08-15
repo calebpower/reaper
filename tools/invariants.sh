@@ -252,6 +252,21 @@ as a session taken down when it was not."
 
 printf '\n--- the gate: what reviews the reviewers ---\n\n'
 
+# Cal's rule, 2026-08-14: TOML, never YAML. The manifest, the site config and
+# every fixture speak one language now; a YAML file reappearing -- or a YAML
+# parser sneaking back into the dependency tree -- is a regression, not a
+# choice someone gets to make mid-task. (Vendor-mandated YAML *content* inside
+# a guest runbook heredoc is not a file and is not ours; this checks files and
+# dependencies.)
+sources | grep -E '\.(ya?ml)$' | offenders \
+    "no YAML files, ever" \
+    "This project speaks TOML everywhere. Convert the file."
+
+sources | grep -E 'Cargo\.(toml|lock)$' | xargs grep -n 'yaml' 2>/dev/null | offenders \
+    "no YAML parser in the dependency tree" \
+    "Same rule, one level down: a YAML dependency is a YAML surface waiting
+to happen." 
+
 # A plain ls-files lists only what is committed, so a new script is reviewed
 # by nothing until after its first commit -- this battery passed its own gate
 # that way and failed it one commit later, with an identical tree. Every

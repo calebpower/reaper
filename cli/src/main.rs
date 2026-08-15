@@ -38,7 +38,7 @@ enum Command {
         /// Override the time-to-live, e.g. 4h.
         #[arg(long)]
         ttl: Option<String>,
-        /// The manifest to read. Defaults to .reaper.yaml here.
+        /// The manifest to read. Defaults to .reaper.toml here.
         #[arg(long)]
         manifest: Option<PathBuf>,
     },
@@ -47,7 +47,7 @@ enum Command {
     Sync {
         /// Which session. Defaults to every session for this project.
         session: Option<String>,
-        /// The manifest to read, and the tree to sync. Defaults to .reaper.yaml here.
+        /// The manifest to read, and the tree to sync. Defaults to .reaper.toml here.
         #[arg(long)]
         manifest: Option<PathBuf>,
     },
@@ -110,7 +110,7 @@ enum Command {
         session: Option<String>,
         #[arg(long)]
         ttl: Option<String>,
-        /// Which project's sessions. Defaults to .reaper.yaml here.
+        /// Which project's sessions. Defaults to .reaper.toml here.
         #[arg(long)]
         manifest: Option<PathBuf>,
     },
@@ -122,7 +122,7 @@ enum Command {
         /// Every session, not just this project's.
         #[arg(long, conflicts_with = "session")]
         all: bool,
-        /// Which project's sessions. Defaults to .reaper.yaml here.
+        /// Which project's sessions. Defaults to .reaper.toml here.
         #[arg(long)]
         manifest: Option<PathBuf>,
     },

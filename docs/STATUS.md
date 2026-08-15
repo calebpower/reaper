@@ -303,7 +303,7 @@ A container-execution verb gets no engine socket, so a tenant orchestrating
 containers must run that verb on the host — but `ubuntu-26.04` under
 `exec: host` has working podman and can orchestrate anything. What it lacks is a
 *toolchain*, and the answer is to containerize the test driver as well, which is
-the shape `manifest/examples/yasss.reaper.yaml` demonstrates. **No third guest is
+the shape `manifest/examples/yasss.reaper.toml` demonstrates. **No third guest is
 being built**; `docs/tenants.md` now spells the pattern out.
 
 ### `ubuntu-26.04` as a tenant finds it

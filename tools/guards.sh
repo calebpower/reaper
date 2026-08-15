@@ -60,8 +60,8 @@ guard_tenant() {
     # here, which is why this guard needs no exemption for itself: it does not
     # contain the words it polices. Add an example, and it is policed from then
     # on with no edit to this file.
-    names=$(grep -h '^project:' manifest/examples/*.reaper.yaml \
-            | awk '{print $2}' | tr '\n' '|' | sed 's/|$//')
+    names=$(sed -n 's/^project *= *"\([^"]*\)".*/\1/p' manifest/examples/*.reaper.toml \
+            | tr '\n' '|' | sed 's/|$//')
     if [ -z "${names}" ]; then
         echo "FAIL  tenant seam"
         echo "      no project names found in manifest/examples; this guard is"
@@ -74,7 +74,7 @@ guard_tenant() {
         '^(docs/|manifest/examples/)' \
         "\\b(${names})\\b" \
         "A tenant name appeared in framework code. Tenants are configuration:
-they belong in their own .reaper.yaml and in manifest/examples, and
+they belong in their own .reaper.toml and in manifest/examples, and
 nowhere else. If the framework needs to know which project it is
 working on, the manifest is how it finds out."
 }
@@ -93,7 +93,7 @@ guard_guest() {
     # with a platform sub-module; it is a single shell script delivered over
     # SSH, so the directory is the boundary.
     scan "guest seam" \
-        '^(docs/|README\.md$|manifest/examples/|\.reaper\.yaml$|runner/|tools/guards\.sh$)' \
+        '^(docs/|README\.md$|manifest/examples/|\.reaper\.toml$|runner/|tools/guards\.sh$)' \
         'systemctl|systemd|apt-get|dpkg |zfsutils-linux|/dev/(vd|vtbd|sd|nvme)[a-z0-9]|rc\.conf|\brc\.d\b|\b(ubuntu|debian|freebsd|alpine|centos|fedora)\b' \
         "An operating system leaked out of the runner's platform modules. The
 guest seam exists so that adding a system is a template build and a

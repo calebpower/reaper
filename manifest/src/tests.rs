@@ -31,7 +31,7 @@ fn every_shipped_example_loads() {
     let mut seen = 0;
     for entry in std::fs::read_dir(&dir).expect("examples directory") {
         let path = entry.expect("readable entry").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
             continue;
         }
         let m = load(&path).unwrap_or_else(|e| panic!("{} should load: {e}", path.display()));
@@ -68,7 +68,7 @@ fn every_example_verb_agrees_with_its_execution_mode() {
     let dir = fixture("examples");
     for entry in std::fs::read_dir(&dir).expect("examples directory") {
         let path = entry.expect("readable entry").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
             continue;
         }
         for g in &load(&path).expect("loads").guests {
@@ -83,7 +83,7 @@ fn every_example_verb_agrees_with_its_execution_mode() {
 
 #[test]
 fn a_container_guest_carries_its_toolchain_and_pre_pulled_images() {
-    let m = load_ok("test/valid/container-with-images.yaml");
+    let m = load_ok("test/valid/container-with-images.toml");
     assert_eq!(m.guests.len(), 1);
 
     let g = &m.guests[0];
@@ -98,7 +98,7 @@ fn a_container_guest_carries_its_toolchain_and_pre_pulled_images() {
 #[test]
 fn a_project_that_runs_no_containers_declares_no_images() {
     // The assertion that the schema is not shaped around one reference tenant.
-    let m = load_ok("test/valid/no-images.yaml");
+    let m = load_ok("test/valid/no-images.toml");
     assert_eq!(m.guests[0].exec, Some(Exec::Host));
     assert!(m.guests[0].run.images.is_empty());
     assert!(m.guests[0].build.as_ref().unwrap().image.is_none());
@@ -106,7 +106,7 @@ fn a_project_that_runs_no_containers_declares_no_images() {
 
 #[test]
 fn the_smallest_legal_manifest_needs_no_build_and_no_reset() {
-    let m = load_ok("test/valid/minimal.yaml");
+    let m = load_ok("test/valid/minimal.toml");
     assert_eq!(m.guests.len(), 1);
     assert!(m.guests[0].build.is_none());
     assert!(m.reset.is_empty());
@@ -115,7 +115,7 @@ fn the_smallest_legal_manifest_needs_no_build_and_no_reset() {
 
 #[test]
 fn defaults_and_overrides_merge_across_scopes() {
-    let m = load_ok("test/valid/inherited-across-scopes.yaml");
+    let m = load_ok("test/valid/inherited-across-scopes.toml");
     let a = m.guest("guest-a").unwrap();
     let b = m.guest("guest-b").unwrap();
 
@@ -131,7 +131,7 @@ fn defaults_and_overrides_merge_across_scopes() {
 
 #[test]
 fn profiles_are_read_but_not_interpreted() {
-    let m = load_ok("test/valid/container-with-images.yaml");
+    let m = load_ok("test/valid/container-with-images.toml");
     let nightly = m.profiles.get("nightly").expect("nightly profile");
     // Kept as written. This crate has no notion of time, deliberately: turning
     // "12h" into a duration is the caller's job.
@@ -149,7 +149,7 @@ fn invalid_fixtures_are_reported_as_invalid() {
     let mut seen = 0;
     for entry in std::fs::read_dir(&dir).expect("invalid fixtures") {
         let path = entry.expect("readable entry").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
             continue;
         }
         let e = match load(&path) {
@@ -170,7 +170,7 @@ fn invalid_fixtures_are_reported_as_invalid() {
 fn the_exec_conditional_is_checked_after_merging() {
     // exec on the guest, build.image at the top level. Neither location is
     // wrong alone; only the merged form is.
-    let e = load_err("test/invalid/host-exec-with-image.yaml");
+    let e = load_err("test/invalid/host-exec-with-image.toml");
     let Error::Invalid { problems, .. } = &e else {
         panic!("expected Invalid, got {e}");
     };
@@ -183,15 +183,15 @@ fn the_exec_conditional_is_checked_after_merging() {
 #[test]
 fn every_problem_is_reported_not_just_the_first() {
     // Two independent faults: an unpinned image and an unknown key.
-    let text = "
-schema: 1
-project: two-faults
-guests: [g]
-exec: container
-build: { image: 'docker.io/library/x:latest', cmd: 'make' }
-run: { cmd: 'make test' }
-nonsense: true
-";
+    let text = r#"
+schema = 1
+project = "two-faults"
+guests = ["g"]
+exec = "container"
+build = { image = "docker.io/library/x:latest", cmd = "make" }
+run = { cmd = "make test" }
+nonsense = true
+"#;
     let e = match from_str(text, "<inline>") {
         Err(e) => e,
         Ok(_) => panic!("should be invalid"),
@@ -206,10 +206,10 @@ nonsense: true
 }
 
 #[test]
-fn unparseable_yaml_is_a_parse_error_not_an_invalid_manifest() {
-    // The distinction matters: "your YAML is broken" and "your manifest is
+fn unparseable_toml_is_a_parse_error_not_an_invalid_manifest() {
+    // The distinction matters: "your TOML is broken" and "your manifest is
     // wrong" send a reader to different places.
-    let e = match from_str("guests: [unclosed", "<inline>") {
+    let e = match from_str("guests = [\"unclosed\"", "<inline>") {
         Err(e) => e,
         Ok(_) => panic!("should not parse"),
     };
@@ -218,7 +218,7 @@ fn unparseable_yaml_is_a_parse_error_not_an_invalid_manifest() {
 
 #[test]
 fn a_missing_file_is_a_read_error() {
-    let e = match load(&fixture("test/does-not-exist.yaml")) {
+    let e = match load(&fixture("test/does-not-exist.toml")) {
         Err(e) => e,
         Ok(_) => panic!("should not load"),
     };
@@ -241,7 +241,7 @@ fn the_embedded_schema_compiles() {
 /// no engine client -- so the pair has to be expressible.
 #[test]
 fn a_verb_may_override_the_guests_execution_mode() {
-    let m = load_ok("test/valid/per-verb-exec.yaml");
+    let m = load_ok("test/valid/per-verb-exec.toml");
     let g = &m.guests[0];
 
     assert_eq!(g.exec, Some(Exec::Container), "the guest's default");
@@ -260,7 +260,7 @@ fn a_verb_may_override_the_guests_execution_mode() {
 /// Two verbs in one toolchain declare the digest once.
 #[test]
 fn a_container_run_inherits_the_build_image() {
-    let m = load_ok("test/valid/run-inherits-the-build-image.yaml");
+    let m = load_ok("test/valid/run-inherits-the-build-image.toml");
     let g = &m.guests[0];
     let build_image = g.build.as_ref().unwrap().image.clone();
 
@@ -275,18 +275,20 @@ fn a_container_run_inherits_the_build_image() {
 /// overwrite -- the opposite would silently ignore what the tenant wrote.
 #[test]
 fn a_run_that_names_an_image_keeps_it() {
-    let text = "
-schema: 1
-project: two-images
-guests: [g]
-exec: container
-build:
-  image: docker.io/library/builder@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-  cmd: make
-run:
-  image: docker.io/library/driver@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-  cmd: make check
-";
+    let text = r#"
+schema = 1
+project = "two-images"
+guests = ["g"]
+exec = "container"
+
+[build]
+image = "docker.io/library/builder@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+cmd = "make"
+
+[run]
+image = "docker.io/library/driver@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+cmd = "make check"
+"#;
     let m = from_str(text, "<inline>").expect("valid");
     assert!(m.guests[0].run.image.as_deref().unwrap().contains("driver"));
 }
@@ -295,18 +297,18 @@ run:
 /// know what any of these patterns mean, and must not learn.
 #[test]
 fn sync_exclusions_are_read_verbatim() {
-    let m = load_ok("test/valid/sync-excludes.yaml");
+    let m = load_ok("test/valid/sync-excludes.toml");
     assert_eq!(m.sync_exclude, vec!["/target/", "*.tmp", ".venv/"]);
 
     // A manifest with no sync block excludes nothing of its own.
-    assert!(load_ok("test/valid/minimal.yaml").sync_exclude.is_empty());
+    assert!(load_ok("test/valid/minimal.toml").sync_exclude.is_empty());
 }
 
 /// A verb cannot ask for container execution when no image exists to run in --
 /// including the case where there is no build block to inherit one from.
 #[test]
 fn a_container_verb_with_no_image_anywhere_is_refused() {
-    let e = load_err("test/invalid/container-run-without-any-image.yaml");
+    let e = load_err("test/invalid/container-run-without-any-image.toml");
     let Error::Invalid { problems, .. } = &e else {
         panic!("expected Invalid, got {e}");
     };
@@ -323,7 +325,7 @@ fn a_container_verb_with_no_image_anywhere_is_refused() {
 
 #[test]
 fn the_same_guest_in_two_spellings_is_refused() {
-    let e = load_err("test/invalid/duplicate-guest.yaml");
+    let e = load_err("test/invalid/duplicate-guest.toml");
     let Error::Invalid { problems, .. } = &e else {
         panic!("a doubled guest is the tenant's mistake, not ours: {e}");
     };
@@ -335,7 +337,7 @@ fn the_same_guest_in_two_spellings_is_refused() {
 
 #[test]
 fn cache_names_that_mangle_to_one_variable_are_refused() {
-    let e = load_err("test/invalid/cache-name-collision.yaml");
+    let e = load_err("test/invalid/cache-name-collision.toml");
     let Error::Invalid { problems, .. } = &e else {
         panic!("colliding caches are the tenant's mistake, not ours: {e}");
     };
@@ -348,10 +350,10 @@ fn cache_names_that_mangle_to_one_variable_are_refused() {
 #[test]
 fn an_image_without_a_real_registry_host_is_refused() {
     // A hub namespace is not a host, and uppercase paths fail at pull time.
-    load_err("test/invalid/hostless-image.yaml");
-    load_err("test/invalid/uppercase-image-path.yaml");
+    load_err("test/invalid/hostless-image.toml");
+    load_err("test/invalid/uppercase-image-path.toml");
     // The forms real sites use still pass.
-    load_ok("test/valid/per-verb-exec.yaml");
+    load_ok("test/valid/per-verb-exec.toml");
 }
 
 #[test]
@@ -360,11 +362,11 @@ fn a_manifest_that_states_exec_only_per_verb_is_complete() {
     // top refused coherent manifests.
     let m = load_str(
         r#"
-schema: 1
-project: verbwise
-guests: [some-guest]
-build: {exec: host, cmd: make deps}
-run: {exec: host, cmd: make check}
+schema = 1
+project = "verbwise"
+guests = ["some-guest"]
+build = { exec = "host", cmd = "make deps" }
+run = { exec = "host", cmd = "make check" }
 "#,
     );
     let g = &m.guests[0];
@@ -391,7 +393,7 @@ fn load_str(text: &str) -> Manifest {
         text.len()
     )));
     std::fs::create_dir_all(&dir.0).unwrap();
-    let path = dir.0.join("m.yaml");
+    let path = dir.0.join("m.toml");
     std::fs::write(&path, text).unwrap();
     load(&path).unwrap_or_else(|e| panic!("should load: {e}"))
 }
@@ -414,7 +416,7 @@ fn load_str_err(text: &str) -> Vec<String> {
         text.len()
     )));
     std::fs::create_dir_all(&dir.0).unwrap();
-    let path = dir.0.join("m.yaml");
+    let path = dir.0.join("m.toml");
     std::fs::write(&path, text).unwrap();
     match load(&path) {
         Ok(_) => panic!("should have been refused:\n{text}"),
@@ -423,20 +425,21 @@ fn load_str_err(text: &str) -> Vec<String> {
     }
 }
 
-const SKELETON: &str = "\nschema: 1\nproject: p\nguests: [g]\nexec: host\nrun: {cmd: make}\n";
+const SKELETON: &str =
+    "\nschema = 1\nproject = \"p\"\nguests = [\"g\"]\nexec = \"host\"\nrun = { cmd = \"make\" }\n";
 
 #[test]
 fn profile_names_and_env_keys_are_held_to_their_patterns() {
-    let p = load_str_err(&format!("{SKELETON}profiles:\n  \"Bad Name\": {{warm_cache: false}}\n"));
+    let p = load_str_err(&format!("{SKELETON}[profiles.\"Bad Name\"]\nwarm_cache = false\n"));
     assert!(p.iter().any(|m| m.contains("Bad Name")), "{p:?}");
 
-    let p = load_str_err(&format!("{SKELETON}profiles: {{}}\n"));
+    let p = load_str_err(&format!("{SKELETON}profiles = {{}}\n"));
     assert!(!p.is_empty(), "an empty profiles table is dead weight: {p:?}");
 
-    let p = load_str_err("\nschema: 1\nproject: p\nguests: [g]\nexec: host\nrun: {cmd: make, env: {\"1BAD\": \"x\"}}\n");
+    let p = load_str_err("\nschema = 1\nproject = \"p\"\nguests = [\"g\"]\nexec = \"host\"\nrun = { cmd = \"make\", env = { \"1BAD\" = \"x\" } }\n");
     assert!(p.iter().any(|m| m.contains("1BAD")), "{p:?}");
 
-    let p = load_str_err("\nschema: 1\nproject: p\nguests: [g]\nexec: host\nrun: {cmd: make, env: {GOOD: 42}}\n");
+    let p = load_str_err("\nschema = 1\nproject = \"p\"\nguests = [\"g\"]\nexec = \"host\"\nrun = { cmd = \"make\", env = { GOOD = 42 } }\n");
     assert!(
         p.iter().any(|m| m.contains("env") || m.contains("GOOD")),
         "an env value that is not a string is a refusal, not a coercion: {p:?}"
@@ -446,9 +449,9 @@ fn profile_names_and_env_keys_are_held_to_their_patterns() {
 #[test]
 fn resource_bounds_hold_for_every_resource() {
     for bad in [
-        "resources: {cores: 0}",
-        "resources: {ram_gb: 0}",
-        "resources: {disk_gb: 0}",
+        "resources = { cores = 0 }",
+        "resources = { ram_gb = 0 }",
+        "resources = { disk_gb = 0 }",
     ] {
         let p = load_str_err(&format!("{SKELETON}{bad}\n"));
         assert!(!p.is_empty(), "{bad} should be refused");
@@ -463,7 +466,7 @@ fn resolution_fallout_stays_quiet_when_the_structure_is_already_wrong() {
     // nameless guest object that resolution would refuse -- so the test can
     // tell "suppressed" from "had nothing to say".
     let p = load_str_err(
-        "\nschema: 1\nproject: p\nguests: [{resources: {cores: 0}}]\nexec: host\nrun: {cmd: make}\n",
+        "\nschema = 1\nproject = \"p\"\nguests = [{ resources = { cores = 0 } }]\nexec = \"host\"\nrun = { cmd = \"make\" }\n",
     );
     assert!(p.iter().any(|m| m.contains("cores")), "{p:?}");
     assert!(

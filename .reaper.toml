@@ -1,0 +1,84 @@
+# reaper, as a tenant of itself.
+#
+# This is not a demonstration. It is the manifest a `reaper up` in this
+# directory uses, and it exists so that every change to the framework keeps
+# being exercised by the framework -- the alternative is a harness that has
+# only ever been run against manifests written to make it look good.
+#
+# It is also the only tenant manifest in this repository that is real. The two
+# under manifest/examples/ are shapes; this one runs.
+
+schema = 1
+project = "reaper"
+
+# The container-execution guest. FreeBSD is registered at some sites and not
+# here; see docs/STATUS.md for why it is parked.
+guests = ["ubuntu-26.04"]
+
+# The toolchain arrives pinned and the template stays generic, which is the
+# arrangement this project recommends to everyone else.
+exec = "container"
+
+[build]
+# docker.io/library/rust:1.97, resolved from the registry on 2026-08-13.
+# Matches the toolchain on the development host, so a failure here is a
+# failure of the code rather than of a version difference.
+image = "docker.io/library/rust@sha256:3382bd20aa942806c533e9a73cd000474fb3ef173f71e684cc9b942675781769"
+
+# The cache paths come from the environment rather than being written out.
+# The command is a shell command, so these expand; a manifest `env` value
+# would not, deliberately -- see docs/tenants.md.
+cmd = """
+CARGO_HOME=$REAPER_CACHE_CARGO \
+CARGO_TARGET_DIR=$REAPER_CACHE_TARGET \
+cargo build --locked --workspace --tests"""
+
+# Named by us and meaningless to the framework. Kept out of tank/state so a
+# rollback never destroys the thing that makes the next iteration fast.
+cache = ["cargo", "target"]
+
+[run]
+# The whole battery, not just the Rust half. Two of these suites are shell,
+# and leaving them out here would mean the tenant that exercises reaper most
+# exercises less of it than `tools/check.sh` does on a workstation.
+#
+# The apt line is the honest cost of not having a purpose-built builder
+# image: the stock Rust image carries none of rsync, shellcheck or jq, and all
+# three are real dependencies of this project's own suite -- rsync because
+# reaper uses it, shellcheck because reaper is half shell, jq because the
+# sweeper's self-test reads canned API replies. Installing them is the
+# tenant's business and not the framework's, which never learns what any of
+# this means. The right answer is a builder image with them baked in;
+# inventing one nobody has built would be the worse kind of wrong, which is
+# the same call manifest/examples/README.md records.
+cmd = """
+apt-get -qq update && apt-get -qq install -y rsync shellcheck jq && \
+CARGO_HOME=$REAPER_CACHE_CARGO \
+CARGO_TARGET_DIR=$REAPER_CACHE_TARGET \
+cargo test --workspace --locked && \
+./tools/check.sh && \
+./runner/test/run.sh"""
+
+[sync]
+# target/ is built on the development host, for a different operating system,
+# and rebuilt in the session's own cache anyway.
+exclude = ["/target/"]
+
+[reset]
+# Nothing of this project's state is worth rolling back yet -- it has none
+# that a session accumulates. Declared so that Phase 4 has a tenant to prove
+# itself against rather than none at all.
+datasets = ["state"]
+
+[resources]
+cores = 4
+ram_gb = 8
+
+[profiles.dev]
+ttl = "4h"
+warm_cache = true
+
+[profiles.nightly]
+ttl = "12h"
+# Cold, so a warm cache can never be the reason a nightly run passed.
+warm_cache = false

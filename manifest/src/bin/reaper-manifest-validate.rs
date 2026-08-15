@@ -9,7 +9,7 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
-        eprintln!("usage: reaper-manifest-validate <manifest.yaml> [...]");
+        eprintln!("usage: reaper-manifest-validate <manifest.toml> [...]");
         eprintln!();
         eprintln!("Validates each manifest against the reaper manifest schema, v1.");
         eprintln!("Exit 0 if every manifest is valid, 1 if any is invalid, 2 on a");
