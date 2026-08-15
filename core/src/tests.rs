@@ -1134,3 +1134,152 @@ fn put_executable_survives_a_chatty_child() {
     ssh.put_executable(&payload, "/tmp/big")
         .expect("a chatty child is normal ssh -vvv behavior, not an error");
 }
+
+// ---------------------------------------------------------------------------
+// Fresh battery: branches the adversarial review found no test exercising.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn state_file_precedence_is_explicit_then_xdg_then_home() {
+    let _guard = env_lock().lock().unwrap();
+    let home = std::env::var("HOME").expect("these tests need a HOME");
+
+    std::env::set_var("REAPER_STATE", "/explicit/sessions.json");
+    std::env::set_var("XDG_STATE_HOME", "/xdg-state");
+    assert_eq!(
+        crate::paths::state_file(),
+        PathBuf::from("/explicit/sessions.json"),
+        "the explicit override outranks everything"
+    );
+
+    std::env::remove_var("REAPER_STATE");
+    assert_eq!(
+        crate::paths::state_file(),
+        PathBuf::from("/xdg-state/reaper/sessions.json"),
+        "then the XDG spelling"
+    );
+
+    // An EMPTY XDG variable is set-but-meaningless, and must not put state at
+    // the filesystem root.
+    std::env::set_var("XDG_STATE_HOME", "");
+    assert_eq!(
+        crate::paths::state_file(),
+        PathBuf::from(&home).join(".local/state/reaper/sessions.json"),
+        "and finally home"
+    );
+    std::env::remove_var("XDG_STATE_HOME");
+}
+
+#[test]
+fn a_blank_provider_name_is_refused() {
+    // With a table whose name matches the blank, so this refusal -- and not
+    // the missing-table one -- is the only thing standing.
+    let text = "
+provider = \"  \"
+[guests.g]
+template = \"t\"
+[\"  \"]
+";
+    let e = parse(text).expect_err("should refuse");
+    assert!(e.to_string().contains("provider is empty"), "{e}");
+}
+
+#[test]
+fn the_ssh_key_expands_its_tilde() {
+    let _guard = env_lock().lock().unwrap();
+    let home = std::env::var("HOME").expect("these tests need a HOME");
+    let text = r#"
+provider = "p"
+[guests.g]
+template = "t"
+[session]
+ssh_key = "~/keys/session"
+[p]
+"#;
+    let c = parse(text).expect("should parse");
+    assert_eq!(
+        c.session.ssh_key.as_deref(),
+        Some(Path::new(&home).join("keys/session")).as_deref(),
+        "a key the ssh binary would look for literally under ./~ is a config bug"
+    );
+}
+
+#[test]
+fn a_failed_sync_surfaces_the_tools_own_stderr() {
+    // The reverse channel is how failure traces escape a machine about to be
+    // destroyed; when it breaks, the person needs rsync's words, not ours.
+    let dir = scratch_dir("syncfail");
+    let stub = dir.join("fake-rsync");
+    write(&stub, b"#!/bin/sh\necho 'connection unexpectedly closed' >&2\nexit 23\n");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let ssh = crate::transport::Ssh::new(
+        "ssh", "root", "192.0.2.7".parse().unwrap(), None, dir.join("kh"),
+        Duration::from_secs(15),
+    );
+    let plan = crate::sync::pull(
+        stub.to_str().unwrap(),
+        Path::new("/some/rsh"),
+        &ssh,
+        "/remote/results",
+        &dir.join("local"),
+    );
+    let e = plan.run().expect_err("the stub fails");
+    let msg = e.to_string();
+    assert!(msg.contains("connection unexpectedly closed"), "{msg}");
+    assert!(msg.contains("23"), "{msg}");
+}
+
+#[test]
+fn format_rough_reads_right_at_the_unit_boundaries() {
+    for (secs, want) in [
+        (59u64, "59s"),
+        (60, "1m00s"),
+        (3599, "59m59s"),
+        (3600, "1h00m"),
+        (3661, "1h01m"),
+    ] {
+        assert_eq!(
+            crate::duration::format_rough(Duration::from_secs(secs)),
+            want
+        );
+    }
+}
+
+#[test]
+fn a_pre_epoch_time_is_clamped_to_zero_not_a_panic() {
+    // A machine with a badly wrong clock can hand out timestamps before 1970;
+    // recording one must not take the store down, now or on the next read.
+    let Some(before) = UNIX_EPOCH.checked_sub(Duration::from_secs(10)) else {
+        return; // platform cannot represent it; nothing to defend against
+    };
+    let dir = scratch_dir("preepoch");
+    let store = Store::at(dir.join("sessions.json"));
+    let mut s = session("alpha", "m-1");
+    s.created_at = before;
+    store.put(s).expect("stored");
+    let got = store.get("alpha").unwrap().expect("still there");
+    assert_eq!(got.created_at, UNIX_EPOCH, "clamped, honestly, to the epoch");
+}
+
+#[test]
+fn a_failed_remote_command_reports_what_it_was_doing() {
+    let dir = scratch_dir("runfail");
+    let stub = dir.join("fake-ssh");
+    write(&stub, b"#!/bin/sh\necho 'the guest said no' >&2\nexit 9\n");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let ssh = crate::transport::Ssh::new(
+        stub.to_str().unwrap(), "root", "192.0.2.7".parse().unwrap(), None,
+        dir.join("kh"), Duration::from_secs(15),
+    );
+    use crate::transport::Transport;
+    let e = ssh.run("true", "checking the machine answers").expect_err("stub fails");
+    let msg = e.to_string();
+    assert!(msg.contains("checking the machine answers"), "{msg}");
+    assert!(msg.contains("the guest said no"), "{msg}");
+}

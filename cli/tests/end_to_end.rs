@@ -1498,3 +1498,95 @@ fn down_with_a_manifest_collects_results_from_anywhere() {
         "the final pull must actually have run"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Fresh battery: paths the adversarial review found no test exercising.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_profile_ttl_reaches_the_machine() {
+    let h = Harness::new("profilettl");
+    write(
+        &h.dir.join(".reaper.yaml"),
+        r#"
+schema: 1
+project: a-project
+guests: [a-guest]
+exec: host
+run:
+  cmd: make check
+profiles:
+  quick:
+    ttl: 1h
+"#,
+        None,
+    );
+    let out = h.ok(&["up", "--profile", "quick"]);
+    assert!(
+        out.contains("expires in 1h"),
+        "the profile's TTL, not the site default: {out}"
+    );
+}
+
+#[test]
+fn renew_with_an_explicit_ttl_uses_it() {
+    let h = Harness::new("renewttl");
+    h.ok(&["up"]);
+    let out = h.ok(&["renew", "--ttl", "30m"]);
+    assert!(out.contains("expires in 30m"), "{out}");
+}
+
+#[test]
+fn list_is_honest_about_expiry_and_dead_heartbeats() {
+    // EXPIRED is not cosmetic -- the sweeper may take the machine at any
+    // moment -- and a DEAD heartbeat means the countdown has stopped moving.
+    // Both renderings existed with no test that would notice them lying.
+    let h = Harness::new("listhonest");
+    write(
+        &h.dir.join("sessions.json"),
+        r#"{
+  "version": 1,
+  "sessions": {
+    "a-project": {
+      "name": "a-project",
+      "project": "a-project",
+      "guest": "a-guest",
+      "template": "opaque",
+      "machine": "an-opaque-handle",
+      "address": "192.0.2.42",
+      "created_at": 1700000000,
+      "ready_at": 1700000060,
+      "expires_at": 1700007200,
+      "ttl": 7200,
+      "heartbeat_pid": 4194000,
+      "synced_at": null
+    }
+  }
+}"#,
+        None,
+    );
+    let out = h.ok(&["list"]);
+    assert!(out.contains("EXPIRED"), "{out}");
+    assert!(out.contains("DEAD"), "{out}");
+}
+
+#[test]
+fn a_heartbeat_for_a_forgotten_session_exits_quietly() {
+    // `down` removed the session; the heartbeat's next tick finds nothing.
+    // That is the intended end of its life, not an error worth a message.
+    let h = Harness::new("hbgone");
+    let out = h.run(&["heartbeat", "--session", "no-such-session"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // The insecure-TLS warning is loud on every invocation by design;
+    // nothing else may be said.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let unexpected: Vec<&str> = stderr
+        .lines()
+        .filter(|l| !l.contains("TLS certificate verification") && !l.trim().is_empty())
+        .collect();
+    assert!(
+        out.stdout.is_empty() && unexpected.is_empty(),
+        "nothing to renew and nothing to report: {} / {unexpected:?}",
+        String::from_utf8_lossy(&out.stdout),
+    );
+}

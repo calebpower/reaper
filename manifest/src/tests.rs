@@ -395,3 +395,79 @@ fn load_str(text: &str) -> Manifest {
     std::fs::write(&path, text).unwrap();
     load(&path).unwrap_or_else(|e| panic!("should load: {e}"))
 }
+
+// ---------------------------------------------------------------------------
+// Fresh battery: validation the adversarial review found no test exercising.
+// ---------------------------------------------------------------------------
+
+/// Like load_str, for text that must be refused.
+fn load_str_err(text: &str) -> Vec<String> {
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let dir = Scratch(std::env::temp_dir().join(format!(
+        "reaper-manifest-err-{}-{}",
+        std::process::id(),
+        text.len()
+    )));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let path = dir.0.join("m.yaml");
+    std::fs::write(&path, text).unwrap();
+    match load(&path) {
+        Ok(_) => panic!("should have been refused:\n{text}"),
+        Err(Error::Invalid { problems, .. }) => problems,
+        Err(e) => panic!("expected Invalid, got {e}"),
+    }
+}
+
+const SKELETON: &str = "\nschema: 1\nproject: p\nguests: [g]\nexec: host\nrun: {cmd: make}\n";
+
+#[test]
+fn profile_names_and_env_keys_are_held_to_their_patterns() {
+    let p = load_str_err(&format!("{SKELETON}profiles:\n  \"Bad Name\": {{warm_cache: false}}\n"));
+    assert!(p.iter().any(|m| m.contains("Bad Name")), "{p:?}");
+
+    let p = load_str_err(&format!("{SKELETON}profiles: {{}}\n"));
+    assert!(!p.is_empty(), "an empty profiles table is dead weight: {p:?}");
+
+    let p = load_str_err("\nschema: 1\nproject: p\nguests: [g]\nexec: host\nrun: {cmd: make, env: {\"1BAD\": \"x\"}}\n");
+    assert!(p.iter().any(|m| m.contains("1BAD")), "{p:?}");
+
+    let p = load_str_err("\nschema: 1\nproject: p\nguests: [g]\nexec: host\nrun: {cmd: make, env: {GOOD: 42}}\n");
+    assert!(
+        p.iter().any(|m| m.contains("env") || m.contains("GOOD")),
+        "an env value that is not a string is a refusal, not a coercion: {p:?}"
+    );
+}
+
+#[test]
+fn resource_bounds_hold_for_every_resource() {
+    for bad in [
+        "resources: {cores: 0}",
+        "resources: {ram_gb: 0}",
+        "resources: {disk_gb: 0}",
+    ] {
+        let p = load_str_err(&format!("{SKELETON}{bad}\n"));
+        assert!(!p.is_empty(), "{bad} should be refused");
+    }
+}
+
+#[test]
+fn resolution_fallout_stays_quiet_when_the_structure_is_already_wrong() {
+    // Pass two only runs when pass one is clean; reporting resolution fallout
+    // on top of the structural break that caused it buries the error that
+    // matters. This input breaks both ways -- cores: 0 structurally, and a
+    // nameless guest object that resolution would refuse -- so the test can
+    // tell "suppressed" from "had nothing to say".
+    let p = load_str_err(
+        "\nschema: 1\nproject: p\nguests: [{resources: {cores: 0}}]\nexec: host\nrun: {cmd: make}\n",
+    );
+    assert!(p.iter().any(|m| m.contains("cores")), "{p:?}");
+    assert!(
+        !p.iter().any(|m| m.contains("without a name")),
+        "the structural error is the one that matters: {p:?}"
+    );
+}

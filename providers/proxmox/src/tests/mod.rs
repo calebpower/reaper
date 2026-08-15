@@ -1139,3 +1139,71 @@ fn a_wrong_token_is_refused_by_the_stand_in() {
         "{e}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Fresh battery: branches the adversarial review found no test exercising.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_double_failure_names_the_machine_to_destroy_by_hand() {
+    // Tags PUT fails AND the cleanup destroy fails: the machine is untagged
+    // and cannot be removed, which is the one state a person must be told
+    // about in so many words. The clone inherits protection from the
+    // template, which is exactly how the cleanup comes to fail.
+    let pve = pve_with_template();
+    pve.with_state(|s| {
+        s.vms.get_mut(&9000).unwrap().protection = true;
+        s.reject_config_writes = true;
+    });
+    let p = provider_for(&pve);
+
+    let e = p.create(&request("a-session", 1)).unwrap_err();
+    let msg = e.to_string();
+    assert!(msg.contains("by hand"), "{msg}");
+    assert!(msg.contains("9001"), "name the machine, not just the problem: {msg}");
+}
+
+#[test]
+fn a_v6_only_guest_still_yields_its_address() {
+    let pve = pve_with_template();
+    pve.with_state(|s| {
+        s.agent_interfaces = Some(serde_json::json!([
+            {"name": "lo0", "ip-addresses": [{"ip-address": "::1"}]},
+            {"name": "vtnet0", "ip-addresses": [
+                {"ip-address": "fe80::1"},
+                {"ip-address": "2001:db8::7"}
+            ]}
+        ]));
+    });
+    let p = provider_for(&pve);
+    let m = p.create(&request("a-session", 1)).expect("create");
+    let a = p.address(&m).expect("query").expect("an address");
+    assert_eq!(a.to_string(), "2001:db8::7", "global v6 beats loopback and link-local");
+}
+
+#[test]
+fn an_agent_reply_shaped_as_a_bare_array_still_parses() {
+    // Older agents answer the array without the {"result": ...} wrapper; the
+    // parser takes both shapes, and only the wrapped one had a test.
+    let bare = serde_json::json!([
+        {"name": "eth0", "ip-addresses": [{"ip-address": "192.0.2.9"}]}
+    ]);
+    assert_eq!(
+        crate::first_usable_address(&bare).map(|a| a.to_string()),
+        Some("192.0.2.9".to_string())
+    );
+}
+
+#[test]
+fn from_table_refuses_what_its_pieces_refuse() {
+    // The composed entry point: a bad table and an unreadable token file must
+    // both come back as Config errors, not panics or defaults.
+    let bad = table("api = \"https://x:8006\"\n");
+    let Err(e) = Proxmox::from_table(&bad) else {
+        panic!("a table with no node, pool or range should be refused");
+    };
+    assert!(
+        matches!(e, reaper_core::ProviderError::Config(_)),
+        "{e}"
+    );
+}
