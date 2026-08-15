@@ -130,7 +130,12 @@ pub struct Guest {
     /// Resolved against the site registry by the caller. Free-form here: this
     /// crate deliberately has no list of known operating systems.
     pub name: String,
-    pub exec: Exec,
+    /// The guest's default mode, when one was stated. Every consumer reads the
+    /// verbs' own resolved `exec`, which is where mode actually lives; a
+    /// manifest that states it per verb and nowhere else is complete, and
+    /// requiring an unread default was refusing coherent manifests.
+    #[serde(default)]
+    pub exec: Option<Exec>,
     #[serde(default)]
     pub build: Option<Build>,
     pub run: Run,
@@ -199,7 +204,10 @@ pub fn from_str(text: &str, origin: &str) -> Result<Manifest, Error> {
     }
 
     let guests = resolve_guests(&doc)
-        .map_err(Error::Internal)?
+        .map_err(|problem| Error::Invalid {
+            path: origin.to_string(),
+            problems: vec![problem],
+        })?
         .into_iter()
         .map(|g| serde_json::from_value::<Guest>(g).map_err(|e| Error::Internal(e.to_string())))
         .collect::<Result<Vec<_>, _>>()?;
@@ -273,7 +281,18 @@ pub fn validate(doc: &Value) -> Result<Vec<String>, Error> {
     // resolution fallout on top of the structural errors that caused it would
     // bury the error that matters.
     if problems.is_empty() {
-        for g in resolve_guests(doc).map_err(Error::Internal)? {
+        // Resolution can refuse things the schema cannot express -- duplicate
+        // guest names across the two spellings, cache names that collide
+        // after env-var mangling. Those are the tenant's to fix, so they
+        // join the problem list rather than masquerading as internal errors.
+        let resolved = match resolve_guests(doc) {
+            Ok(r) => r,
+            Err(problem) => {
+                problems.push(problem);
+                return Ok(problems);
+            }
+        };
+        for g in resolved {
             let name = g
                 .get("name")
                 .and_then(Value::as_str)
@@ -313,6 +332,7 @@ fn resolve_guests(doc: &Value) -> Result<Vec<Value>, String> {
         .ok_or_else(|| "no guests array; the root schema should have caught this".to_string())?;
 
     let mut out = Vec::with_capacity(entries.len());
+    let mut seen: Vec<String> = Vec::new();
 
     for entry in entries {
         // Shorthand is a bare name; expanded form is an object carrying it.
@@ -327,6 +347,16 @@ fn resolve_guests(doc: &Value) -> Result<Vec<Value>, String> {
             }
             _ => return Err("guest entry is neither a name nor an object".to_string()),
         };
+
+        // The schema's uniqueItems compares whole JSON values, so the same
+        // guest as a bare name and as an object slips through -- and the
+        // second entry then silently loses to the first everywhere downstream.
+        if seen.contains(&name) {
+            return Err(format!(
+                "guests declares {name:?} more than once; a guest gets one entry, whichever form it is written in"
+            ));
+        }
+        seen.push(name.clone());
 
         let mut resolved = Map::new();
         resolved.insert("name".into(), Value::String(name));
@@ -363,6 +393,33 @@ fn resolve_guests(doc: &Value) -> Result<Vec<Value>, String> {
                 if let Some(image) = b.get("image") {
                     r.insert("image".into(), image.clone());
                 }
+            }
+        }
+
+        // Cache names become REAPER_CACHE_<NAME> with [a-z.-] mangled to
+        // [A-Z__], so my-cache, my.cache and my_cache all become the same
+        // variable and only one of them is reachable the documented way.
+        // uniqueItems cannot see that; this can.
+        if let Some(cache) = build
+            .as_ref()
+            .and_then(|b| b.get("cache"))
+            .and_then(Value::as_array)
+        {
+            let mut vars: Vec<(String, String)> = Vec::new();
+            for c in cache.iter().filter_map(Value::as_str) {
+                let var: String = c
+                    .chars()
+                    .map(|ch| match ch {
+                        '.' | '-' => '_',
+                        other => other.to_ascii_uppercase(),
+                    })
+                    .collect();
+                if let Some((prev, _)) = vars.iter().find(|(_, v)| *v == var) {
+                    return Err(format!(
+                        "caches {prev:?} and {c:?} would share the environment variable REAPER_CACHE_{var}; only one of them would be reachable. Pick names that differ in more than punctuation"
+                    ));
+                }
+                vars.push((c.to_string(), var));
             }
         }
 

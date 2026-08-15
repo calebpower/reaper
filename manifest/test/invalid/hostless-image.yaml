@@ -1,0 +1,10 @@
+# `library/rust` is a Docker Hub namespace, not a registry host. The schema's
+# own description promises no ambiguity about where the bytes came from, and
+# this is exactly the ambiguous form.
+schema: 1
+project: hostless
+guests: [some-guest]
+exec: container
+run:
+  cmd: make check
+  image: library/example@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef

@@ -1,0 +1,12 @@
+# The same guest twice, wearing its two legal spellings. uniqueItems compares
+# JSON values, so only resolution can see that these are one guest -- and
+# before it did, the second entry silently lost to the first everywhere.
+schema: 1
+project: doubled
+guests:
+  - some-guest
+  - name: some-guest
+    resources: {cores: 2}
+exec: host
+run:
+  cmd: make check

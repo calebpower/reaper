@@ -102,14 +102,19 @@ build: { cmd: make test, cache: [obj] }   # defaults both guests inherit
 run:   { cmd: make e2e }
 ```
 
-Per-guest keys override the top-level defaults. Anything you do not override is
-inherited.
+Per-guest keys override the top-level defaults, key by key within the block:
+override `build: {env: ...}` and the top level's `cmd` is still inherited. But
+each key is replaced whole, and `env` is one key -- override one variable and
+every top-level variable the guest did not restate is gone, not merged under
+yours. Restate the whole `env` you mean.
 
 ## Container execution or host execution
 
-`exec: container` is the default and the better answer where it fits. Your
-toolchain arrives as a digest-pinned image, the guest template stays generic,
-and what you build with is exactly what you declared.
+`exec` must be stated -- at the top level, per guest, or per verb; a manifest
+that never says is refused rather than guessed at. `exec: container` is the
+better answer where it fits: your toolchain arrives as a digest-pinned image,
+the guest template stays generic, and what you build with is exactly what you
+declared.
 
 `exec: host` runs your commands directly in the guest, with the toolchain
 supplied by the template. Choose it when containers cannot give you what you

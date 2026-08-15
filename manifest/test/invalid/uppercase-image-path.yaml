@@ -1,0 +1,10 @@
+# Every real registry refuses uppercase repository paths; accepting one here
+# just moves the failure into the guest, minutes later and blaming the wrong
+# thing.
+schema: 1
+project: shouting
+guests: [some-guest]
+exec: container
+run:
+  cmd: make check
+  image: docker.io/Library/EXAMPLE@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef

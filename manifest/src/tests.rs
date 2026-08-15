@@ -87,7 +87,7 @@ fn a_container_guest_carries_its_toolchain_and_pre_pulled_images() {
     assert_eq!(m.guests.len(), 1);
 
     let g = &m.guests[0];
-    assert_eq!(g.exec, Exec::Container);
+    assert_eq!(g.exec, Some(Exec::Container));
     assert!(g.build.as_ref().unwrap().image.is_some());
     assert_eq!(g.run.images.len(), 3);
     assert_eq!(m.reset, vec!["state".to_string()]);
@@ -99,7 +99,7 @@ fn a_container_guest_carries_its_toolchain_and_pre_pulled_images() {
 fn a_project_that_runs_no_containers_declares_no_images() {
     // The assertion that the schema is not shaped around one reference tenant.
     let m = load_ok("test/valid/no-images.yaml");
-    assert_eq!(m.guests[0].exec, Exec::Host);
+    assert_eq!(m.guests[0].exec, Some(Exec::Host));
     assert!(m.guests[0].run.images.is_empty());
     assert!(m.guests[0].build.as_ref().unwrap().image.is_none());
 }
@@ -119,8 +119,8 @@ fn defaults_and_overrides_merge_across_scopes() {
     let a = m.guest("guest-a").unwrap();
     let b = m.guest("guest-b").unwrap();
 
-    assert_eq!(a.exec, Exec::Host);
-    assert_eq!(b.exec, Exec::Container);
+    assert_eq!(a.exec, Some(Exec::Host));
+    assert_eq!(b.exec, Some(Exec::Container));
     // Command from the top level, image from the guest: neither scope holds
     // both, so this passes only if resolution merges before the typed model is
     // built.
@@ -244,7 +244,7 @@ fn a_verb_may_override_the_guests_execution_mode() {
     let m = load_ok("test/valid/per-verb-exec.yaml");
     let g = &m.guests[0];
 
-    assert_eq!(g.exec, Exec::Container, "the guest's default");
+    assert_eq!(g.exec, Some(Exec::Container), "the guest's default");
     assert_eq!(g.build.as_ref().unwrap().exec, Exec::Container);
     assert_eq!(g.run.exec, Exec::Host, "the run overrode it");
 
@@ -314,4 +314,84 @@ fn a_container_verb_with_no_image_anywhere_is_refused() {
         problems.iter().any(|p| p.contains("/run") && p.contains("image")),
         "the failure should name the run's missing image: {problems:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Hardening: defects found by adversarial review. Every test here was watched
+// failing against the code as first written.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_same_guest_in_two_spellings_is_refused() {
+    let e = load_err("test/invalid/duplicate-guest.yaml");
+    let Error::Invalid { problems, .. } = &e else {
+        panic!("a doubled guest is the tenant's mistake, not ours: {e}");
+    };
+    assert!(
+        problems.iter().any(|p| p.contains("more than once")),
+        "{problems:?}"
+    );
+}
+
+#[test]
+fn cache_names_that_mangle_to_one_variable_are_refused() {
+    let e = load_err("test/invalid/cache-name-collision.yaml");
+    let Error::Invalid { problems, .. } = &e else {
+        panic!("colliding caches are the tenant's mistake, not ours: {e}");
+    };
+    assert!(
+        problems.iter().any(|p| p.contains("REAPER_CACHE_MY_CACHE")),
+        "the refusal must name the variable both would become: {problems:?}"
+    );
+}
+
+#[test]
+fn an_image_without_a_real_registry_host_is_refused() {
+    // A hub namespace is not a host, and uppercase paths fail at pull time.
+    load_err("test/invalid/hostless-image.yaml");
+    load_err("test/invalid/uppercase-image-path.yaml");
+    // The forms real sites use still pass.
+    load_ok("test/valid/per-verb-exec.yaml");
+}
+
+#[test]
+fn a_manifest_that_states_exec_only_per_verb_is_complete() {
+    // Both verbs carry their mode; requiring an unread guest-level default on
+    // top refused coherent manifests.
+    let m = load_str(
+        r#"
+schema: 1
+project: verbwise
+guests: [some-guest]
+build: {exec: host, cmd: make deps}
+run: {exec: host, cmd: make check}
+"#,
+    );
+    let g = &m.guests[0];
+    assert_eq!(g.exec, None, "no default was stated, and none is invented");
+    assert_eq!(g.build.as_ref().unwrap().exec, Exec::Host);
+    assert_eq!(g.run.exec, Exec::Host);
+}
+
+/// Load from a string by way of a scratch file, for shapes small enough that
+/// a fixture file would just put distance between the test and its data.
+fn load_str(text: &str) -> Manifest {
+    // Drop, not a call at the end: a panic inside load() must still remove
+    // the directory. The invariants battery refuses this file without it,
+    // and it caught this very helper leaking on its first draft.
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let dir = Scratch(std::env::temp_dir().join(format!(
+        "reaper-manifest-test-{}-{}",
+        std::process::id(),
+        text.len()
+    )));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let path = dir.0.join("m.yaml");
+    std::fs::write(&path, text).unwrap();
+    load(&path).unwrap_or_else(|e| panic!("should load: {e}"))
 }

@@ -68,9 +68,9 @@
       "pattern": "^[a-z0-9][a-z0-9._-]*$"
     },
     "imageRef": {
-      "description": "A fully-qualified, digest-pinned image reference. Tags are rejected: a run that cannot say which bytes it ran is a run whose result stops meaning anything tomorrow. Requiring a registry host as well removes any ambiguity about where the bytes came from.",
+      "description": "A fully-qualified, digest-pinned image reference. Tags are rejected: a run that cannot say which bytes it ran is a run whose result stops meaning anything tomorrow. The first component must actually be a registry host -- dotted, or localhost, with an optional port -- because `library/rust` passing as a host is exactly the ambiguity this field exists to remove. Path components are lowercase because every real registry refuses anything else, and a reference that validates here and fails at pull time helps nobody.",
       "type": "string",
-      "pattern": "^[A-Za-z0-9._-]+(:[0-9]+)?(/[A-Za-z0-9._-]+)+@sha256:[0-9a-f]{64}$"
+      "pattern": "^(localhost|[a-z0-9-]+(\\.[a-z0-9-]+)+)(:[0-9]+)?(/[a-z0-9._-]+)+@sha256:[0-9a-f]{64}$"
     },
     "execMode": {
       "description": "container: commands run in a digest-pinned toolchain image, and the guest template stays generic. host: commands run directly in the guest, with the toolchain supplied by the template. See docs/tenants.md for the tradeoff.",
@@ -200,7 +200,7 @@
         "ttl": {
           "description": "How long a session lives without a heartbeat. Measured from readiness, not from the create request.",
           "type": "string",
-          "pattern": "^[1-9][0-9]*(s|m|h|d)$"
+          "pattern": "^[1-9][0-9]{0,8}(s|m|h|d)$"
         },
         "warm_cache": {
           "description": "false runs without tank/cache mounted: determinism mode, for when a warm cache is the suspect.",
@@ -249,7 +249,6 @@
       "additionalProperties": false,
       "required": [
         "name",
-        "exec",
         "run"
       ],
       "properties": {
