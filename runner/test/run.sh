@@ -27,6 +27,26 @@ fail=0
 CASE=""
 WORK=""
 
+# One parent for every case's scratch directory, so cleanup is a single removal
+# and so a leak check can scope itself to *this* run rather than to whatever
+# else is in /tmp.
+RUNDIR=$(mktemp -d "${TMPDIR:-/tmp}/reaper-suite.XXXXXXXX")
+
+# Stop anything this run started and take its directories with it, on every exit
+# path including a failure or a signal.
+#
+# This suite leaked a control loop per container case and a directory per case,
+# for as long as the trigger existed -- 379 spinning shells and four thousand
+# directories by the time anyone looked. The Rust harness had the same defect
+# and was given the same treatment; the lesson is that a suite which starts
+# processes needs an exit path that stops them, not a stop call at the end of
+# each case that a failure can skip.
+cleanup() {
+    pkill -f "${RUNDIR}" 2>/dev/null || true
+    rm -rf "${RUNDIR}"
+}
+trap cleanup EXIT HUP INT TERM
+
 # --- harness ---------------------------------------------------------------
 
 # A PATH holding only stubs and the handful of real tools the runner needs.
@@ -45,7 +65,7 @@ new_case() {
     # system the argument is a prefix, on another it is a template that must
     # end in X's, and there it fails outright. A full template works on both,
     # and this suite has to run on the systems it tests.
-    WORK=$(mktemp -d "${TMPDIR:-/tmp}/reaper-runner.XXXXXXXX")
+    WORK=$(mktemp -d "${RUNDIR}/case.XXXXXXXX")
     mkdir -p "${WORK}/bin" "${WORK}/fix" "${WORK}/sysroot" "${WORK}/pool" "${WORK}/proc"
     : > "${WORK}/log"
 
@@ -490,6 +510,9 @@ FAKE_PLATFORM=Linux
 with_engine
 job=$(a_job)
 run_runner workspace --project a-project
+# A tenant that declares something to roll back gets a trigger at `up`, so the
+# channel exists by the time anything is executed.
+run_runner control --project a-project start
 if run_runner exec --project a-project --job "${job}" \
      --image docker.io/library/example@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
      --cache cargo --cache build-dir; then :; else bad "exec should have succeeded"; fi
@@ -515,6 +538,27 @@ log_has 'REAPER_CACHE_CARGO=/reaper/cache/cargo'
 log_has 'REAPER_CACHE_BUILD_DIR=/reaper/cache/build-dir'
 log_has '/bin/sh /reaper/job.sh'
 if [ -d "${WORK}/pool/cache/cargo" ]; then ok "made the cargo cache"; else bad "cache directory missing"; fi
+run_runner control --project a-project stop
+
+new_case "with no trigger set up, exec mounts none and starts none"
+FAKE_PLATFORM=Linux
+with_engine
+job=$(a_job)
+run_runner workspace --project a-project
+# No `control start`, which is what a tenant declaring no reset datasets gets.
+if run_runner exec --project a-project --job "${job}" \
+     --image docker.io/library/example@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef; then :; else bad "exec should have succeeded"; fi
+log_has 'podman run --rm'
+# Starting a daemon is a decision. exec used to make it here, as a side effect
+# of wanting a file to mount -- for every tenant, including those the CLI
+# deliberately gives no trigger.
+log_lacks '/reaper/control'
+log_lacks 'REAPER_CONTROL'
+if [ -f "${WORK}/pool/control/a-project/loop.pid" ]; then
+    bad "exec started a control loop nobody asked for"
+else
+    ok "no control loop was started"
+fi
 
 new_case "a cold run gets an empty cache, not a missing one"
 FAKE_PLATFORM=Linux
@@ -546,6 +590,7 @@ new_case "host execution runs the job here, with no engine involved"
 FAKE_PLATFORM=Linux
 job=$(a_job)
 run_runner workspace --project a-project
+run_runner control --project a-project start
 if run_runner exec --project a-project --job "${job}"; then :; else bad "exec should have succeeded"; fi
 log_lacks 'podman'
 # The working directory is the synced tree, without the job having to arrange
@@ -556,6 +601,7 @@ saw "REAPER_OUT=${WORK}/pool/work/a-project/out"
 # Same names in both modes, so a tenant's command need not know which it got.
 saw "REAPER_STATE=${WORK}/pool/state"
 saw "REAPER_CONTROL=${WORK}/pool/control/a-project"
+run_runner control --project a-project stop
 
 new_case "host execution still hands over the caches, by their host paths"
 FAKE_PLATFORM=Linux
@@ -948,6 +994,17 @@ log_has 'zfs rollback -r tank/state@pristine'
 if ls "${ctl}"/io/req.* >/dev/null 2>&1; then bad "a request was left behind"; else ok "no request left behind"; fi
 if ls "${ctl}"/io/res.* >/dev/null 2>&1; then bad "a reply was left behind"; else ok "no reply left behind"; fi
 run_runner control --project a-project stop
+
+echo
+echo "nothing left running"
+CASE="the suite leaves no process behind"
+leaked=$(pgrep -f "${RUNDIR}" 2>/dev/null | wc -l | tr -d ' ')
+if [ "${leaked}" -eq 0 ]; then
+    ok "no stray processes"
+else
+    bad "${leaked} process(es) still running from this suite"
+    pgrep -lf "${RUNDIR}" 2>/dev/null | head -5 | sed 's/^/          /'
+fi
 
 echo
 printf '%s passed, %s failed\n' "${pass}" "${fail}"

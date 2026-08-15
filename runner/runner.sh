@@ -519,10 +519,7 @@ cmd_exec() {
     # State is a dataset firstboot made; control is per project. Both have to
     # exist before a container tries to mount them, or the engine creates a
     # directory owned by nobody in their place.
-    mkdir -p "$(state_dir)" "$(control_io "${exec_project}")"
-    # The wrapper is mounted as a file, so it has to exist before a container
-    # starts or the engine invents a directory in its place.
-    [ -e "$(control_dir "${exec_project}")/reset" ] || cmd_control --project "${exec_project}" start
+    mkdir -p "$(state_dir)"
 
     for exec_c in ${exec_caches}; do
         valid_name "${exec_c}" || usage "exec: ${exec_c} is not a usable cache name"
@@ -560,13 +557,25 @@ exec_in_container() {
         -v "${exec_work}:${MOUNT_WORK}" \
         -v "${exec_job}:${MOUNT_JOB}:ro" \
         -v "$(state_dir):${MOUNT_STATE}" \
-        -v "$(control_io "${exec_project}"):${MOUNT_CONTROL}/io" \
-        -v "$(control_dir "${exec_project}")/reset:${MOUNT_CONTROL}/reset:ro" \
-        -v "$(control_dir "${exec_project}")/snapshot:${MOUNT_CONTROL}/snapshot:ro" \
         -e "REAPER_WORK=${MOUNT_WORK}" \
         -e "REAPER_OUT=${MOUNT_WORK}/out" \
-        -e "REAPER_STATE=${MOUNT_STATE}" \
-        -e "REAPER_CONTROL=${MOUNT_CONTROL}"
+        -e "REAPER_STATE=${MOUNT_STATE}"
+
+    # The reset trigger, only if one has been set up.
+    #
+    # This used to start a control loop here when it found no wrapper to mount,
+    # which meant a resident process appeared as a side effect of preparing a
+    # directory -- for every tenant, including those that declare nothing to
+    # roll back and for which the CLI deliberately starts no trigger. Starting a
+    # daemon is a decision, and it belongs to whoever knows whether the tenant
+    # can reset at all.
+    if [ -e "$(control_dir "${exec_project}")/reset" ]; then
+        set -- "$@" \
+            -v "$(control_io "${exec_project}"):${MOUNT_CONTROL}/io" \
+            -v "$(control_dir "${exec_project}")/reset:${MOUNT_CONTROL}/reset:ro" \
+            -v "$(control_dir "${exec_project}")/snapshot:${MOUNT_CONTROL}/snapshot:ro" \
+            -e "REAPER_CONTROL=${MOUNT_CONTROL}"
+    fi
 
     for exec_c in ${exec_caches}; do
         set -- "$@" -v "$(cache_dir "${exec_c}"):${MOUNT_CACHE}/${exec_c}"
@@ -581,7 +590,11 @@ exec_on_host() {
     # env rather than exporting into this shell: the job gets exactly the
     # variables it was promised, and nothing this script happens to be holding.
     set -- "REAPER_WORK=${exec_work}" "REAPER_OUT=${exec_work}/out" \
-        "REAPER_STATE=$(state_dir)" "REAPER_CONTROL=$(control_dir "${exec_project}")"
+        "REAPER_STATE=$(state_dir)"
+    # As above: named only when there is something to name.
+    if [ -e "$(control_dir "${exec_project}")/reset" ]; then
+        set -- "$@" "REAPER_CONTROL=$(control_dir "${exec_project}")"
+    fi
     for exec_c in ${exec_caches}; do
         set -- "$@" "$(cache_var "${exec_c}")=$(cache_dir "${exec_c}")"
     done
