@@ -67,8 +67,14 @@ mod epoch {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<SystemTime, D::Error> {
         let secs = u64::deserialize(d)?;
-        Ok(UNIX_EPOCH + Duration::from_secs(secs))
+        from_secs_checked(secs).ok_or_else(|| serde::de::Error::custom("epoch seconds overflow SystemTime"))
     }
+}
+
+/// Checked, because this arrives from a file: a value that overflows
+/// SystemTime must surface as the store's Corrupt error, not a panic.
+fn from_secs_checked(secs: u64) -> Option<SystemTime> {
+    UNIX_EPOCH.checked_add(Duration::from_secs(secs))
 }
 
 mod epoch_opt {
@@ -88,7 +94,11 @@ mod epoch_opt {
         d: D,
     ) -> std::result::Result<Option<SystemTime>, D::Error> {
         let secs = Option::<u64>::deserialize(d)?;
-        Ok(secs.map(|s| UNIX_EPOCH + Duration::from_secs(s)))
+        secs.map(|s| {
+            super::from_secs_checked(s)
+                .ok_or_else(|| serde::de::Error::custom("epoch seconds overflow SystemTime"))
+        })
+        .transpose()
     }
 }
 
@@ -178,6 +188,21 @@ impl Store {
     /// The store at the conventional location.
     pub fn open() -> Store {
         Store::at(crate::paths::state_file())
+    }
+
+    /// Test-only: the production timeouts make a wedged-lock test take ten
+    /// seconds, and a slow test is a test that stops being run.
+    #[cfg(test)]
+    pub(crate) fn with_timeouts(
+        path: impl Into<PathBuf>,
+        lock_timeout: Duration,
+        stale_lock_after: Duration,
+    ) -> Store {
+        Store {
+            path: path.into(),
+            lock_timeout,
+            stale_lock_after,
+        }
     }
 
     pub fn at(path: impl Into<PathBuf>) -> Store {
@@ -342,8 +367,16 @@ impl Store {
                 .and_then(|m| SystemTime::now().duration_since(m).ok())
                 .unwrap_or_default();
             if held_for > self.stale_lock_after {
-                let _ = fs::remove_file(&path);
-                continue;
+                // Steal by rename, then retry the create. rename is atomic, so
+                // when two waiters age the same lock out only one wins the
+                // steal -- remove-then-create would let both "acquire" it and
+                // reintroduce the lost update the lock exists to prevent. The
+                // deadline check below still runs: a steal that keeps failing
+                // (an unwritable directory) must end in Locked, not a spin.
+                let stale = path.with_extension(format!("lock.stale.{}", std::process::id()));
+                if fs::rename(&path, &stale).is_ok() {
+                    let _ = fs::remove_file(&stale);
+                }
             }
 
             if SystemTime::now() >= deadline {

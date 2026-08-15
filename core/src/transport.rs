@@ -196,7 +196,11 @@ impl Transport for Ssh {
         // Piped over the same connection rather than via scp or sftp: one tool
         // to depend on instead of three, and no assumption about which of them
         // a given guest ships.
-        let script = format!("cat > {dest} && chmod 0755 {dest}");
+        // Quoted for the same reason job.rs quotes every value: this string
+        // is parsed by the remote shell, and a path with a space or a
+        // metacharacter must stay a path.
+        let q = crate::job::quote(dest);
+        let script = format!("cat > {q} && chmod 0755 {q}");
         let mut child = Command::new(&self.program)
             .args(self.options())
             .arg(&script)
@@ -209,21 +213,27 @@ impl Transport for Ssh {
                 source: e,
             })?;
 
-        child
-            .stdin
-            .as_mut()
-            .expect("stdin was piped")
-            .write_all(bytes)
-            .map_err(|e| TransportError::Spawn {
-                program: self.program.clone(),
-                source: e,
-            })?;
+        // The write happens on its own thread while wait_with_output drains
+        // stdout and stderr: writing first and draining after deadlocks the
+        // moment the child fills a pipe buffer while stdin is still mid-write
+        // (a verbose ssh wrapper is enough).
+        let mut stdin = child.stdin.take().expect("stdin was piped");
+        let bytes_owned = bytes.to_vec();
+        let writer = std::thread::spawn(move || {
+            let r = stdin.write_all(&bytes_owned);
+            drop(stdin);
+            r
+        });
 
         let out = child.wait_with_output().map_err(|e| TransportError::Spawn {
             program: self.program.clone(),
             source: e,
         })?;
 
+        let wrote = writer.join().expect("stdin writer thread panicked");
+
+        // Status first: a write that broke mid-stream usually broke because
+        // the remote command died, and the status plus stderr says why.
         if !out.status.success() {
             return Err(TransportError::Failed {
                 what: format!("writing {dest}"),
@@ -231,6 +241,10 @@ impl Transport for Ssh {
                 stderr: String::from_utf8_lossy(&out.stderr).to_string(),
             });
         }
+        wrote.map_err(|e| TransportError::Spawn {
+            program: self.program.clone(),
+            source: e,
+        })?;
         Ok(())
     }
 

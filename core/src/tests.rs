@@ -947,3 +947,181 @@ fn a_real_round_trip_keeps_results_and_mirrors_deletions() {
     );
 
 }
+
+// ---------------------------------------------------------------------------
+// Hardening: inputs that used to panic, hang, or be silently accepted. Every
+// test here failed against the code as first written.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_multibyte_unit_is_a_parse_error_not_a_panic() {
+    // split_at on a byte index used to land inside the µ and panic; a typo in
+    // a config file must never take the process down.
+    for input in ["5µ", "µ", "10µs", "5\u{00e9}"] {
+        let e = crate::duration::parse(input).expect_err(input);
+        assert!(e.to_string().contains(input), "{e}");
+    }
+}
+
+#[test]
+fn an_astronomical_heartbeat_interval_is_refused_not_a_panic() {
+    // Duration * 3 overflows before the margin comparison; overflow IS the
+    // margin violated, so it must come back as the same config error.
+    let text = r#"
+provider = "p"
+[guests.g]
+template = "t"
+[session]
+heartbeat_interval = "6148914691236517206s"
+default_ttl = "6148914691236517206s"
+[p]
+"#;
+    let e = parse(text).expect_err("should refuse");
+    assert!(e.to_string().contains("heartbeat"), "{e}");
+}
+
+#[test]
+fn a_typoed_session_key_is_refused_not_silently_defaulted() {
+    // A misspelt key that quietly gets the default is the worst outcome a
+    // config file has: the person believes they set it.
+    let text = r#"
+provider = "p"
+[guests.g]
+template = "t"
+[session]
+default_ttll = "8h"
+[p]
+"#;
+    let e = parse(text).expect_err("should refuse");
+    assert!(e.to_string().contains("default_ttll"), "{e}");
+}
+
+#[test]
+fn an_epoch_that_overflows_systemtime_is_corrupt_not_a_panic() {
+    // The store's whole design converts an unreadable file into Corrupt; a
+    // number too large for SystemTime arrives from the same file and must get
+    // the same treatment.
+    let dir = scratch_dir("epochoverflow");
+    let path = dir.join("sessions.json");
+    let store = Store::at(&path);
+    store.put(session("alpha", "m-1")).unwrap();
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    let sabotaged = text.replace("1700007200", "18446744073709551615");
+    assert_ne!(text, sabotaged, "fixture no longer contains the expiry");
+    std::fs::write(&path, sabotaged).unwrap();
+
+    let e = store.list().expect_err("should refuse");
+    assert!(
+        matches!(e, crate::session::StoreError::Corrupt { .. }),
+        "wanted Corrupt, got {e}"
+    );
+}
+
+#[test]
+fn an_unstealable_stale_lock_ends_in_locked_not_a_spin() {
+    // When the stale lock cannot be removed (unwritable directory), the old
+    // code skipped both the deadline and the sleep and span forever at 100%
+    // CPU. It must give up with Locked like any other contended lock.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch_dir("wedgedlock");
+    let path = dir.join("sessions.json");
+    let lock = dir.join("sessions.lock");
+    std::fs::write(&lock, "").unwrap();
+    let f = std::fs::File::open(&lock).unwrap();
+    f.set_modified(SystemTime::now() - Duration::from_secs(3600))
+        .unwrap();
+    drop(f);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let store = Store::with_timeouts(&path, Duration::from_millis(300), Duration::from_secs(120));
+    let started = std::time::Instant::now();
+    let result = store.put(session("alpha", "m-1"));
+    // Permissions come back BEFORE any assertion: a test that can only be
+    // cleaned up when it passes leaks an unremovable directory when it fails.
+    std::fs::set_permissions(&*dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let e = result.expect_err("should refuse");
+
+    assert!(
+        matches!(e, crate::session::StoreError::Locked { .. }),
+        "wanted Locked, got {e}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "took {:?}, which looks like the spin",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn put_executable_quotes_the_destination() {
+    // The script goes to a remote shell; a destination with a space or a
+    // metacharacter must stay a path. The stub stands in for ssh and records
+    // the script it was handed.
+    let dir = scratch_dir("putquote");
+    let stub = dir.join("fake-ssh");
+    let record = dir.join("argv");
+    write(
+        &stub,
+        format!(
+            "#!/bin/sh\nshift $(($# - 1))\nprintf '%s' \"$1\" > {} ; cat > /dev/null\n",
+            crate::job::quote(record.to_str().unwrap())
+        )
+        .as_bytes(),
+    );
+
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let ssh = crate::transport::Ssh::new(
+        stub.to_str().unwrap(),
+        "root",
+        "192.0.2.7".parse().unwrap(),
+        None,
+        dir.join("kh"),
+        Duration::from_secs(15),
+    );
+    use crate::transport::Transport;
+    ssh.put_executable(b"#!/bin/sh\n", "/tmp/a b;touch pwned")
+        .expect("stub accepts");
+
+    let recorded = std::fs::read_to_string(&record).unwrap();
+    // The last argument -- the remote script -- must carry the destination
+    // inside single quotes, so the remote shell sees one word and no command.
+    assert_eq!(
+        recorded,
+        "cat > '/tmp/a b;touch pwned' && chmod 0755 '/tmp/a b;touch pwned'",
+    );
+    assert!(!dir.join("pwned").exists(), "the metacharacter executed");
+}
+
+#[test]
+fn put_executable_survives_a_chatty_child() {
+    // A child that fills its stderr pipe while the parent is still writing
+    // stdin used to deadlock both sides forever. The stub shouts a megabyte
+    // of stderr first, then drains stdin, which is the pathological order.
+    let dir = scratch_dir("putchatty");
+    let stub = dir.join("fake-ssh");
+    write(
+        &stub,
+        b"#!/bin/sh\ni=0; while [ $i -lt 16384 ]; do printf '%064d\\n' $i >&2; i=$((i+1)); done; cat > /dev/null\n",
+    );
+
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let ssh = crate::transport::Ssh::new(
+        stub.to_str().unwrap(),
+        "root",
+        "192.0.2.7".parse().unwrap(),
+        None,
+        dir.join("kh"),
+        Duration::from_secs(15),
+    );
+    use crate::transport::Transport;
+    let payload = vec![b'x'; 1 << 20];
+    ssh.put_executable(&payload, "/tmp/big")
+        .expect("a chatty child is normal ssh -vvv behavior, not an error");
+}

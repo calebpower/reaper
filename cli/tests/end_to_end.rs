@@ -48,7 +48,7 @@ printf '%s
 ' "$*" >> "${here}/ssh.log"
 for a in "$@"; do
     case "${a}" in
-        *"cat > /tmp/reaper-job.sh"*) cat > "${here}/job" ;;
+        *"cat > '/tmp/reaper-job.sh'"*) cat > "${here}/job" ;;
         *"cat > "*) cat > "${here}/uploaded" ;;
         # The one runner reply the CLI reads rather than ignores: where the
         # workspace is. Answered here so the CLI's own use of it is exercised.
@@ -469,7 +469,7 @@ fn up_delivers_the_runner_and_builds_the_storage_before_declaring_ready() {
     );
 
     let log = h.ssh_log();
-    assert!(log.contains("chmod 0755 /tmp/reaper-runner.sh"), "{log}");
+    assert!(log.contains("chmod 0755 '/tmp/reaper-runner.sh'"), "{log}");
     assert!(log.contains("/tmp/reaper-runner.sh firstboot"), "{log}");
 
     // The connection is unattended and the host is brand new.

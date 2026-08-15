@@ -33,7 +33,11 @@ pub fn parse(s: &str) -> Result<Duration, ParseError> {
         reason,
     };
 
-    let (digits, unit) = s.split_at(s.len().saturating_sub(1));
+    // Split before the final *character*, not the final byte: a multi-byte
+    // unit like "5µ" must be an unknown-unit error, not a panic on a byte
+    // index that is not a char boundary.
+    let unit_len = s.chars().last().map(char::len_utf8).unwrap_or(0);
+    let (digits, unit) = s.split_at(s.len() - unit_len);
     let secs_per = match unit {
         "s" => 1u64,
         "m" => 60,

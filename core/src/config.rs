@@ -138,7 +138,10 @@ impl Config {
     }
 }
 
+// deny_unknown_fields: a typoed key silently getting its default is the
+// worst outcome a config file has -- the guest entry already refuses one.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawSession {
     default_ttl: Option<String>,
     heartbeat_interval: Option<String>,
@@ -265,7 +268,12 @@ pub fn parse(text: &str, path: &Path) -> Result<Config, ConfigError> {
     // absorb a slow API call or a laptop lid. A third of the TTL means at least
     // two renewals can fail before anything is lost; at exactly the TTL, one
     // slow call costs a session.
-    if heartbeat_interval * 3 > default_ttl {
+    // checked_mul: an astronomically large interval is the margin violated,
+    // not a reason to panic on Duration overflow.
+    if heartbeat_interval
+        .checked_mul(3)
+        .map_or(true, |m| m > default_ttl)
+    {
         return Err(invalid(format!(
             "session.heartbeat_interval is {} but session.default_ttl is only {}: \
              a heartbeat must fit at least three times into the TTL, or a single \
