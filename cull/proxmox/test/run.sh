@@ -72,6 +72,7 @@ logger)
 sleep)
     : ;;
 curl)
+    { for a in "$@"; do printf '[%s]' "${a}"; done; printf '\n'; } >> "${FIX}/curl.argv"
     method=GET
     url=""
     prev=""
@@ -88,6 +89,7 @@ curl)
             cat "${FIX}/resources.json" ;;
         "GET "*"status/current")
             vmid=$(printf '%s' "${url}" | sed 's|.*/qemu/\([0-9]*\)/.*|\1|')
+            if [ -f "${FIX}/status_rc_${vmid}" ]; then exit "$(cat "${FIX}/status_rc_${vmid}")"; fi
             if [ -f "${FIX}/status_${vmid}.json" ]; then
                 cat "${FIX}/status_${vmid}.json"
             else
@@ -333,6 +335,48 @@ untouched 9012
 untouched 8100
 untouched 9013
 says "reaped 1, skipped 2"
+
+echo
+echo "hardening: defects found by adversarial review"
+
+new_case "a CA path with a space reaches curl as one argument"
+resources <<JSON
+{"data":[]}
+JSON
+mkdir -p "${WORK}/ca dir"
+: > "${WORK}/ca dir/ca.pem"
+( PATH="${WORK}/bin" \
+  FIX="${WORK}/fix" \
+  FIXLOG="${WORK}/log" \
+  FAKE_NOW="${NOW}" \
+  PVE_HOST="somehost:8006" \
+  PVE_POOL="a/pool" \
+  VMID_MIN=9000 \
+  VMID_MAX=9099 \
+  CRED="${WORK}/cred" \
+  PVE_CACERT="${WORK}/ca dir/ca.pem" \
+  "${cull}" ) > "${WORK}/out" 2> "${WORK}/err" || bad "should have succeeded"
+if grep -qF "[--cacert][${WORK}/ca dir/ca.pem]" "${WORK}/fix/curl.argv"; then
+    ok "the path stayed whole"
+else
+    bad "the path was split: $(grep -o -- '--cacert.\{0,40\}' "${WORK}/fix/curl.argv" | head -1)"
+fi
+
+new_case "a failed status poll is unknown, never already-gone"
+resources <<JSON
+{"data":[{"vmid":9020,"node":"n1","status":"running","pool":"a/pool","tags":"${expired}"}]}
+JSON
+fixture_rc status_rc_9020 22
+run_cull || bad "should have succeeded"
+nothing_destroyed
+says "did not stop"
+
+new_case "an empty status field does not shift the row"
+resources <<JSON
+{"data":[{"vmid":9021,"node":"n1","status":"","pool":"a/pool","tags":"${expired}"}]}
+JSON
+run_cull || bad "should have succeeded"
+destroyed 9021
 
 echo
 printf '%s passed, %s failed\n' "${pass}" "${fail}"

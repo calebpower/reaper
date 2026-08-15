@@ -40,13 +40,10 @@ STOP_TIMEOUT="${STOP_TIMEOUT:-60}"
 
 # Self-signed PVE cert: set PVE_INSECURE=1. If you have a real cert from
 # your CA, leave it unset and point PVE_CACERT at the CA bundle instead.
-if [ -n "${PVE_INSECURE:-}" ]; then
-	TLSOPT="--insecure"
-elif [ -n "${PVE_CACERT:-}" ]; then
-	TLSOPT="--cacert ${PVE_CACERT}"
-else
-	TLSOPT=""
-fi
+# The flags are assembled as an argument list inside api() rather than as a
+# string here: joining "--cacert /path" into one variable and re-splitting it
+# unquoted broke any CA path with a space in it, and the shellcheck disable
+# that permitted the re-split was justified only for the single-flag case.
 
 log() { logger -t pve-reap -p daemon.info "$*"; echo "pve-reap: $*"; }
 err() { logger -t pve-reap -p daemon.err  "$*"; echo "pve-reap: $*" >&2; }
@@ -61,19 +58,25 @@ err() { logger -t pve-reap -p daemon.err  "$*"; echo "pve-reap: $*" >&2; }
 
 api() {
 	_method="$1"; _path="$2"
-	# shellcheck disable=SC2086
-	# TLSOPT is a deliberate list of flags, not a filename; quoting it would
-	# pass one empty argument or one nonsensical one.
-	curl -sS --fail-with-body $TLSOPT \
+	set -- -sS --fail-with-body
+	if [ -n "${PVE_INSECURE:-}" ]; then
+		set -- "$@" --insecure
+	elif [ -n "${PVE_CACERT:-}" ]; then
+		set -- "$@" --cacert "${PVE_CACERT}"
+	fi
+	curl "$@" \
 		-X "$_method" \
 		-H "Authorization: $PVE_TOKEN" \
 		"https://${PVE_HOST}/api2/json${_path}"
 }
 
-# Returns the guest's current status string, or empty if it is gone.
+# Prints the guest's current status, or nothing and a non-zero exit when the
+# query itself failed. The distinction matters: a failed query used to read as
+# "already gone", and the sweeper then proceeded as if a stop had finished
+# that it actually knows nothing about.
 vm_status() {
-	api GET "/nodes/$1/qemu/$2/status/current" 2>/dev/null \
-		| jq -r '.data.status // empty'
+	_body=$(api GET "/nodes/$1/qemu/$2/status/current" 2>/dev/null) || return 1
+	printf '%s' "$_body" | jq -r '.data.status // empty'
 }
 
 now=$(date +%s)
@@ -110,7 +113,7 @@ if ! rows=$(printf '%s' "$resources" | jq -r --arg pool "$PVE_POOL" '
 		.data[]
 		| select(.pool == $pool)
 		| select((.template // 0) != 1)
-		| [.vmid, .node, (.status // "unknown"), (.tags // "")]
+		| [.vmid, .node, (if (.status // "") == "" then "unknown" else .status end), (.tags // "")]
 		| @tsv'); then
 	err "the API answered with something that is not the guest list we expected"
 	exit 1
@@ -154,17 +157,20 @@ while IFS="$(printf '\t')" read -r vmid node status tags; do
 		fi
 
 		waited=0
+		cur=""
 		while [ "$waited" -lt "$STOP_TIMEOUT" ]; do
 			sleep 3
 			waited=$((waited + 3))
-			cur=$(vm_status "$node" "$vmid")
-			[ -z "$cur" ] && break              # already gone
+			# A failed query is "unknown", never "gone": proceeding to
+			# the destroy on the strength of an error would be acting
+			# on a guest whose state we could not read.
+			cur=$(vm_status "$node" "$vmid") || cur="unknown"
 			[ "$cur" = "stopped" ] && break
 		done
 
-		cur=$(vm_status "$node" "$vmid")
-		if [ -n "$cur" ] && [ "$cur" != "stopped" ]; then
-			err "vmid $vmid did not stop within ${STOP_TIMEOUT}s; will retry next run"
+		cur=$(vm_status "$node" "$vmid") || cur="unknown"
+		if [ "$cur" != "stopped" ] && [ -n "$cur" ]; then
+			err "vmid $vmid did not stop within ${STOP_TIMEOUT}s (last status: $cur); will retry next run"
 			continue
 		fi
 	fi

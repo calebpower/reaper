@@ -147,7 +147,9 @@ zpool)
 zfs)
     case "$1" in
         snapshot|rollback) exit 0 ;;
-        get) fix zfs_mountpoint ;;
+        get)
+            if [ -f "${FIX}/zfs_get_rc" ]; then exit "$(cat "${FIX}/zfs_get_rc")"; fi
+            fix zfs_mountpoint ;;
         list)
             # `zfs list -t snapshot` asks whether a named snapshot exists; the
             # fixture decides, so a test can model both answers.
@@ -765,6 +767,24 @@ log_has 'podman stop aaa111'
 # Stopping the caller would look exactly like the reset having crashed.
 log_lacks 'podman stop bbb222'
 log_has 'zfs rollback'
+
+new_case "an unreadable mountpoint refuses with a sentence, not a silent death"
+FAKE_PLATFORM=Linux
+with_engine
+printf 'tank/state@pristine\n' > "${WORK}/fix/zfs_snapshots"
+: > "${WORK}/fix/running_containers"
+# zfs get fails. Under set -e an unguarded substitution here used to kill the
+# runner with no message and no exit-2 contract -- and, worse to think about,
+# it died before the open-files check it exists to feed.
+printf '1\n' > "${WORK}/fix/zfs_get_rc"
+if run_runner rollback --dataset state --name pristine; then
+    bad "should have refused when the mountpoint cannot be read"
+else
+    ok "refused"
+fi
+errsays 'cannot read'
+errsays 'not rolling back'
+log_lacks 'zfs rollback'
 
 new_case "a live process on the dataset stops the rollback, whatever ZFS would allow"
 FAKE_PLATFORM=Linux

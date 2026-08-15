@@ -801,7 +801,11 @@ cmd_rollback() {
     # Then check, because stopping containers is not the same as the dataset
     # being idle -- a host-execution tenant that daemonised something has
     # nothing for the step above to stop.
-    roll_mount=$(zfs get -H -o value mountpoint "${roll_target}" 2>/dev/null)
+    # Guarded: under set -e an unguarded substitution failing here would kill
+    # the runner with no message at all. Failing to learn the mountpoint is
+    # answered like every other refusal, with a sentence.
+    roll_mount=$(zfs get -H -o value mountpoint "${roll_target}" 2>/dev/null) \
+        || die "cannot read ${roll_target}'s mountpoint, so cannot check for open files; not rolling back"
     if [ -n "${roll_mount}" ] && [ "${roll_mount}" != "-" ]; then
         roll_held=$(holders "${roll_mount}")
         if [ -n "${roll_held}" ]; then
