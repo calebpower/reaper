@@ -51,8 +51,21 @@ offenders() {
 checks() {
 
 # Files this project actually wrote. Build output and vendored code are not
-# ours to hold to these rules.
-sources() { git ls-files | grep -vE '^(docs/(reaper-plan|testing-methodology)\.md)$'; }
+# ours to hold to these rules. Untracked files ARE: a new script is untracked
+# for exactly the window in which this gate is its only reviewer, and this
+# battery itself passed its own gate while untracked and failed it one commit
+# later. --others closes that window; --exclude-standard keeps build output
+# out via .gitignore.
+#
+# This file is excluded from its own scans, and the reason has to cover the
+# whole file: every rule below quotes the construct it forbids, in the pattern
+# or in the message, so a textual scan cannot tell its rules from violations.
+# The shell linter still covers it, and running it in the gate on both systems is
+# what exercises its portability.
+sources() {
+    git ls-files --cached --others --exclude-standard \
+        | grep -vE '^(docs/(reaper-plan|testing-methodology)\.md|tools/invariants\.sh)$'
+}
 shell_sources() { sources | grep -E '\.sh$'; }
 rust_sources() { sources | grep -E '\.rs$'; }
 
@@ -145,7 +158,7 @@ printf '\n--- safety: refusals that must not quietly become permissions ---\n\n'
 
 # Invocations only. A comment saying "not -f" and a test asserting its absence
 # are the project agreeing with this rule, not breaking it.
-sources | grep -vE '^(tools/invariants\.sh|docs/)' \
+sources | grep -v '^docs/' \
     | xargs grep -nE 'zpool create -f|zfs (destroy|rollback)[^|]*-f\b' 2>/dev/null \
     | grep -vE ':[0-9]+:[[:space:]]*#' \
     | grep -vE 'log_lacks|assert|refuted|must not' \
@@ -154,7 +167,7 @@ sources | grep -vE '^(tools/invariants\.sh|docs/)' \
     "-f tells ZFS to ignore what it found, whatever it is. Clear the
 residue deliberately and let it check again."
 
-sources | grep -vE '^(tools/invariants\.sh|docs/)' | xargs grep -nE '#\[ignore\]|--skip ' 2>/dev/null \
+sources | grep -v '^docs/' | xargs grep -nE '#\[ignore\]|--skip ' 2>/dev/null \
     | offenders \
     "no test is skipped" \
     "A skipped test is a decision about what this project permanently stops
@@ -162,8 +175,7 @@ noticing."
 
 # `|| true` is legitimate on cleanup. It is not legitimate on anything whose
 # failure is the point.
-shell_sources | grep -v '^tools/invariants.sh$' \
-    | xargs grep -nE '(zfs (rollback|snapshot|destroy)|zpool create|podman (rm|stop)) .*\|\| true' 2>/dev/null \
+shell_sources | xargs grep -nE '(zfs (rollback|snapshot|destroy)|zpool create|podman (rm|stop)) .*\|\| true' 2>/dev/null \
     | offenders \
     "no swallowing the failure of something destructive or load-bearing" \
     "|| true on cleanup is fine. On an operation whose success is the claim,
@@ -238,6 +250,24 @@ somebody comes to rely on something that is not there."
 'reaper down --manifest x' was rejected outright -- which in a script reads
 as a session taken down when it was not."
 
+printf '\n--- the gate: what reviews the reviewers ---\n\n'
+
+# A plain ls-files lists only what is committed, so a new script is reviewed
+# by nothing until after its first commit -- this battery passed its own gate
+# that way and failed it one commit later, with an identical tree. Every
+# file-list a gate script builds must therefore include untracked files.
+# The pattern is written so it cannot match itself; the flag filter means an
+# invocation carrying the flags on the same line is the only accepted form.
+for f in tools/*.sh; do
+    grep -n 'git ls-file[s]' "${f}" 2>/dev/null \
+        | grep -v -- '--others --exclude-standard' \
+        | sed "s|^|${f}:|"
+done | offenders \
+    "the gate reviews untracked files too" \
+    "A file is untracked for exactly the window in which the gate is its
+only reviewer. --others --exclude-standard closes that window while
+.gitignore keeps build output out."
+
 printf '\n--- documentation that claims something the code must actually do ---\n\n'
 
 # Every [session] key documented in site-config.md must be parsed, and every
@@ -259,17 +289,28 @@ printf '\n--- documentation that claims something the code must actually do ---\
     "A setting documented and unread is a lie; one read and undocumented is
 a trap."
 
-# Same for the provider's own table.
+# Same for each provider's own table. Providers are discovered, not named:
+# name one here and the provider seam guard fails this file, correctly. The
+# doc section is expected to carry the provider directory's name, so a second
+# provider is checked the day its directory appears.
 {
-    documented=$(awk '/^\[proxmox\]/{f=1;next} f && /^\[|^```/{exit} f' docs/site-config.md \
-        | sed -n 's/^\([a-z_]*\) *=.*/\1/p' | sort -u)
-    parsed=$(sed -n '/^struct Raw {/,/^}/p' providers/proxmox/src/config.rs \
-        | sed -n 's/^    \([a-z_]*\): .*/\1/p' | sort -u)
-    for k in ${documented}; do
-        printf '%s\n' "${parsed}" | grep -qx "${k}" || printf 'site-config.md documents a provider key %s that nothing parses\n' "${k}"
-    done
-    for k in ${parsed}; do
-        printf '%s\n' "${documented}" | grep -qx "${k}" || printf 'provider key %s is parsed but undocumented\n' "${k}"
+    for cfg in providers/*/src/config.rs; do
+        [ -f "${cfg}" ] || continue
+        prov=${cfg#providers/}; prov=${prov%%/*}
+        documented=$(awk -v s="[${prov}]" 'index($0,s)==1{f=1;next} f && /^\[|^```/{exit} f' docs/site-config.md \
+            | sed -n 's/^\([a-z_]*\) *=.*/\1/p' | sort -u)
+        if [ -z "${documented}" ]; then
+            printf 'site-config.md has no [%s] section, but providers/%s parses a config\n' "${prov}" "${prov}"
+            continue
+        fi
+        parsed=$(sed -n '/^struct Raw {/,/^}/p' "${cfg}" \
+            | sed -n 's/^    \([a-z_]*\): .*/\1/p' | sort -u)
+        for k in ${documented}; do
+            printf '%s\n' "${parsed}" | grep -qx "${k}" || printf 'site-config.md documents a %s key %s that nothing parses\n' "${prov}" "${k}"
+        done
+        for k in ${parsed}; do
+            printf '%s\n' "${documented}" | grep -qx "${k}" || printf '%s key %s is parsed but undocumented\n' "${prov}" "${k}"
+        done
     done
 } | offenders \
     "every provider setting is both parsed and documented" \

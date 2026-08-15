@@ -23,9 +23,10 @@ failures=0
 
 # scan <label> <allow-regex> <forbid-regex> <why>
 #
-# Reports every tracked file outside the allowed paths that matches the
-# forbidden pattern. Tracked files only: build output and untracked scratch are
-# not the project's source.
+# Reports every file outside the allowed paths that matches the forbidden
+# pattern. Untracked files are scanned too: a new source file is untracked for
+# exactly the window in which this gate is its only reviewer. Build output
+# stays out via .gitignore (--exclude-standard).
 scan() {
     label=$1
     allow=$2
@@ -33,7 +34,7 @@ scan() {
     why=$4
 
     hits=''
-    for f in $(git ls-files | grep -Ev "${allow}"); do
+    for f in $(git ls-files --cached --others --exclude-standard | grep -Ev "${allow}"); do
         # Binary files and deleted-but-tracked paths are skipped rather than
         # reported as errors; neither is source anyone can leak through.
         [ -f "${f}" ] || continue

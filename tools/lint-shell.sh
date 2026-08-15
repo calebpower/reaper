@@ -20,12 +20,14 @@ cd "${root}"
 # from koalaman/shellcheck:v0.11.0 on 2026-08-12.
 IMAGE='docker.io/koalaman/shellcheck@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d'
 
-# Every tracked file that is a shell script, by extension or by shebang. Going
-# by shebang as well as extension matters: an extensionless hook or wrapper is
-# still a shell script, and skipping it because it is not named *.sh is exactly
-# the kind of silent gap this is meant to close.
+# Every file that is a shell script, by extension or by shebang, untracked
+# ones included -- a new script is untracked for exactly the window in which
+# this lint is its only reviewer. Going by shebang as well as extension
+# matters: an extensionless hook or wrapper is still a shell script, and
+# skipping it because it is not named *.sh is exactly the kind of silent gap
+# this is meant to close.
 scripts=$(
-    for f in $(git ls-files); do
+    for f in $(git ls-files --cached --others --exclude-standard); do
         [ -f "${f}" ] || continue
         case "${f}" in
             *.sh) printf '%s\n' "${f}"; continue ;;
