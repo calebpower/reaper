@@ -131,7 +131,7 @@ pub fn up(
     if let Some(key) = &cfg.session.ssh_key {
         if !key.exists() {
             return Err(format!(
-                "session.ssh_key {} does not exist, so no session could ever                  be reached. Fix the path in {} before creating machines",
+                "session.ssh_key {} does not exist, so no session could ever be reached. Fix the path in {} before creating machines",
                 key.display(),
                 cfg.path.display()
             )
@@ -151,7 +151,8 @@ pub fn up(
 
         if let Some(existing) = store.get(&name)? {
             // A record with no address is an `up` that never finished; there
-            // is nothing here to reuse and no way to resume it.
+            // is nothing here to reuse and no way to resume it. Judged before
+            // the cluster is consulted: it is about the record's own shape.
             let Some(address) = existing.address else {
                 return Err(format!(
                     "{name}: a session by this name exists but never became ready, so \
@@ -159,6 +160,16 @@ pub fn up(
                 )
                 .into());
             };
+            // The record says up; the cluster may know better. Reusing a
+            // machine the sweeper has taken hands back a session every verb
+            // fails against, with a heartbeat that ends seconds later.
+            let live_machines = provider.list()?;
+            if !live_machines.iter().any(|m| m.machine == existing.machine) {
+                return Err(format!(
+                    "{name}: its machine is gone (the sweeper collects anything past its expiry). `reaper down {name}` clears the record, and the next `reaper up` starts fresh"
+                )
+                .into());
+            }
             // Reusing a session whose heartbeat died (a reboot, a killed
             // terminal) would hand the operator a machine on a fixed
             // countdown; restart the renewal before calling it up.
@@ -542,7 +553,11 @@ pub fn list() -> Result<()> {
             None => "EXPIRED".to_string(),
         };
         let heartbeat = match s.heartbeat_pid {
-            Some(pid) if proc::is_alive(pid) => format!("{pid}"),
+            // The same judgement `down` uses before signalling: alive AND
+            // verifiably ours. An alive pid the OS has recycled for a
+            // stranger is a dead heartbeat wearing a number, and this column
+            // is the dead-man's-switch indicator -- it must not vouch for it.
+            Some(pid) if proc::looks_like_heartbeat(pid) == Some(true) => format!("{pid}"),
             // A dead heartbeat means the expiry has stopped moving. Nothing is
             // leaked -- that is what the tag is for -- but the session is now
             // on a countdown nobody is winding.
@@ -665,7 +680,7 @@ pub fn renew(
             Err(reaper_core::ProviderError::NotFound(_)) => {
                 failures += 1;
                 eprintln!(
-                    "{}: its machine is gone (the sweeper collects anything past                      its expiry); there is nothing left to renew. `reaper down {}`                      clears the record",
+                    "{}: its machine is gone (the sweeper collects anything past its expiry); there is nothing left to renew. `reaper down {}` clears the record",
                     s.name, s.name
                 );
             }
@@ -804,7 +819,7 @@ pub fn heartbeat(name: &str) -> Result<()> {
             // log line.
             Err(reaper_core::ProviderError::NotFound(_)) => {
                 eprintln!(
-                    "{name}: its machine is gone; nothing left to renew, so this                      heartbeat is ending. `reaper down {name}` clears the record"
+                    "{name}: its machine is gone; nothing left to renew, so this heartbeat is ending. `reaper down {name}` clears the record"
                 );
                 return Ok(());
             }
@@ -1248,6 +1263,18 @@ pub fn exec(
 
     let mut failures = 0;
     for s in implied_sessions(&store, session, Some(&manifest.project))? {
+        // Nothing has ever been pushed, so the workspace is empty; a build
+        // has nothing to compile and a run's "success" would be meaningless
+        // -- and on a project with reset datasets, that success would take
+        // @pristine of unseeded state, poisoning every later reset.
+        if s.synced_at.is_none() {
+            return Err(format!(
+                "{}: nothing has been synced into it yet, so there is nothing to {}. `reaper sync` pushes the tree (and `reaper test` does all of this in order)",
+                s.name,
+                which.label()
+            )
+            .into());
+        }
         let g = manifest.guest(&s.guest).ok_or_else(|| {
             format!(
                 "this session runs on {:?}, and the manifest no longer names that \

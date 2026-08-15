@@ -1929,3 +1929,94 @@ fn up_refuses_a_missing_ssh_key_before_spending_a_machine() {
         "the refusal must come before the machine is spent"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Battery three: records that have quietly stopped being true. Written
+// before the fixes and watched failing.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_run_before_any_sync_is_refused_not_run_against_nothing() {
+    // The workspace is empty until a sync; a run "succeeding" against it is
+    // meaningless -- and on a project that declares reset datasets, that
+    // meaningless success would take @pristine of unseeded state, poisoning
+    // every later reset. The refusal is the cheap moment.
+    let h = Harness::new("runnosync");
+    write(
+        &h.dir.join(".reaper.toml"),
+        r#"
+schema = 1
+project = "a-project"
+guests = ["a-guest"]
+exec = "host"
+
+[run]
+cmd = "make check"
+
+[reset]
+datasets = ["state"]
+"#,
+        None,
+    );
+    h.ok(&["up"]);
+    let err = h.fails(&["run"]);
+    assert!(
+        err.contains("sync"),
+        "say what has not happened yet: {err}"
+    );
+    assert!(
+        !h.log("ssh.log").contains("snapshot --dataset"),
+        "and above all take no pristine of an empty workspace: {}",
+        h.log("ssh.log")
+    );
+}
+
+#[test]
+fn list_does_not_vouch_for_a_recycled_pid() {
+    // `down` already refuses to signal a pid that is no longer the
+    // heartbeat; `list` was still showing the same pid as a live heartbeat.
+    // The column is the operator's dead-man's-switch indicator -- vouching
+    // for a stranger's process is the one lie it must not tell.
+    let h = Harness::new("recycledpid");
+    h.ok(&["up"]);
+    // Replace the recorded pid with this test's own: alive, and not a
+    // heartbeat.
+    let p = h.dir.join("sessions.json");
+    let stored = std::fs::read_to_string(&p).unwrap();
+    let re_stored = {
+        let pid = std::process::id();
+        let mut out = String::new();
+        for line in stored.lines() {
+            if line.trim_start().starts_with("\"heartbeat_pid\"") {
+                out.push_str(&format!("      \"heartbeat_pid\": {pid},\n"));
+            } else {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out
+    };
+    std::fs::write(&p, re_stored).unwrap();
+
+    let out = h.ok(&["list"]);
+    assert!(
+        out.contains("DEAD"),
+        "an alive-but-foreign pid is a dead heartbeat, not a live one: {out}"
+    );
+}
+
+#[test]
+fn up_does_not_reuse_a_session_whose_machine_is_gone() {
+    // The record said up; the sweeper had other information. "Reusing" a
+    // machine that no longer exists hands the operator a session every verb
+    // will fail against, with a heartbeat that exits seconds later.
+    let h = Harness::new("reusegone");
+    h.ok(&["up"]);
+    let m = h.hypervisor.machine_named("a-project").expect("machine");
+    h.hypervisor.collect(&m);
+    let err = h.fails(&["up"]);
+    assert!(
+        err.contains("gone") && err.contains("reaper down"),
+        "say what happened and the way out: {err}"
+    );
+}
