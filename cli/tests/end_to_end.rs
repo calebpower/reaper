@@ -1980,9 +1980,20 @@ fn list_does_not_vouch_for_a_recycled_pid() {
     let h = Harness::new("recycledpid");
     h.ok(&["up"]);
     // Replace the recorded pid with this test's own: alive, and not a
-    // heartbeat.
+    // heartbeat. The REAL heartbeat is killed first -- once its pid leaves
+    // the record, nothing (not even the harness's closing down --all) can
+    // stop it, and it lingers until its next ten-minute tick. This suite's
+    // own residue count is what caught that.
     let p = h.dir.join("sessions.json");
     let stored = std::fs::read_to_string(&p).unwrap();
+    if let Some(pid) = stored
+        .split("\"heartbeat_pid\": ")
+        .nth(1)
+        .and_then(|r| r.split(&[',', '\n'][..]).next())
+        .and_then(|x| x.trim().parse::<i32>().ok())
+    {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
     let re_stored = {
         let pid = std::process::id();
         let mut out = String::new();
@@ -2104,4 +2115,129 @@ fn an_up_stopped_by_the_cap_keeps_what_it_made() {
         1,
         "only the stranger's machine remains"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Battery five: probes at the remaining seams. Where these pass on first
+// contact, they pin behavior that was correct but unwitnessed.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_expired_record_with_a_live_machine_is_still_reusable() {
+    // The sweeper has not come yet; the machine is real; the record's expiry
+    // is merely stale. Reuse restarts the renewal rather than refusing a
+    // perfectly good machine.
+    let h = Harness::new("staleexpiry");
+    h.ok(&["up"]);
+    let p = h.dir.join("sessions.json");
+    let stored = std::fs::read_to_string(&p).unwrap();
+    let re_stored: String = stored
+        .lines()
+        .map(|l| {
+            if l.trim_start().starts_with("\"expires_at\"") {
+                "      \"expires_at\": 1500000000,".to_string()
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&p, re_stored).unwrap();
+
+    let out = h.ok(&["up"]);
+    assert!(out.contains("reusing it"), "{out}");
+    let out = h.ok(&["renew"]);
+    assert!(out.contains("expires in"), "{out}");
+}
+
+#[test]
+fn a_second_run_does_not_move_the_pristine_point() {
+    // The first successful run takes @pristine; the second must not quietly
+    // re-take it -- the point is a fixed place resets return to, not a
+    // rolling one.
+    let h = Harness::new("fixedpristine");
+    write(
+        &h.dir.join(".reaper.toml"),
+        r#"
+schema = 1
+project = "a-project"
+guests = ["a-guest"]
+exec = "host"
+
+[run]
+cmd = "make check"
+
+[reset]
+datasets = ["state"]
+"#,
+        None,
+    );
+    h.ok(&["up"]);
+    h.ok(&["sync"]);
+    h.ok(&["run"]);
+    let first: usize = h
+        .log("ssh.log")
+        .matches("snapshot --dataset state --name pristine --if-absent")
+        .count();
+    assert_eq!(first, 1, "the first run asks (with --if-absent)");
+    h.ok(&["run"]);
+    let second: usize = h
+        .log("ssh.log")
+        .matches("--if-absent")
+        .count();
+    assert_eq!(
+        second, 2,
+        "the second run may ask again, but only ever --if-absent: the runner \
+         refuses to move an existing point"
+    );
+}
+
+#[test]
+fn down_with_nothing_says_so_gently() {
+    // Nothing up: a bare `down` should explain, not stack-trace, and `down
+    // --all` should be a calm no-op.
+    let h = Harness::new("downnothing");
+    let err = h.fails(&["down"]);
+    assert!(err.contains("no sessions"), "{err}");
+    let out = h.ok(&["down", "--all"]);
+    assert!(out.contains("no sessions"), "{out}");
+}
+
+#[test]
+fn every_forward_sync_excludes_what_the_manifest_says() {
+    // The exclusions ride every push, not just the first: a later sync that
+    // forgot them would mirror the build tree over and delete out/'s
+    // protection.
+    let h = Harness::new("excludesalways");
+    write(
+        &h.dir.join(".reaper.toml"),
+        r#"
+schema = 1
+project = "a-project"
+guests = ["a-guest"]
+exec = "host"
+
+[run]
+cmd = "make check"
+
+[sync]
+exclude = ["/target/", "*.tmp"]
+"#,
+        None,
+    );
+    h.ok(&["up"]);
+    h.ok(&["sync"]);
+    h.ok(&["sync"]);
+    let pushes: Vec<&str> = h
+        .log("rsync.log")
+        .lines()
+        .filter(|l| l.contains("--delete"))
+        .map(|l| l.to_owned().leak() as &str)
+        .collect();
+    assert_eq!(pushes.len(), 2, "two syncs, two pushes");
+    for p in pushes {
+        assert!(p.contains("--exclude=/target/"), "{p}");
+        assert!(p.contains("--exclude=*.tmp"), "{p}");
+        assert!(p.contains("--exclude=/out/"), "out/ is always protected: {p}");
+    }
 }

@@ -601,6 +601,25 @@ real cluster in one session, created and destroyed by the same run:
 - `down`: results collected, machine destroyed, store empty, zero heartbeat
   processes, pool restored to exactly the two templates.
 
+## The battery cycle, 2026-08-15
+
+Five successive end-to-end batteries, each written to fail first, run until
+one came up dry. Thirteen defects fixed across four rounds: the gone-machine
+403 generalized to every per-VM mutation (set_expiry, start, stop) with the
+stand-in taught to answer 403 the way the live API does; renew, sync and run
+made per-session so one dead machine costs itself and never its siblings; a
+heartbeat whose machine is gone now ends instead of warning forever; up
+pre-flights the store's writability and the ssh key's existence before
+spending a machine; down removes the session's known-hosts, rsh wrapper and
+heartbeat log alongside the record (fourteen stale ones were sitting in the
+real state directory); run/build refuse a never-synced session rather than
+taking @pristine of unseeded state; list no longer vouches for a recycled
+pid; up refuses to reuse a session whose machine is gone, and refuses a
+cross-project session-name collision ("a"+"b-guest" vs a project named
+"a-b-guest"). Round five's four probes all passed on first contact and were
+kept as pins. Closed with a live up/renew/down smoke; the cluster and the
+state directory both came back clean.
+
 ## Decisions taken
 
 | Question | Answer | When |
