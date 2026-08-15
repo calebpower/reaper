@@ -55,10 +55,17 @@ pub fn parse(s: &str) -> Result<Duration, ParseError> {
         return Err(err("zero"));
     }
 
-    amount
+    // Ten years is the ceiling. Every duration in this project is a deadline
+    // or a cadence; a value above this is a typo, and refusing it here is
+    // what keeps every `SystemTime + ttl` downstream from overflowing.
+    const MAX: u64 = 3650 * 24 * 60 * 60;
+    let secs = amount
         .checked_mul(secs_per)
-        .map(Duration::from_secs)
-        .ok_or_else(|| err("the amount is too large"))
+        .ok_or_else(|| err("the amount is too large"))?;
+    if secs > MAX {
+        return Err(err("longer than ten years, which is a typo, not a plan"));
+    }
+    Ok(Duration::from_secs(secs))
 }
 
 /// Render a duration the way a person reads a remaining-time column: the

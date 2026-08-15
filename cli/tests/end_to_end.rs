@@ -60,7 +60,17 @@ for a in "$@"; do
         # Which points exist. A file the test controls, so both the
         # never-run-yet case and the ordinary one can be modelled.
         *"runner.sh snapshots"*)
-            cat "${here}/snapshots" 2>/dev/null || true ;;
+            sess=''
+            for b in "$@"; do
+                case "${b}" in
+                    UserKnownHostsFile=*known-hosts-*) sess=${b##*known-hosts-} ;;
+                esac
+            done
+            if [ -n "${sess}" ] && [ -f "${here}/snapshots.${sess}" ]; then
+                cat "${here}/snapshots.${sess}"
+            else
+                cat "${here}/snapshots" 2>/dev/null || true
+            fi ;;
         *"runner.sh snapshot"*)
             printf 'snapshot=tank/state@pristine\n' ;;
     esac
@@ -138,6 +148,17 @@ run:
         );
 
         Harness { hypervisor, dir }
+    }
+
+    /// Like `run`, but standing somewhere that is not the project tree.
+    fn run_from(&self, cwd: &Path, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_reaper"))
+            .args(args)
+            .current_dir(cwd)
+            .env("REAPER_CONFIG", self.dir.join("config.toml"))
+            .env("REAPER_STATE", self.dir.join("sessions.json"))
+            .output()
+            .expect("run reaper")
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -947,7 +968,7 @@ fn reset_rolls_back_every_declared_dataset() {
     let out = h.ok(&["reset"]);
     let ssh = h.log("ssh.log");
     assert!(
-        ssh.contains("rollback --dataset state --name pristine"),
+        ssh.contains("rollback --dataset state --name 'pristine'"),
         "{ssh}"
     );
     assert!(out.contains("rolled back to pristine"), "{out}");
@@ -956,7 +977,7 @@ fn reset_rolls_back_every_declared_dataset() {
     h.forget_logs();
     h.ok(&["reset", "--to", "before-the-bad-step"]);
     assert!(
-        h.log("ssh.log").contains("--name before-the-bad-step"),
+        h.log("ssh.log").contains("--name 'before-the-bad-step'"),
         "{}",
         h.log("ssh.log")
     );
@@ -973,7 +994,7 @@ fn snapshot_names_a_point() {
 
     h.ok(&["snapshot", "mid"]);
     let ssh = h.log("ssh.log");
-    assert!(ssh.contains("snapshot --dataset state --name mid"), "{ssh}");
+    assert!(ssh.contains("snapshot --dataset state --name 'mid'"), "{ssh}");
     // Not --if-absent: an explicit name is a deliberate act, and silently
     // keeping an older point of the same name would be the wrong answer.
     assert!(!ssh.contains("--if-absent"), "{ssh}");
@@ -1179,7 +1200,7 @@ fn test_can_reset_to_a_named_point() {
     let out = h.ok(&["test", "--to", "after-stack-up"]);
     assert!(out.contains("reset to after-stack-up"), "{out}");
     assert!(
-        h.log("ssh.log").contains("rollback --dataset state --name after-stack-up"),
+        h.log("ssh.log").contains("rollback --dataset state --name 'after-stack-up'"),
         "{}",
         h.log("ssh.log")
     );
@@ -1211,4 +1232,269 @@ fn a_named_point_that_does_not_exist_is_an_error_not_a_skip() {
     );
 
     h.ok(&["down"]);
+}
+
+// ---------------------------------------------------------------------------
+// Hardening: defects found by adversarial review. Every test here was watched
+// failing against the code as first written.
+// ---------------------------------------------------------------------------
+
+impl Harness {
+    /// Register a second guest at the site and hand back nothing: the point
+    /// is that the config and the hypervisor both know it.
+    fn add_guest(&self, name: &str) {
+        let template = self.hypervisor.add_template(POOL);
+        let mut cfg = std::fs::read_to_string(self.dir.join("config.toml")).unwrap();
+        cfg.push_str(&format!("\n[guests.\"{name}\"]\ntemplate = \"{template}\"\n"));
+        std::fs::write(self.dir.join("config.toml"), cfg).unwrap();
+    }
+}
+
+const TWO_GUESTS: &str = r#"
+schema: 1
+project: a-project
+guests: [a-guest, b-guest]
+exec: host
+run:
+  cmd: make check
+"#;
+
+#[test]
+fn selecting_one_guest_of_two_names_the_session_the_same_way() {
+    // `up --guest a` in a two-guest manifest used to name its session
+    // "a-project" -- the single-guest spelling -- so a later plain `up` could
+    // not see it and brought up a second machine for the same guest.
+    let h = Harness::new("guestname");
+    h.add_guest("b-guest");
+    write(&h.dir.join(".reaper.yaml"), TWO_GUESTS, None);
+
+    let out = h.ok(&["up", "--guest", "a-guest"]);
+    assert!(
+        out.contains("a-project-a-guest: creating"),
+        "the name must carry the guest suffix whenever the manifest has more \
+         than one, whatever subset this invocation chose: {out}"
+    );
+
+    let out = h.ok(&["up"]);
+    assert!(out.contains("a-project-a-guest: already up"), "{out}");
+    assert!(out.contains("a-project-b-guest: creating"), "{out}");
+    assert_eq!(
+        h.machines().len(),
+        2,
+        "two guests means two machines; three means the spellings disagreed"
+    );
+}
+
+#[test]
+fn a_guest_without_a_build_is_skipped_not_fatal() {
+    // Build is per-guest. A manifest mixing a compiled guest with an
+    // interpreted one used to abort the whole `test` at the second session.
+    let h = Harness::new("mixedbuild");
+    h.add_guest("b-guest");
+    write(
+        &h.dir.join(".reaper.yaml"),
+        r#"
+schema: 1
+project: a-project
+guests:
+  - name: a-guest
+    build:
+      cmd: make prep
+  - b-guest
+exec: host
+run:
+  cmd: make check
+"#,
+        None,
+    );
+
+    h.ok(&["up"]);
+    let out = h.ok(&["test"]);
+    assert!(
+        out.contains("b-guest declares no build; skipping"),
+        "{out}"
+    );
+    assert!(
+        out.contains("a-project-b-guest: run on b-guest"),
+        "the skip must not cost the guest its run: {out}"
+    );
+    assert!(
+        out.contains("a-project-a-guest: build on a-guest"),
+        "and the guest that declares one still builds: {out}"
+    );
+}
+
+#[test]
+fn a_session_without_the_point_skips_only_itself() {
+    // reset-before-run returned from inside the per-session loop, so one
+    // fresh session cancelled the rollback its older sibling was owed, and
+    // the older session ran on dirty state with nothing saying so.
+    let h = Harness::new("resetpair");
+    h.add_guest("b-guest");
+    write(
+        &h.dir.join(".reaper.yaml"),
+        r#"
+schema: 1
+project: a-project
+guests: [a-guest, b-guest]
+exec: host
+run:
+  cmd: make check
+reset:
+  datasets: [state]
+"#,
+        None,
+    );
+
+    h.ok(&["up"]);
+    // The b session has run before and holds a pristine; the a session --
+    // which sorts first, which is what made the early return quiet -- has
+    // nothing yet.
+    write(&h.dir.join("snapshots.a-project-b-guest"), "pristine\n", None);
+
+    let out = h.ok(&["test"]);
+    assert!(
+        out.contains("a-project-a-guest: nothing to reset to yet"),
+        "{out}"
+    );
+    assert!(out.contains("a-project-b-guest: reset to pristine"), "{out}");
+    let rolled: Vec<&str> = h
+        .log("ssh.log")
+        .lines()
+        .filter(|l| l.contains("rollback --dataset state"))
+        .map(|l| if l.contains("known-hosts-a-project-b-guest") { "b" } else { "a" })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect();
+    assert_eq!(
+        rolled,
+        vec!["b"],
+        "exactly the session that has the point rolls back"
+    );
+}
+
+#[test]
+fn a_snapshot_name_reaches_the_guest_as_data_not_shell() {
+    // The name is the one free-text argument the snapshot verbs send, and the
+    // runner's own validation happens only after the remote shell has parsed
+    // the command line. Unquoted, `a;boom` runs boom.
+    let h = Harness::new("snapquote");
+    write(
+        &h.dir.join(".reaper.yaml"),
+        r#"
+schema: 1
+project: a-project
+guests: [a-guest]
+exec: host
+run:
+  cmd: make check
+reset:
+  datasets: [state]
+"#,
+        None,
+    );
+    h.ok(&["up"]);
+    h.ok(&["snapshot", "a;boom"]);
+    assert!(
+        h.log("ssh.log").contains("--name 'a;boom'"),
+        "the whole name must arrive as one quoted word: {}",
+        h.log("ssh.log")
+    );
+}
+
+#[test]
+fn down_refuses_a_session_and_all_together() {
+    // `down staging --all` silently ignored "staging" and destroyed every
+    // session of every project. Contradictory instructions are an error.
+    let h = Harness::new("downall");
+    let err = h.fails(&["down", "a-project", "--all"]);
+    assert!(err.contains("--all"), "{err}");
+}
+
+#[test]
+fn an_explicit_session_of_another_project_is_refused() {
+    // `reaper sync <other-projects-session>` used to push this tree into that
+    // project's machine -- with --delete -- and stamp its synced_at. A verb
+    // acting for a project stays inside it; a one-character typo costs a
+    // sentence, not a poisoned workspace.
+    let h = Harness::new("crossproj");
+    h.ok(&["up"]);
+    write(
+        &h.dir.join("other.yaml"),
+        r#"
+schema: 1
+project: b-project
+guests: [a-guest]
+exec: host
+run:
+  cmd: make check
+"#,
+        None,
+    );
+    let err = h.fails(&["sync", "a-project", "--manifest", "other.yaml"]);
+    assert!(err.contains("belongs to"), "{err}");
+    assert!(
+        !h.log("rsync.log").contains("--delete"),
+        "nothing may have been pushed: {}",
+        h.log("rsync.log")
+    );
+}
+
+#[test]
+fn reusing_a_session_that_never_became_ready_is_refused() {
+    // The reuse branch used to print "already up on no address yet -- reusing
+    // it" and exit 0, handing the operator a session no verb can use.
+    let h = Harness::new("unready");
+    write(
+        &h.dir.join("sessions.json"),
+        r#"{
+  "version": 1,
+  "sessions": {
+    "a-project": {
+      "name": "a-project",
+      "project": "a-project",
+      "guest": "a-guest",
+      "template": "opaque",
+      "machine": "an-opaque-handle",
+      "address": null,
+      "created_at": 1700000000,
+      "ready_at": null,
+      "expires_at": 1700003600,
+      "ttl": 7200,
+      "heartbeat_pid": null,
+      "synced_at": null
+    }
+  }
+}"#,
+        None,
+    );
+    let err = h.fails(&["up"]);
+    assert!(err.contains("never became ready"), "{err}");
+    assert!(err.contains("reaper down"), "say what clears it: {err}");
+}
+
+#[test]
+fn down_with_a_manifest_collects_results_from_anywhere() {
+    // --manifest selected the sessions but the results tree was still read
+    // from the current directory, so `down --manifest X` from elsewhere
+    // destroyed the machine after printing that results had nowhere to land.
+    let h = Harness::new("downmanifest");
+    h.ok(&["up"]);
+    h.ok(&["sync"]);
+    h.forget_logs();
+
+    let elsewhere = h.dir.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let manifest = h.dir.join(".reaper.yaml");
+    let out = h.run_from(&elsewhere, &["down", "--manifest", manifest.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("results collected"),
+        "the manifest names the tree, wherever the invocation stands: {stdout}"
+    );
+    assert!(
+        !h.log("rsync.log").is_empty(),
+        "the final pull must actually have run"
+    );
 }

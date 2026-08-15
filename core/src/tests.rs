@@ -964,9 +964,18 @@ fn a_multibyte_unit_is_a_parse_error_not_a_panic() {
 }
 
 #[test]
-fn an_astronomical_heartbeat_interval_is_refused_not_a_panic() {
-    // Duration * 3 overflows before the margin comparison; overflow IS the
-    // margin violated, so it must come back as the same config error.
+fn an_astronomical_duration_is_refused_not_a_panic() {
+    // Two layers used to be able to panic on a huge-but-parseable duration:
+    // the heartbeat margin check (Duration * 3 overflow) and every
+    // `SystemTime + ttl` in the CLI. The parser now refuses anything past
+    // ten years, which is the single fence all of them stand behind -- and
+    // the margin check multiplies checked anyway, in case the fence moves.
+    let e = crate::duration::parse("6148914691236517206s").expect_err("should refuse");
+    assert!(e.to_string().contains("ten years"), "{e}");
+    // The largest sane spellings still pass.
+    assert!(crate::duration::parse("3650d").is_ok());
+    assert!(crate::duration::parse("3651d").is_err());
+
     let text = r#"
 provider = "p"
 [guests.g]
@@ -977,7 +986,7 @@ default_ttl = "6148914691236517206s"
 [p]
 "#;
     let e = parse(text).expect_err("should refuse");
-    assert!(e.to_string().contains("heartbeat"), "{e}");
+    assert!(e.to_string().contains("ten years"), "{e}");
 }
 
 #[test]

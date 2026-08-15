@@ -125,19 +125,35 @@ pub fn up(
     }
 
     let ttl = ttl_for(&cfg, &manifest, profile.as_deref(), ttl.as_deref())?;
-    let single = wanted.len() == 1;
+    // From the manifest, not the selection: `up --guest a` in a two-guest
+    // manifest must produce the same name a plain `up` would, or the two
+    // spellings create sessions that cannot see each other.
+    let single = manifest.guests.len() == 1;
     let provider = provider_for(&cfg)?;
 
     for g in wanted {
         let name = session_name(&manifest.project, &g.name, single);
 
         if let Some(existing) = store.get(&name)? {
+            // A record with no address is an `up` that never finished; there
+            // is nothing here to reuse and no way to resume it.
+            let Some(address) = existing.address else {
+                return Err(format!(
+                    "{name}: a session by this name exists but never became ready, so \
+                     there is nothing to reuse. `reaper down {name}` clears it"
+                )
+                .into());
+            };
+            // Reusing a session whose heartbeat died (a reboot, a killed
+            // terminal) would hand the operator a machine on a fixed
+            // countdown; restart the renewal before calling it up.
+            if !existing.heartbeat_pid.map(proc::is_alive).unwrap_or(false) {
+                let pid = start_heartbeat(&name)?;
+                store.update(&name, |st| st.heartbeat_pid = pid)?;
+                println!("{name}: its heartbeat was dead; restarted");
+            }
             println!(
-                "{name}: already up on {} since {} ago -- reusing it",
-                existing
-                    .address
-                    .map(|a| a.to_string())
-                    .unwrap_or_else(|| "no address yet".into()),
+                "{name}: already up on {address} since {} ago -- reusing it",
                 duration::format_rough(existing.age(SystemTime::now()))
             );
             continue;
@@ -207,7 +223,7 @@ pub fn up(
 
         provider.start(&machine)?;
 
-        match wait_until_reachable(provider.as_ref(), &machine, &cfg, &name)? {
+        match wait_until_reachable(provider.as_ref(), &machine, &cfg, &name, created_at)? {
             Some((address, ssh)) => {
                 // A machine we can reach is not yet a machine anyone can use:
                 // it has no pool. Firstboot is what makes it a session, so it
@@ -221,11 +237,23 @@ pub fn up(
                 let ready_at = SystemTime::now();
                 provider.set_expiry(&machine, ready_at + ttl)?;
 
+                // The ready session is recorded before the heartbeat spawns:
+                // a failed spawn used to abort `up` after the machine had its
+                // full TTL, leaving a store record that still said "no
+                // address, expiring on the grace". The machine is fine either
+                // way -- it just will not renew -- so say that instead.
                 session.address = Some(address);
                 session.ready_at = Some(ready_at);
                 session.expires_at = ready_at + ttl;
-                session.heartbeat_pid = start_heartbeat(&name)?;
                 store.put(session)?;
+                match start_heartbeat(&name) {
+                    Ok(pid) => {
+                        store.update(&name, |st| st.heartbeat_pid = pid)?;
+                    }
+                    Err(e) => eprintln!(
+                        "{name}: could not start the renewal heartbeat: {e}. The session works but its expiry will not move; `reaper renew` extends it by hand"
+                    ),
+                }
 
                 println!(
                     "{name}: up at {address}, expires in {}",
@@ -267,17 +295,34 @@ fn wait_until_reachable(
     machine: &MachineRef,
     cfg: &Config,
     session: &str,
+    created_at: SystemTime,
 ) -> Result<Option<(std::net::IpAddr, Ssh)>> {
     // Cleared once, here. A session starts with no history, so it cannot
     // inherit a stale key from an address that has been recycled -- and the
     // loop below may legitimately try more than one address for one machine.
     let _ = std::fs::remove_file(state_file(session, "known-hosts")?);
 
-    let deadline = SystemTime::now() + cfg.session.ready_grace;
+    // From creation, not from now: the machine's grace expiry was stamped at
+    // creation, and a clone that took six minutes must not leave this loop
+    // polling a machine the sweeper is already entitled to collect.
+    let deadline = created_at + cfg.session.ready_grace;
     let mut said: Option<String> = None;
 
     loop {
-        if let Some(address) = provider.address(machine)? {
+        let address = match provider.address(machine) {
+            Ok(a) => a,
+            // Gone mid-wait means collected: the grace expired while we were
+            // still polling. Saying so beats surfacing a raw NotFound.
+            Err(reaper_core::ProviderError::NotFound(_)) => {
+                return Err(format!(
+                    "{session}: the machine was destroyed while waiting for it to answer -- its readiness grace ({}) ran out, most likely because the clone itself took most of it. session.ready_grace in the site config is the knob",
+                    duration::format(cfg.session.ready_grace)
+                )
+                .into());
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if let Some(address) = address {
             let ssh = ssh_to(cfg, session, address)?;
             match ssh.run("true", "reaching the machine") {
                 Ok(_) => return Ok(Some((address, ssh))),
@@ -505,6 +550,19 @@ fn implied_sessions(
         let s = store
             .get(&name)?
             .ok_or_else(|| format!("no session named {name:?}; try `reaper list`"))?;
+        // A verb that knows which project it is acting for must not cross to
+        // another project's machine on the strength of a typo: pushing tree A
+        // into session B's workspace, or running A's command there, poisons B.
+        // Verbs with no project in hand (`down foo` from anywhere) still work.
+        if let Some(p) = project {
+            if s.project != p {
+                return Err(format!(
+                    "session {name:?} belongs to {:?}, but this command is acting for {p:?}. Run it from that project (or with its --manifest), or name one of this project's sessions",
+                    s.project
+                )
+                .into());
+            }
+        }
         return Ok(vec![s]);
     }
 
@@ -574,7 +632,7 @@ pub fn down(session: Option<String>, all: bool, manifest_path: Option<PathBuf>) 
     let targets = if all {
         store.list()?
     } else {
-        let project = project_of(manifest_path)?;
+        let project = project_of(manifest_path.clone())?;
         implied_sessions(&store, session, project.as_deref())?
     };
 
@@ -588,14 +646,27 @@ pub fn down(session: Option<String>, all: bool, manifest_path: Option<PathBuf>) 
         // Results before anything else, and before the heartbeat stops: a
         // collection of a large artifact takes time, and the expiry should keep
         // moving while it does.
-        collect_last_results(&cfg, &s);
+        collect_last_results(&cfg, &s, manifest_path.as_deref());
 
         // Heartbeat next. A renewal landing between the destroy and the
         // forget would be harmless but confusing in the logs, and there is no
         // reason to leave the process running once its session is going.
         if let Some(pid) = s.heartbeat_pid {
-            if !proc::stop(pid) {
-                eprintln!("{}: heartbeat {pid} would not stop", s.name);
+            // The pid is verified before anything is signalled: it was
+            // recorded by a different process, possibly days ago, and the OS
+            // reuses identifiers. An unrecognized pid is left alone -- the
+            // heartbeat exits by itself once the session leaves the store.
+            match proc::looks_like_heartbeat(pid) {
+                Some(true) => {
+                    if !proc::stop(pid) {
+                        eprintln!("{}: heartbeat {pid} would not stop", s.name);
+                    }
+                }
+                Some(false) => eprintln!(
+                    "{}: pid {pid} is no longer the heartbeat (reused after a reboot?); leaving it alone",
+                    s.name
+                ),
+                None => {} // already gone
             }
         }
 
@@ -644,15 +715,29 @@ pub fn heartbeat(name: &str) -> Result<()> {
     let interval = cfg.session.heartbeat_interval;
 
     loop {
-        let Some(session) = store.get(name)? else {
+        // A transient store failure (somebody else holding the lock) must not
+        // kill the renewal loop: nothing restarts it, so dying here converts
+        // a blip into a machine collected while in use. Only the session
+        // genuinely being gone ends the loop.
+        let session = match store.get(name) {
+            Ok(Some(s)) => s,
             // `down` removed it. Nothing to renew and nothing to report.
-            return Ok(());
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                eprintln!("{name}: could not read the session store: {e}");
+                std::thread::sleep(interval);
+                continue;
+            }
         };
 
         let expires_at = SystemTime::now() + session.ttl;
         match provider.set_expiry(&session.machine, expires_at) {
             Ok(()) => {
-                store.update(name, |s| s.expires_at = expires_at)?;
+                // The machine is renewed even when the record cannot say so;
+                // the record catches up on the next tick.
+                if let Err(e) = store.update(name, |s| s.expires_at = expires_at) {
+                    eprintln!("{name}: renewed, but could not record it: {e}");
+                }
             }
             Err(e) => {
                 // Keep going. A single failed renewal is survivable precisely
@@ -714,7 +799,22 @@ fn prepull(ssh: &Ssh, session: &str, images: &[String]) {
 /// `down` may be run from anywhere, and results have nowhere to land unless
 /// the project they belong to is here. Saying so beats writing them somewhere
 /// arbitrary.
-fn tree_for(s: &Session) -> Option<PathBuf> {
+fn tree_for(s: &Session, manifest_path: Option<&Path>) -> Option<PathBuf> {
+    // The explicit --manifest wins, exactly as it does for selecting the
+    // sessions: a `down --manifest X` that selected X's sessions and then
+    // "could not find" X's tree was collecting from half a contract.
+    if let Some(p) = manifest_path {
+        let m = reaper_manifest::load(p).ok()?;
+        if m.project == s.project {
+            let root = p
+                .parent()
+                .filter(|d| !d.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            return Some(root);
+        }
+        return None;
+    }
     let here = Path::new(".reaper.yaml");
     let project = reaper_manifest::load(here).ok()?.project;
     (project == s.project).then(|| PathBuf::from("."))
@@ -896,10 +996,12 @@ fn reset_before_run(
 
     // Asked of the session rather than assumed, because "has this project ever
     // completed a run here" is a fact about the machine and not about the
-    // manifest.
+    // manifest. Per session, too: a fresh session skipping its first reset
+    // must not cancel the rollback its older sibling was owed.
     for s in &sessions {
         let ssh = ssh_for(&cfg, s)?;
         deliver_runner(&ssh)?;
+        let mut missing = false;
         for d in &manifest.reset {
             if !existing_snapshots(&ssh, d)?.iter().any(|n| n == &name) {
                 // A point the tenant asked for by name and that does not exist
@@ -908,9 +1010,7 @@ fn reset_before_run(
                 // command against whatever state happened to be there.
                 if to.is_some() {
                     return Err(format!(
-                        "{}: there is no {name:?} to reset to. `reaper snapshot {name}` \
-                         names one, or a run can name it for itself through \
-                         $REAPER_CONTROL/snapshot",
+                        "{}: there is no {name:?} to reset to. `reaper snapshot {name}` names one, or a run can name it for itself through $REAPER_CONTROL/snapshot",
                         s.name
                     )
                     .into());
@@ -919,13 +1019,17 @@ fn reset_before_run(
                     "{}: nothing to reset to yet; this run will take {PRISTINE}",
                     s.name
                 );
-                return Ok(());
+                missing = true;
+                break;
             }
         }
+        if missing {
+            continue;
+        }
+        println!("{}: reset to {name}", s.name);
+        reset(to.clone(), Some(s.name.clone()), manifest_path.clone())?;
     }
-
-    println!("{}: reset to {name}", manifest.project);
-    reset(to, session, manifest_path)
+    Ok(())
 }
 
 pub fn snapshot(
@@ -951,8 +1055,11 @@ pub fn snapshot(
         let ssh = ssh_for(&cfg, &s)?;
         deliver_runner(&ssh)?;
         for d in datasets {
+            // Quoted: the name is the one free-text argument on this line,
+            // and the runner's own validation runs only after the remote
+            // shell has already parsed the string.
             ssh.run(
-                &format!("{RUNNER_PATH} snapshot --dataset {d} --name {name}"),
+                &format!("{RUNNER_PATH} snapshot --dataset {d} --name {}", job::quote(&name)),
                 "taking a snapshot",
             )?;
         }
@@ -991,7 +1098,7 @@ pub fn reset(
             // and what it rolls back, and that is exactly what somebody
             // watching a reset wants to see.
             ssh.run_live(
-                &format!("{RUNNER_PATH} rollback --dataset {d} --name {name}"),
+                &format!("{RUNNER_PATH} rollback --dataset {d} --name {}", job::quote(&name)),
                 "rolling back",
             )?;
         }
@@ -1046,6 +1153,17 @@ pub fn exec(
         None => None,
     };
 
+    // Refused up front, so the per-guest skip below can never add up to a
+    // silent no-op: `reaper build` on a project with no build step anywhere
+    // is a misunderstanding worth a sentence.
+    if which == Verb::Build && manifest.guests.iter().all(|g| g.build.is_none()) {
+        return Err(format!(
+            "{} declares no build for any guest, so there is nothing to build. A project whose test command needs no build step is ordinary; run it instead",
+            manifest.project
+        )
+        .into());
+    }
+
     for s in implied_sessions(&store, session, Some(&manifest.project))? {
         let g = manifest.guest(&s.guest).ok_or_else(|| {
             format!(
@@ -1056,17 +1174,20 @@ pub fn exec(
         })?;
 
         let (cmd, verb_env, image, mode) = match which {
-            Verb::Build => {
-                let b = g.build.as_ref().ok_or_else(|| {
-                    format!(
-                        "{} declares no build for {}, so there is nothing to build. \
-                         A project whose test command needs no build step is ordinary; \
-                         run it instead",
-                        manifest.project, g.name
-                    )
-                })?;
-                (&b.cmd, &b.env, b.image.as_ref(), b.exec)
-            }
+            Verb::Build => match g.build.as_ref() {
+                Some(b) => (&b.cmd, &b.env, b.image.as_ref(), b.exec),
+                // A skip, not a failure: build is per-guest, and a manifest
+                // mixing a compiled guest with an interpreted one is legal.
+                // The nothing-to-build-anywhere case was refused before the
+                // loop, so silence here never means "did nothing at all".
+                None => {
+                    println!(
+                        "{}: {} declares no build; skipping",
+                        s.name, g.name
+                    );
+                    continue;
+                }
+            },
             Verb::Run => (&g.run.cmd, &g.run.env, g.run.image.as_ref(), g.run.exec),
         };
 
@@ -1195,7 +1316,7 @@ pub fn exec(
 /// cannot be reached is exactly the machine most in need of being taken down,
 /// and refusing to remove it because its results could not be fetched would
 /// leave the operator with a session they cannot get rid of.
-fn collect_last_results(cfg: &Config, s: &Session) {
+fn collect_last_results(cfg: &Config, s: &Session, manifest_path: Option<&Path>) {
     // Nothing was ever pushed, so there is no workspace to read and nothing
     // could have been written. Attempting it would fail on a directory that was
     // never made, and read as though results had been lost.
@@ -1203,7 +1324,7 @@ fn collect_last_results(cfg: &Config, s: &Session) {
         return;
     }
 
-    let Some(tree) = tree_for(s) else {
+    let Some(tree) = tree_for(s, manifest_path) else {
         eprintln!(
             "{}: not standing in {}, so its results have nowhere to land. \
              Run `reaper sync` from the project before taking it down if you want them",

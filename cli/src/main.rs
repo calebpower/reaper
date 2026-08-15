@@ -120,7 +120,7 @@ enum Command {
         /// Which session. Defaults to every session for this project.
         session: Option<String>,
         /// Every session, not just this project's.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "session")]
         all: bool,
         /// Which project's sessions. Defaults to .reaper.yaml here.
         #[arg(long)]
