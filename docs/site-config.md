@@ -43,10 +43,10 @@ ssh_connect_timeout = "15s"
 # a tenant asks for one by name and the framework looks it up here. Quote keys
 # containing dots, as TOML requires.
 [guests."ubuntu-26.04"]
-template = "9000"
+template = "9001"
 
 [guests."freebsd-15.1"]
-template = "9001"
+template = "9004"
 
 # The selected provider's own table. reaper carries this through without
 # reading it; what the keys mean is the provider's business.

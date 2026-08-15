@@ -89,7 +89,7 @@ only the boot disk is copied, and never the session's 64 GiB of storage.
 | Name | Template | Execution | Notes |
 |---|---|---|---|
 | `ubuntu-26.04` | 9001 | `container` | ZFS, podman, rsync, guest agent. No language toolchains. Rebuilt 2026-08-13 to add the three packages podman needs to work |
-| `freebsd-15.1` | 9000 | `host` | ZFS in base, rsync, guest agent. No container engine, and none wanted -- the engine here runs only foreign-format images under emulation |
+| `freebsd-15.1` | 9004 | `host` | ZFS in base, rsync, guest agent. No container engine, and none wanted -- the engine here runs only foreign-format images under emulation |
 
 The FreeBSD template ships a C compiler because FreeBSD base includes one. It
 ships no Rust, Node or JDK, so it cannot yet serve a host-execution tenant that
@@ -204,9 +204,13 @@ The tool therefore takes `--user` and `--password-file` instead. A user holding
 the harness token in every other respect. Until such a user exists, the tool
 refuses at startup and explains why rather than failing at the websocket.
 
-### FreeBSD, as previously recorded
+### FreeBSD, as previously recorded — superseded
 
-Clones of the FreeBSD template do not boot usefully: without host keys they come
+**This section is history, kept for the diagnostic record. The template it
+describes (9002) was destroyed; "FreeBSD works" above is the current truth,
+and the guest at 9004 is registered and exercised by every `reaper test`.**
+
+Clones of the FreeBSD template did not boot usefully: without host keys they come
 up with no ssh, and with host keys the last attempt did not start the guest
 agent either. Six hypotheses were tested and refuted -- `sshd_enable`, malformed
 `sshd_config`, entropy, missing `hostid`, the attached data disk, and an

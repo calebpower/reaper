@@ -50,7 +50,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Read { path, source } => write!(f, "{path}: cannot read: {source}"),
-            Error::Parse { path, message } => write!(f, "{path}: cannot parse as YAML: {message}"),
+            Error::Parse { path, message } => write!(f, "{path}: cannot parse as TOML: {message}"),
             Error::Invalid { path, problems } => {
                 write!(f, "{path}: not a valid manifest")?;
                 for p in problems {

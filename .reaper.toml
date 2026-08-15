@@ -11,15 +11,23 @@
 schema = 1
 project = "reaper"
 
-# The container-execution guest. FreeBSD is registered at some sites and not
-# here; see docs/STATUS.md for why it is parked.
-guests = ["ubuntu-26.04"]
-
+# Both guests, every loop. Ubuntu runs the full battery in a pinned toolchain
+# image; FreeBSD runs the runner's own self-test natively -- pure POSIX sh,
+# every tool in base, so the host-execution template needs no toolchain. This
+# is what keeps FreeBSD from being the platform nothing exercises: the cost
+# is a slower loop, and the alternative was proven worse when the fstat
+# branch sat unexercised beside a tested Linux one.
 # The toolchain arrives pinned and the template stays generic, which is the
-# arrangement this project recommends to everyone else.
+# arrangement this project recommends to everyone else. Stated up here
+# because TOML cannot return to the root scope once a table has opened.
 exec = "container"
 
-[build]
+[[guests]]
+name = "ubuntu-26.04"
+
+# Ubuntu's alone: the FreeBSD guest is host-execution and a host build may
+# not carry an image, so this block must not be a default it would inherit.
+[guests.build]
 # docker.io/library/rust:1.97, resolved from the registry on 2026-08-13.
 # Matches the toolchain on the development host, so a failure here is a
 # failure of the code rather than of a version difference.
@@ -36,6 +44,11 @@ cargo build --locked --workspace --tests"""
 # Named by us and meaningless to the framework. Kept out of tank/state so a
 # rollback never destroys the thing that makes the next iteration fast.
 cache = ["cargo", "target"]
+
+[[guests]]
+name = "freebsd-15.1"
+exec = "host"
+run = { cmd = "./runner/test/run.sh" }
 
 [run]
 # The whole battery, not just the Rust half. Two of these suites are shell,
