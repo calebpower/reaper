@@ -2020,3 +2020,88 @@ fn up_does_not_reuse_a_session_whose_machine_is_gone() {
         "say what happened and the way out: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Battery four: names that collide across projects, and an up that half
+// happens.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_session_name_collision_across_projects_is_refused() {
+    // project "a" with guests [b-guest, x] names a session "a-b-guest";
+    // a single-guest project literally named "a-b-guest" names its session
+    // the same thing. The reuse branch used to hand the second project the
+    // first one's machine -- and every verb after that would have pushed
+    // trees and taken snapshots across the boundary.
+    let h = Harness::new("namecollision");
+    h.add_guest("b-guest");
+    h.add_guest("x-guest");
+    write(
+        &h.dir.join(".reaper.toml"),
+        r#"
+schema = 1
+project = "a"
+guests = ["b-guest", "x-guest"]
+exec = "host"
+
+[run]
+cmd = "make check"
+"#,
+        None,
+    );
+    h.ok(&["up"]);
+
+    write(
+        &h.dir.join("colliding.toml"),
+        r#"
+schema = 1
+project = "a-b-guest"
+guests = ["x-guest"]
+exec = "host"
+
+[run]
+cmd = "make check"
+"#,
+        None,
+    );
+    let out = h.run(&["up", "--manifest", "colliding.toml"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("reusing it"),
+        "another project's machine is not reusable: {stdout}"
+    );
+    assert!(
+        !out.status.success(),
+        "a name collision is a refusal, not a quiet adoption: {stdout}"
+    );
+    assert!(
+        stderr.contains("\"a\"") && stderr.contains("a-b-guest"),
+        "name both projects so somebody can rename one: {stderr}"
+    );
+}
+
+#[test]
+fn an_up_stopped_by_the_cap_keeps_what_it_made() {
+    // Two guests, room for one: the first is created, the second is refused
+    // by the concurrency cap. The half that exists must stay -- visible,
+    // renewable, downable -- and the error must name the cap, not imply the
+    // whole up failed.
+    let h = Harness::new("partialup");
+    h.add_guest("b-guest");
+    h.hypervisor.add_foreign_session(POOL);
+    write(&h.dir.join(".reaper.toml"), TWO_GUESTS, None);
+    let err = h.fails(&["up"]);
+    assert!(err.contains("max_concurrent"), "{err}");
+    let list = h.ok(&["list"]);
+    assert!(
+        list.contains("a-project-a-guest"),
+        "the created half stays: {list}"
+    );
+    h.ok(&["down"]);
+    assert_eq!(
+        h.hypervisor.session_machines().len(),
+        1,
+        "only the stranger's machine remains"
+    );
+}

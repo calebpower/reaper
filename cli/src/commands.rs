@@ -150,6 +150,21 @@ pub fn up(
         let name = session_name(&manifest.project, &g.name, single);
 
         if let Some(existing) = store.get(&name)? {
+            // Whose record is this? Session names are {project}-{guest} (or
+            // the bare project), so distinct projects can mint the same name
+            // -- "a" with guest "b-guest" and a project named "a-b-guest".
+            // Reusing across that boundary would hand this project another
+            // one's machine, and every verb after would push trees and take
+            // snapshots across it.
+            if existing.project != manifest.project {
+                return Err(format!(
+                    "{name}: that session name is taken by project {:?}, whose \
+                     naming collides with {:?} here. Rename one of the two \
+                     projects, or take the other session down first",
+                    existing.project, manifest.project
+                )
+                .into());
+            }
             // A record with no address is an `up` that never finished; there
             // is nothing here to reuse and no way to resume it. Judged before
             // the cluster is consulted: it is about the record's own shape.
