@@ -48,6 +48,11 @@ pub struct Config {
     /// knowing its outcome. Generous by default: a full-copy clone on storage
     /// without snapshots takes minutes.
     pub task_timeout: Duration,
+    /// How long past its expiry a machine may linger before the doctor calls
+    /// the sweeper absent. The sweeper's cadence is its own business (a cron
+    /// on another machine); this is the observer's patience, and the default
+    /// is generous next to any sane cron interval.
+    pub sweep_within: Duration,
     pub request_timeout: Duration,
 }
 
@@ -76,6 +81,7 @@ struct Raw {
     tls: String,
     ca_file: Option<String>,
     task_timeout: Option<String>,
+    sweep_within: Option<String>,
     request_timeout: Option<String>,
 }
 
@@ -158,6 +164,7 @@ pub fn from_table(table: &toml::Value) -> Result<Config, ConfigError> {
         min_free_gb: raw.min_free_gb.unwrap_or(10),
         tls,
         task_timeout: parse_dur("task_timeout", raw.task_timeout.as_ref(), "10m")?,
+        sweep_within: parse_dur("sweep_within", raw.sweep_within.as_ref(), "15m")?,
         request_timeout: parse_dur("request_timeout", raw.request_timeout.as_ref(), "30s")?,
     })
 }

@@ -59,6 +59,7 @@ token_file = "~/.config/reaper/token"
 data_storage = "some-storage"  # where each session's blank pool disk is made
 min_free_gb  = 10              # room to leave on a storage after a session takes its share
 task_timeout = "10m"           # how long to wait on a clone or a destroy
+sweep_within = "15m"           # doctor: how long past expiry before the sweeper is presumed absent
 request_timeout = "30s"        # a single API call
 data_bus     = "virtio1"       # which slot it hangs on; templates boot from virtio0
 tls        = "ca-file"       # webpki | ca-file | insecure

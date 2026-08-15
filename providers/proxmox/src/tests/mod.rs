@@ -29,6 +29,7 @@ fn provider_for(pve: &MockPve) -> Proxmox {
         min_free_gb: 10,
         tls: Tls::Insecure,
         task_timeout: Duration::from_secs(2),
+        sweep_within: Duration::from_secs(900),
         request_timeout: Duration::from_secs(5),
     };
     let mut p = Proxmox::with_token(config, "someone@realm!test=secret".into()).expect("provider");
@@ -650,6 +651,7 @@ fn asking_for_a_disk_with_nowhere_to_put_it_is_refused_clearly() {
         min_free_gb: 10,
         tls: Tls::Insecure,
         task_timeout: Duration::from_secs(2),
+        sweep_within: Duration::from_secs(900),
         request_timeout: Duration::from_secs(5),
     };
     config.data_storage = None;
@@ -948,6 +950,7 @@ fn refusing_a_disk_with_nowhere_to_put_it_creates_nothing() {
         min_free_gb: 10,
         tls: Tls::Insecure,
         task_timeout: Duration::from_secs(2),
+        sweep_within: Duration::from_secs(900),
         request_timeout: Duration::from_secs(5),
     };
     config.data_storage = None;
@@ -1129,6 +1132,7 @@ fn a_wrong_token_is_refused_by_the_stand_in() {
         min_free_gb: 10,
         tls: Tls::Insecure,
         task_timeout: Duration::from_secs(2),
+        sweep_within: Duration::from_secs(900),
         request_timeout: Duration::from_secs(5),
     };
     config.data_storage = Some("some-storage".to_string());
@@ -1273,4 +1277,158 @@ fn a_machine_that_exists_still_renews_and_starts() {
         matches!(e, reaper_core::ProviderError::Unauthorized(_)),
         "a refusal for a machine that IS listed stays a refusal: {e}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// diagnose(): the site doctor's provider half. These tests may assert on the
+// provider's own sentences -- they live inside the provider's crate, where
+// its vocabulary is legal. The CLI's tests may not, and do not.
+// ---------------------------------------------------------------------------
+
+fn health_count(findings: &[Finding], h: Health) -> usize {
+    findings.iter().filter(|f| f.health == h).count()
+}
+
+fn find<'a>(findings: &'a [Finding], label: &str) -> Vec<&'a Finding> {
+    findings.iter().filter(|f| f.label == label).collect()
+}
+
+#[test]
+fn a_healthy_site_diagnoses_clean_with_honest_warns() {
+    let pve = pve_with_template();
+    let p = provider_for(&pve);
+    let f = p.diagnose(&[RegisteredGuest {
+        name: "a-guest".into(),
+        template: "9000".into(),
+    }]);
+    assert_eq!(health_count(&f, Health::Fail), 0, "{f:?}");
+    assert!(find(&f, "api")[0].health == Health::Ok);
+    assert!(find(&f, "pool")[0].health == Health::Ok);
+    assert!(find(&f, "template")[0].health == Health::Ok);
+    // A clean pool is NO evidence the sweeper works, and tls is insecure in
+    // this harness; both must be Warn, not a false Ok.
+    assert!(find(&f, "sweeper")[0].health == Health::Warn, "{f:?}");
+    assert!(find(&f, "sweeper")[0].detail.contains("no evidence"));
+    assert!(find(&f, "tls")[0].health == Health::Warn);
+}
+
+#[test]
+fn a_refused_credential_is_one_fail_not_a_pile() {
+    // The ACL check precedes everything, so every downstream probe would
+    // refuse identically. One Fail names the cause; the rest say skipped.
+    let pve = pve_with_template();
+    pve.with_state(|s| s.unauthorized = true);
+    let p = provider_for(&pve);
+    let f = p.diagnose(&[RegisteredGuest { name: "g".into(), template: "9000".into() }]);
+    assert_eq!(health_count(&f, Health::Fail), 1, "{f:?}");
+    assert!(find(&f, "api")[0].detail.contains("refuses the credential"));
+    assert!(f.iter().filter(|x| x.detail.starts_with("skipped:")).count() >= 3, "{f:?}");
+}
+
+#[test]
+fn an_unreachable_api_is_one_fail_not_a_pile() {
+    let pve = pve_with_template();
+    let p = provider_for(&pve);
+    drop(pve);
+    let f = p.diagnose(&[RegisteredGuest { name: "g".into(), template: "9000".into() }]);
+    assert_eq!(health_count(&f, Health::Fail), 1, "{f:?}");
+    assert!(find(&f, "api")[0].detail.contains("did not answer"));
+}
+
+#[test]
+fn a_missing_template_is_named_with_its_guests() {
+    let pve = pve_with_template();
+    pve.collect("9000");
+    let p = provider_for(&pve);
+    let f = p.diagnose(&[RegisteredGuest { name: "a-guest".into(), template: "9000".into() }]);
+    let t = find(&f, "template");
+    assert_eq!(t[0].health, Health::Fail, "{f:?}");
+    assert!(t[0].detail.contains("does not exist"));
+    assert!(t[0].detail.contains("a-guest"), "the guest is named: {}", t[0].detail);
+}
+
+#[test]
+fn a_machine_that_is_not_a_template_is_refused_as_one() {
+    let pve = pve_with_template();
+    pve.with_state(|s| {
+        s.vms.get_mut(&9000).unwrap().template = false;
+    });
+    let p = provider_for(&pve);
+    let f = p.diagnose(&[RegisteredGuest { name: "g".into(), template: "9000".into() }]);
+    assert!(find(&f, "template")[0].detail.contains("not a template"), "{f:?}");
+    assert_eq!(find(&f, "template")[0].health, Health::Fail);
+}
+
+#[test]
+fn a_diskless_template_cannot_boot_a_clone_and_says_so() {
+    let pve = pve_with_template();
+    pve.with_state(|s| s.vms.get_mut(&9000).unwrap().diskless = true);
+    let p = provider_for(&pve);
+    let f = p.diagnose(&[RegisteredGuest { name: "g".into(), template: "9000".into() }]);
+    assert_eq!(find(&f, "template")[0].health, Health::Fail, "{f:?}");
+    assert!(find(&f, "template")[0].detail.contains("no priceable disk"));
+}
+
+#[test]
+fn a_storage_under_the_floor_fails_the_diagnosis() {
+    let pve = pve_with_template();
+    pve.storage_named_has("stand-in-storage", 2 * 1024 * 1024 * 1024); // template's home, tiny
+    let p = provider_for(&pve);
+    let f = p.diagnose(&[RegisteredGuest { name: "g".into(), template: "9000".into() }]);
+    let bad: Vec<_> = find(&f, "storage")
+        .into_iter()
+        .filter(|x| x.health == Health::Fail)
+        .collect();
+    assert_eq!(bad.len(), 1, "{f:?}");
+    assert!(bad[0].detail.contains("stand-in-storage"));
+}
+
+#[test]
+fn pool_hygiene_names_the_machines_that_want_a_human() {
+    let pve = pve_with_template();
+    pve.with_state(|s| {
+        // Untagged, in pool and range: nothing will ever collect it.
+        s.vms.insert(9030, Vm {
+            name: "somebody-built-this".into(),
+            pool: POOL.into(),
+            ..Vm::default()
+        });
+        // Expired an hour ago, sweep_within is 15m: the sweeper is absent.
+        s.vms.insert(9031, Vm {
+            name: "long-dead".into(),
+            pool: POOL.into(),
+            tags: "expires-1000000000".into(),
+            ..Vm::default()
+        });
+    });
+    let p = provider_for(&pve);
+    let f = p.diagnose(&[RegisteredGuest { name: "g".into(), template: "9000".into() }]);
+    assert!(
+        find(&f, "pool hygiene").iter().any(|x| x.detail.contains("9030")),
+        "{f:?}"
+    );
+    let sweeper = find(&f, "sweeper");
+    assert_eq!(sweeper[0].health, Health::Fail, "{f:?}");
+    assert!(sweeper[0].detail.contains("9031"));
+}
+
+#[test]
+fn an_expired_machine_inside_the_window_is_the_sweepers_to_take() {
+    let pve = pve_with_template();
+    let recent = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 60;
+    pve.with_state(|s| {
+        s.vms.insert(9032, Vm {
+            name: "just-expired".into(),
+            pool: POOL.into(),
+            tags: format!("expires-{recent}"),
+            ..Vm::default()
+        });
+    });
+    let p = provider_for(&pve);
+    let f = p.diagnose(&[RegisteredGuest { name: "g".into(), template: "9000".into() }]);
+    assert_eq!(find(&f, "sweeper")[0].health, Health::Ok, "{f:?}");
 }

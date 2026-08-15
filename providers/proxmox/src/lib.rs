@@ -22,7 +22,8 @@ use std::net::IpAddr;
 use std::time::{Duration, SystemTime};
 
 use reaper_core::provider::{
-    CreateRequest, MachineRef, MachineSummary, Provider, ProviderError, Result,
+    CreateRequest, Finding, Health, MachineRef, MachineSummary, Provider, ProviderError,
+    RegisteredGuest, Result,
 };
 use serde_json::Value;
 
@@ -595,6 +596,267 @@ impl Provider for Proxmox {
                 running,
             })
             .collect())
+    }
+
+    /// Staged deliberately: on a pool-scoped token the ACL check precedes the
+    /// existence check, so one bad credential yields refusals on everything
+    /// downstream. The stages that depend on a failed one report "skipped"
+    /// rather than piling on findings that all mean the same broken thing.
+    ///
+    /// Every probe here uses only what the live token has been proven to
+    /// answer -- /version, the cluster listing, per-VM config/status -- and
+    /// deliberately not /nodes/<n>/status or /pools/<p>, which need Sys.Audit
+    /// and Pool.Audit grants no site is required to have given. The node's
+    /// health is evidenced through the template checks, whose requests all
+    /// cross it.
+    fn diagnose(&self, guests: &[RegisteredGuest]) -> Vec<Finding> {
+        let mut out = Vec::new();
+        let mut push = |label: &str, health: Health, detail: String| {
+            out.push(Finding { label: label.into(), health, detail })
+        };
+        let skipped = |what: &str| (Health::Warn, format!("skipped: {what}"));
+
+        // Stage 1: is anyone there, and do they know us.
+        match self.client.get("/version") {
+            Ok(v) => {
+                let version = v.get("version").and_then(Value::as_str).unwrap_or("?");
+                push("api", Health::Ok, format!(
+                    "{} answers (version {version}) and accepts the credential",
+                    self.config.api
+                ));
+            }
+            Err(ProviderError::Unauthorized(m)) => {
+                push("api", Health::Fail, format!(
+                    "{} answers but refuses the credential: {m}",
+                    self.config.api
+                ));
+                let (h, d) = skipped("the credential is refused");
+                push("pool and sweeper", h, d.clone());
+                push("templates", h, d.clone());
+                push("storage", h, d);
+                return out;
+            }
+            Err(e) => {
+                push("api", Health::Fail, format!(
+                    "{} did not answer: {e}. Nothing past this point could be checked",
+                    self.config.api
+                ));
+                let (h, d) = skipped("the API is unreachable");
+                push("pool and sweeper", h, d.clone());
+                push("templates", h, d.clone());
+                push("storage", h, d);
+                return out;
+            }
+        }
+
+        // Stage 2: the cluster listing, read once; pool visibility and pool
+        // hygiene both come from it -- the one view this token provably has.
+        let listing = match self.client.get("/cluster/resources?type=vm") {
+            Ok(d) => d.as_array().cloned().unwrap_or_default(),
+            Err(e) => {
+                push("pool", Health::Fail, format!("the cluster listing failed: {e}"));
+                let (h, d) = skipped("the cluster listing failed");
+                push("templates", h, d.clone());
+                push("storage", h, d);
+                self.diagnose_tls(&mut |l, h, d| push(l, h, d));
+                return out;
+            }
+        };
+
+        let in_pool: Vec<&Value> = listing
+            .iter()
+            .filter(|i| i.get("pool").and_then(Value::as_str) == Some(self.config.pool.as_str()))
+            .collect();
+        if in_pool.is_empty() {
+            push("pool", Health::Fail, format!(
+                "pool {} has no members visible to this token -- either it does                  not exist, it is empty of even templates, or the token cannot                  see it",
+                self.config.pool
+            ));
+        } else {
+            push("pool", Health::Ok, format!(
+                "pool {} is visible with {} member(s)",
+                self.config.pool,
+                in_pool.len()
+            ));
+        }
+
+        // Pool hygiene: the states that want a human.
+        let now = SystemTime::now();
+        let mut expired_seen = false;
+        for item in &in_pool {
+            let Some(id) = item.get("vmid").and_then(Value::as_u64).map(|v| v as u32) else {
+                continue;
+            };
+            let name = item.get("name").and_then(Value::as_str).unwrap_or("?");
+            if item.get("template").and_then(Value::as_u64).unwrap_or(0) == 1 {
+                continue;
+            }
+            if !self.config.ids.contains(id) {
+                push("pool hygiene", Health::Warn, format!(
+                    "{id} ({name}) is in pool {} but outside {} -- the sweeper                      refuses to touch it by design, so it is somebody's by hand",
+                    self.config.pool, self.config.ids
+                ));
+                continue;
+            }
+            let tag_string = item.get("tags").and_then(Value::as_str).unwrap_or("");
+            match tags::expiry_of(tag_string) {
+                None => push("pool hygiene", Health::Warn, format!(
+                    "{id} ({name}) carries no expiry tag: nothing will ever                      collect it, and it wants a human"
+                )),
+                Some(at) => {
+                    if let Ok(past) = now.duration_since(at) {
+                        expired_seen = true;
+                        if past > self.config.sweep_within {
+                            push("sweeper", Health::Fail, format!(
+                                "{id} ({name}) expired {}s ago and is still here,                                  which is longer than sweep_within allows: the                                  sweeper does not appear to be collecting",
+                                past.as_secs()
+                            ));
+                        } else {
+                            push("sweeper", Health::Ok, format!(
+                                "{id} ({name}) is expired and inside the {}s                                  sweep_within window; the sweeper has time",
+                                self.config.sweep_within.as_secs()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if !expired_seen {
+            push("sweeper", Health::Warn,
+                "no expired machine is present, so there is no evidence the                  sweeper works -- and none that it does not. Only a canary can                  answer this on a clean pool".to_string());
+        }
+
+        // Stage 3: every registered template, deduplicated -- findings
+        // attributed per template, guests named together. Storage needs are
+        // collected for stage 4.
+        let mut storages: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
+        let mut checked: std::collections::BTreeMap<&str, Vec<&str>> =
+            std::collections::BTreeMap::new();
+        for g in guests {
+            checked.entry(g.template.as_str()).or_default().push(g.name.as_str());
+        }
+        for (template, guest_names) in checked {
+            let whose = guest_names.join(", ");
+            let id = match self.config.ids.check(&MachineRef::new(template)) {
+                Ok(id) => id,
+                Err(e) => {
+                    push("template", Health::Fail, format!(
+                        "template {template} (guest {whose}) is not usable: {e}"
+                    ));
+                    continue;
+                }
+            };
+            let listed = listing.iter().find(|i| {
+                i.get("vmid").and_then(Value::as_u64) == Some(u64::from(id))
+            });
+            match listed {
+                None => {
+                    push("template", Health::Fail, format!(
+                        "template {id} (guest {whose}) does not exist on the cluster"
+                    ));
+                    continue;
+                }
+                Some(item)
+                    if item.get("template").and_then(Value::as_u64).unwrap_or(0) != 1 =>
+                {
+                    push("template", Health::Fail, format!(
+                        "{id} (guest {whose}) exists but is not a template -- a                          clone would copy a machine somebody may be using"
+                    ));
+                    continue;
+                }
+                Some(_) => {}
+            }
+            match self.client.get(&format!("/nodes/{}/qemu/{id}/config", self.node())) {
+                Ok(cfg) => {
+                    let mut disks = 0;
+                    let mut unpriceable = Vec::new();
+                    for (key, value) in cfg.as_object().into_iter().flatten() {
+                        if !is_disk_key(key) {
+                            continue;
+                        }
+                        let Some(spec) = value.as_str() else { continue };
+                        match disk_storage_and_size(spec) {
+                            Some((storage, bytes)) => {
+                                disks += 1;
+                                let e = storages.entry(storage).or_default();
+                                *e = (*e).max(bytes);
+                            }
+                            None if !spec.contains("media=cdrom") => {
+                                unpriceable.push(key.clone())
+                            }
+                            None => {}
+                        }
+                    }
+                    if disks == 0 {
+                        push("template", Health::Fail, format!(
+                            "template {id} (guest {whose}) has no priceable disk:                              a clone of it would boot nothing"
+                        ));
+                    } else if !unpriceable.is_empty() {
+                        push("template", Health::Warn, format!(
+                            "template {id} (guest {whose}): {} disk(s) priceable,                              but {} could not be priced and will not count toward                              room checks",
+                            disks,
+                            unpriceable.join(", ")
+                        ));
+                    } else {
+                        push("template", Health::Ok, format!(
+                            "template {id} (guest {whose}) exists, is a template,                              and its {disks} disk(s) price cleanly"
+                        ));
+                    }
+                }
+                Err(e) => push("template", Health::Fail, format!(
+                    "template {id} (guest {whose}): its configuration could not                      be read: {}",
+                    self.disambiguate(id, e)
+                )),
+            }
+        }
+
+        // Stage 4: the storages those templates and the data disk live on.
+        if let Some(ds) = self.config.data_storage.as_ref() {
+            storages.entry(ds.clone()).or_default();
+        } else {
+            push("storage", Health::Fail,
+                "data_storage is not set, and every session asks for a data                  disk -- up would refuse each one".to_string());
+        }
+        let floor = u64::from(self.config.min_free_gb) * GIB;
+        for (storage, template_need) in storages {
+            match self
+                .client
+                .get(&format!("/nodes/{}/storage/{storage}/status", self.node()))
+            {
+                Ok(status) => match status.get("avail").and_then(Value::as_u64) {
+                    Some(avail) if avail < floor + template_need => {
+                        push("storage", Health::Fail, format!(
+                            "{storage} has {} free, under the {} floor plus the                              {} a clone would take: sessions will be refused",
+                            gib(avail), gib(floor), gib(template_need)
+                        ))
+                    }
+                    Some(avail) => push("storage", Health::Ok, format!(
+                        "{storage} has {} free ({} floor)",
+                        gib(avail), gib(floor)
+                    )),
+                    None => push("storage", Health::Warn, format!(
+                        "{storage} answered without a free-space figure; room                          checks will proceed unchecked against it"
+                    )),
+                },
+                Err(e) => push("storage", Health::Fail, format!(
+                    "{storage} did not answer: {e}"
+                )),
+            }
+        }
+
+        self.diagnose_tls(&mut |l, h, d| push(l, h, d));
+        out
+    }
+}
+
+impl Proxmox {
+    fn diagnose_tls(&self, push: &mut dyn FnMut(&str, Health, String)) {
+        match &self.config.tls {
+            crate::config::Tls::Insecure => push("tls", Health::Warn,
+                "certificate verification is disabled: anyone between here and                  the node can read the token and rewrite replies. Export the                  node's CA and set tls = \"ca-file\"".to_string()),
+            _ => push("tls", Health::Ok, "certificate verification is on".to_string()),
+        }
     }
 }
 

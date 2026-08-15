@@ -31,6 +31,10 @@ pub struct Vm {
     pub memory: Option<u64>,
     /// Disks attached after creation, as bus -> "<storage>:<gib>".
     pub extra_disks: BTreeMap<String, String>,
+    /// A template with no disks at all -- a real misconfiguration a doctor
+    /// must be able to see; the config route synthesizes a boot disk for
+    /// everything else.
+    pub diskless: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -411,6 +415,8 @@ fn route(s: &mut State, method: &str, path: &str, body: &str) -> (u16, Value) {
     };
 
     match (method, seg) {
+        ("GET", ["version"]) => (200, json!({"data": {"version": "9.1.4", "release": "9.1"}})),
+
         ("GET", ["cluster", "resources"]) => {
             let _ = query;
             let items: Vec<Value> = s
@@ -451,6 +457,8 @@ fn route(s: &mut State, method: &str, path: &str, body: &str) -> (u16, Value) {
                 cores: source.cores,
                 memory: source.memory,
                 extra_disks: BTreeMap::new(),
+                // Inherited too: a clone of a diskless template is diskless.
+                diskless: source.diskless,
             };
             s.vms.insert(newid, vm);
             let t = new_task(s);
@@ -466,13 +474,16 @@ fn route(s: &mut State, method: &str, path: &str, body: &str) -> (u16, Value) {
                     "tags": vm.tags,
                     "cores": vm.cores,
                     "memory": vm.memory,
-                    // A boot disk, because a machine without one weighs nothing
-                    // and a free-space check would have nothing to weigh.
-                    "virtio0": format!("{STORAGE}:vm-{id}-disk-0,iothread=1,size=8G"),
                     // Not a disk, and named to catch a prefix match that thinks
                     // it is.
                     "virtiofs0": "some-share",
                 });
+                if !vm.diskless {
+                    // A boot disk, because a machine without one weighs nothing
+                    // and a free-space check would have nothing to weigh.
+                    cfg["virtio0"] =
+                        json!(format!("{STORAGE}:vm-{id}-disk-0,iothread=1,size=8G"));
+                }
                 for (bus, spec) in &vm.extra_disks {
                     cfg[bus] = json!(spec);
                 }

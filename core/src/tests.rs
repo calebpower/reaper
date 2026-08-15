@@ -1299,3 +1299,32 @@ fn a_failed_remote_command_reports_what_it_was_doing() {
     assert!(msg.contains("checking the machine answers"), "{msg}");
     assert!(msg.contains("the guest said no"), "{msg}");
 }
+
+#[test]
+fn a_provider_without_diagnostics_says_so_rather_than_answering_ok() {
+    // The default impl exists so a new provider compiles without growing a
+    // doctor -- but "nothing was checked" must never present as health.
+    struct Bare;
+    impl crate::provider::Provider for Bare {
+        fn name(&self) -> &'static str { "bare" }
+        fn create(&self, _: &crate::provider::CreateRequest) -> crate::provider::Result<crate::MachineRef> {
+            unimplemented!()
+        }
+        fn set_expiry(&self, _: &crate::MachineRef, _: SystemTime) -> crate::provider::Result<()> {
+            unimplemented!()
+        }
+        fn start(&self, _: &crate::MachineRef) -> crate::provider::Result<()> { unimplemented!() }
+        fn stop(&self, _: &crate::MachineRef) -> crate::provider::Result<()> { unimplemented!() }
+        fn destroy(&self, _: &crate::MachineRef) -> crate::provider::Result<()> { unimplemented!() }
+        fn address(&self, _: &crate::MachineRef) -> crate::provider::Result<Option<std::net::IpAddr>> {
+            unimplemented!()
+        }
+        fn list(&self) -> crate::provider::Result<Vec<crate::provider::MachineSummary>> {
+            unimplemented!()
+        }
+    }
+    let f = crate::provider::Provider::diagnose(&Bare, &[]);
+    assert_eq!(f.len(), 1);
+    assert_eq!(f[0].health, crate::provider::Health::Warn, "{f:?}");
+    assert!(f[0].detail.contains("no diagnostics"), "{}", f[0].detail);
+}

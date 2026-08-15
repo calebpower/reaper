@@ -122,6 +122,38 @@ impl std::error::Error for ProviderError {}
 
 pub type Result<T> = std::result::Result<T, ProviderError>;
 
+/// One guest as the site registry declares it: a name somebody chose and a
+/// template reference this crate deliberately cannot interpret -- the same
+/// opaque string `CreateRequest` carries. A struct rather than a tuple so a
+/// transposition is a compile error instead of findings quietly attributed
+/// to the wrong guest.
+#[derive(Debug, Clone)]
+pub struct RegisteredGuest {
+    pub name: String,
+    pub template: String,
+}
+
+/// How one diagnostic check came out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Health {
+    Ok,
+    /// True but worth a person's attention -- or genuinely unknown, which a
+    /// doctor must say rather than dressing "did not check" as Ok.
+    Warn,
+    Fail,
+}
+
+/// One diagnostic finding. The provider authors every word: label and detail
+/// may use the provider's own vocabulary freely, because a caller only
+/// prints them and branches on `health`. Interpreting the text would move
+/// hypervisor knowledge across the seam, so no caller may.
+#[derive(Debug, Clone)]
+pub struct Finding {
+    pub label: String,
+    pub health: Health,
+    pub detail: String,
+}
+
 pub trait Provider {
     /// The name this provider is selected by in site configuration.
     fn name(&self) -> &'static str;
@@ -149,4 +181,23 @@ pub trait Provider {
     /// than every machine that exists. A provider scoped to part of a shared
     /// cluster reports only its own part.
     fn list(&self) -> Result<Vec<MachineSummary>>;
+
+    /// Everything this provider can check about the site without creating
+    /// anything: reachability, credentials, the registered templates, room,
+    /// hygiene. Infallible by design -- for a doctor, errors ARE findings,
+    /// and an unreachable hypervisor must come back as a Fail line, not
+    /// abort the report. The default implementation keeps the trait cheap
+    /// for a provider that has not grown diagnostics yet, and says so
+    /// honestly rather than answering Ok about nothing.
+    fn diagnose(&self, guests: &[RegisteredGuest]) -> Vec<Finding> {
+        let _ = guests;
+        vec![Finding {
+            label: "provider diagnostics".into(),
+            health: Health::Warn,
+            detail: format!(
+                "the {} provider offers no diagnostics; nothing was checked",
+                self.name()
+            ),
+        }]
+    }
 }
