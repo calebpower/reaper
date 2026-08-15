@@ -761,7 +761,31 @@ holders() {
                 esac
             done | sort -u ;;
         FreeBSD)
-            fstat -f "$1" 2>/dev/null | awk 'NR > 1 { print $3 }' | sort -u ;;
+            # fstat reads kern.proc.filedesc directly; no procfs involved. But
+            # its absence must be a refusal, not silence: without this guard a
+            # missing binary is eaten by the redirect below, prints nothing,
+            # and the rollback proceeds unchecked.
+            command -v fstat >/dev/null 2>&1 \
+                || die "fstat is not available, so open files under $1 cannot be checked; not rolling back"
+            # Observed live (2026-08-15, 15.1-RELEASE-p2): MOUNT ($5) carries
+            # the mountpoint for a linked file -- descriptors and working
+            # directories both -- and "-" for a file unlinked after opening.
+            # Excluding "-" keeps the same promise the Linux branch makes
+            # above: a process reading an inode a rollback cannot reach must
+            # not veto every reset for the life of the session.
+            #
+            # Known scope limits, deliberate: -f is per-filesystem, so a child
+            # dataset mounted beneath this one is not covered (the Linux
+            # prefix match would catch it); and a checker whose own working
+            # directory is on the dataset counts itself, exactly as the Linux
+            # branch would.
+            fstat -f "$1" 2>/dev/null \
+                | awk -v m="$1" 'NR > 1 && $5 == m { print $3 }' | sort -u ;;
+        *)
+            # Fail closed. An operating system this function does not know is
+            # one whose open files it cannot see, and "no holders found" must
+            # never be the reading of "did not look".
+            die "no way to check for open files on $(platform); not rolling back" ;;
     esac
 }
 
@@ -807,7 +831,8 @@ cmd_rollback() {
     roll_mount=$(zfs get -H -o value mountpoint "${roll_target}" 2>/dev/null) \
         || die "cannot read ${roll_target}'s mountpoint, so cannot check for open files; not rolling back"
     if [ -n "${roll_mount}" ] && [ "${roll_mount}" != "-" ]; then
-        roll_held=$(holders "${roll_mount}")
+        roll_held=$(holders "${roll_mount}") \
+            || die "could not check for open files under ${roll_mount}; not rolling back"
         if [ -n "${roll_held}" ]; then
             die "refusing to roll ${roll_target} back: process(es) $(printf '%s' "${roll_held}" | tr '\n' ' ') still
        have files open under ${roll_mount}. Rolling the filesystem out from

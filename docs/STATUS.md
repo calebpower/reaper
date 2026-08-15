@@ -601,6 +601,38 @@ real cluster in one session, created and destroyed by the same run:
 - `down`: results collected, machine destroyed, store empty, zero heartbeat
   processes, pool restored to exactly the two templates.
 
+## FreeBSD holders(), observed then hardened, 2026-08-15
+
+The open-files check that guards rollback had an fstat branch written
+alongside the Linux one and never exercised: no test modelled fstat, so a
+missing binary printed nothing and the rollback proceeded unchecked, and the
+unlinked-file exclusion the Linux branch promises did not exist on FreeBSD.
+
+Observed live on a 15.1-RELEASE-p2 session before writing the fix, which is
+what decided the filter's exact form:
+
+- `fstat -f` output carries no NAME column; MOUNT ($5) is the mountpoint for
+  a linked file -- descriptors and working directories both -- and `-` for a
+  file unlinked after opening. The exclusion is therefore `$5 == mountpoint`.
+- An idle dataset lists nothing: no root/text-vnode noise in practice.
+- A checker whose own working directory is on the dataset counts itself,
+  exactly as the Linux branch would.
+- Known scope limit, deliberate: -f is per-filesystem, so a child dataset
+  mounted beneath is not covered (the Linux prefix match would catch it).
+
+The hardened branch excludes unlinked holders, refuses loudly when fstat is
+absent, and an operating system the check does not know now fails closed --
+"no holders found" must never be the reading of "did not look". Proven live
+both ways on the same session: a daemonized holder blocked `reaper reset`
+with its pid named (1725), and after unlinking the held file the same holder
+did not block, with the rollback completing in 0s.
+
+One unexplained observation, recorded honestly: twice, the ssh operation
+immediately following a `daemon`-planted holder stalled for minutes client-
+side while the guest stayed healthy (fstat instant, no runner process ever
+started); each time the retry succeeded instantly. Not reproduced on demand;
+worth an eye if it recurs.
+
 ## The battery cycle, 2026-08-15
 
 Five successive end-to-end batteries, each written to fail first, run until

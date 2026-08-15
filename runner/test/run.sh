@@ -133,6 +133,8 @@ blockdev)
     fix disk_bytes ;;
 diskinfo)
     fix diskinfo ;;
+fstat)
+    fix fstat ;;
 zpool)
     case "$1" in
         list)
@@ -187,7 +189,7 @@ esac
 exit 0
 STUB
     chmod +x "${WORK}/bin/_stub"
-    for t in uname lsblk sysctl gpart fstyp mount zpool zfs blockdev diskinfo dd; do
+    for t in uname lsblk sysctl gpart fstyp mount zpool zfs blockdev diskinfo dd fstat; do
         ln -sf "${WORK}/bin/_stub" "${WORK}/bin/${t}"
     done
 }
@@ -842,6 +844,67 @@ printf '%s\n' "${WORK}/held" > "${WORK}/fix/zfs_mountpoint"
 ln -sf "${WORK}/held/gone (deleted)" "${WORK}/proc/4243/fd/6"
 if run_runner rollback --dataset state --name pristine; then ok "rolled back"; else bad "should not have been blocked"; fi
 log_has 'zfs rollback -r tank/state@pristine'
+
+new_case "FreeBSD: a live holder stops the rollback, and is named"
+FAKE_PLATFORM=FreeBSD
+printf 'tank/state@pristine\n' > "${WORK}/fix/zfs_snapshots"
+mkdir -p "${WORK}/held"
+printf '%s\n' "${WORK}/held" > "${WORK}/fix/zfs_mountpoint"
+# The observed shape, live on 15.1-RELEASE-p2: MOUNT ($5) is the mountpoint
+# for a linked file; the header row is skipped by NR > 1.
+printf 'USER CMD PID FD MOUNT INUM MODE SZ|DV R/W\nroot sleep 4242 3 %s 2 -rw-r--r-- 13 r\nroot sh 4244 wd %s 34 drwxr-xr-x 2 r\n' \
+    "${WORK}/held" "${WORK}/held" > "${WORK}/fix/fstat"
+if run_runner rollback --dataset state --name pristine; then
+    bad "should have refused while a process held the dataset"
+else
+    ok "refused"
+fi
+errsays '4242'
+errsays '4244'
+log_lacks 'zfs rollback'
+
+new_case "FreeBSD: an unlinked-only holder does not block a rollback"
+FAKE_PLATFORM=FreeBSD
+printf 'tank/state@pristine\n' > "${WORK}/fix/zfs_snapshots"
+mkdir -p "${WORK}/held"
+printf '%s\n' "${WORK}/held" > "${WORK}/fix/zfs_mountpoint"
+# MOUNT is "-" for a file unlinked after opening -- observed live. Such a
+# process reads an inode a rollback cannot reach, and counting it would let
+# one leaked process veto every reset for the life of the session.
+printf 'USER CMD PID FD MOUNT INUM MODE SZ|DV R/W\nroot sleep 4242 3 - 2 -rw-r--r-- 13 r\n' \
+    > "${WORK}/fix/fstat"
+if run_runner rollback --dataset state --name pristine; then ok "rolled back"; else bad "should not have been blocked"; fi
+log_has 'zfs rollback -r tank/state@pristine'
+
+new_case "FreeBSD: a missing fstat is a refusal, not a silent proceed"
+FAKE_PLATFORM=FreeBSD
+printf 'tank/state@pristine\n' > "${WORK}/fix/zfs_snapshots"
+mkdir -p "${WORK}/held"
+printf '%s\n' "${WORK}/held" > "${WORK}/fix/zfs_mountpoint"
+# The tool is absent from the guest. Before the guard, the 2>/dev/null ate
+# "not found", holders printed nothing, and the rollback proceeded unchecked.
+rm "${WORK}/bin/fstat"
+if run_runner rollback --dataset state --name pristine; then
+    bad "should have refused without a way to check open files"
+else
+    ok "refused"
+fi
+errsays 'fstat'
+errsays 'not rolling back'
+log_lacks 'zfs rollback'
+
+new_case "an operating system the check does not know fails closed"
+FAKE_PLATFORM=SunOS
+printf 'tank/state@pristine\n' > "${WORK}/fix/zfs_snapshots"
+mkdir -p "${WORK}/held"
+printf '%s\n' "${WORK}/held" > "${WORK}/fix/zfs_mountpoint"
+if run_runner rollback --dataset state --name pristine; then
+    bad "no holders found must never mean did not look"
+else
+    ok "refused"
+fi
+errsays 'no way to check'
+log_lacks 'zfs rollback'
 
 new_case "the caller is spared whether it names itself long or short"
 FAKE_PLATFORM=Linux
