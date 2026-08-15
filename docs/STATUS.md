@@ -16,7 +16,7 @@ Last updated: 2026-08-13.
 | 3 | Sync, build, execution | **Accepted live.** sync, build and run against the real cluster, results flowing continuously |
 | 4 | `reset` and the `@pristine` snapshot | **Accepted live.** Reset, named checkpoints, and an in-guest trigger a container can call |
 | 5 | The loop as one verb | **Accepted live**, and now proven by a tenant that is not reaper |
-| 6 | Hardening, `doctor`, third-tenant proof | Not started |
+| 6 | Hardening, `doctor`, third-tenant proof | **`doctor` done, canary included.** Structured session log and third-tenant proof remain |
 
 Phase detail is in [`reaper-plan.md`](reaper-plan.md) §6, amended by the
 decisions below. Phase 2 is parallel-safe with Phase 1; nothing else is.
@@ -604,6 +604,25 @@ real cluster in one session, created and destroyed by the same run:
 - Sweeper dry-run against the live API: saw the session, would reap 0.
 - `down`: results collected, machine destroyed, store empty, zero heartbeat
   processes, pool restored to exactly the two templates.
+
+## Phase 6 acceptance: doctor, canary, and both guests, 2026-08-15
+
+`reaper doctor` is live. Against the real site it reports 14 ok, 2 warnings
+(the honest ones: tls = "insecure", and -- on a clean pool -- "no evidence
+either way" about the sweeper), 0 failed, exit 0. With sessions up it judged
+both records "record, machine and heartbeat agree".
+
+`reaper doctor --canary` performed the sweeper's first witnessed wet
+collection: machine 9000, created already expired and never started, was
+collected by the sweeper **10 seconds** after creation. The dead-man's
+switch is no longer an inference from tags; it has been watched working.
+
+The two-guest loop is the daily default now: `up` brings both sessions in
+2m48s, and `reaper test` runs the full battery in the Ubuntu toolchain image
+while the runner's 202-case self-test runs **natively on FreeBSD** -- its own
+sh, awk and userland, including the new holders cases -- in a 2m53s loop.
+Both guests take their own @pristine. FreeBSD stopped being the platform
+nothing exercises.
 
 ## FreeBSD holders(), observed then hardened, 2026-08-15
 

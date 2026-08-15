@@ -10,6 +10,13 @@ grow into something nobody asked for:
 
 - **No dynamic loading.** No `dlopen`, no shared objects, no ABI to keep stable.
 - **No plugin discovery.** Providers do not register themselves at runtime.
+- **A provider may offer diagnostics** through one trait method,
+  `diagnose(&[RegisteredGuest]) -> Vec<Finding>`: infallible (for a doctor,
+  errors are findings), sentences authored entirely by the provider, consumed
+  by callers that print and count and never interpret. The default
+  implementation answers a single honest Warn -- "no diagnostics; nothing was
+  checked" -- so a new provider compiles without growing a doctor and without
+  a false ok.
 - **A new provider is a new module, compiled in**, selected by name in the site
   configuration.
 

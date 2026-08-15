@@ -291,7 +291,19 @@ between passes without knowing ZFS exists:
 The container that asks is spared when the others are stopped. `snapshot` is how
 you get a pristine taken at stack-up rather than at the end of a run.
 
-### 5. When it goes wrong
+### 5. Check the site before blaming your code
+
+```sh
+reaper doctor            # config, key, provider, templates, storage, records
+reaper doctor --canary   # additionally prove the sweeper with a real machine
+```
+
+Every check runs and reports -- knowing three things broke beats knowing one
+did. Exit 0 is healthy (warnings permitted), 1 means something failed, 2
+means doctor itself could not run. The warnings are honest: an unexercised
+sweeper reads WARN "no evidence either way", never a false ok.
+
+### 6. When it goes wrong
 
 | What you see | What it means |
 |---|---|
@@ -314,7 +326,7 @@ through the API -- see
 Note the limitation it documents: an API token cannot open a console, so it
 needs a user login.
 
-### 6. This repository is its own first tenant
+### 7. This repository is its own first tenant
 
 The `.reaper.toml` at the root is real, not an example. `reaper test` here runs
 reaper's whole battery -- Rust suites, shell suites and seam guards -- inside a

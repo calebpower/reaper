@@ -1553,7 +1553,9 @@ impl Report {
         };
         println!("{word}  {label}");
         for l in detail.lines() {
-            println!(" {l}");
+            // Six spaces, and the padding-collapse sweep must not "fix" it:
+            // this indent is the report's structure, not an accident.
+            println!("{}{l}", "      ");
         }
     }
 }

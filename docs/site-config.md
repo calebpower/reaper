@@ -194,7 +194,12 @@ be rare, and each one is a bug.
 
 ## Verifying it
 
-Once the CLI exists, `reaper doctor` checks this configuration end to end:
-provider reachable, every registered guest's template actually present,
-registry internally coherent, sweeper alive. Until then, see
-[`STATUS.md`](STATUS.md) for what can be checked by hand.
+`reaper doctor` checks this configuration end to end: the file parses, the
+key and transport binaries exist, the provider is reachable and the
+credential accepted, every registered guest's template is present and a
+template and priceable, the registry is internally coherent, the storages
+have room, and every session record still matches a machine. `sweep_within`
+above is its patience for the passive sweeper check; `reaper doctor
+--canary` proves the sweeper actively, by creating an already-expired
+machine and watching it be collected. Exit 0 is healthy (warnings
+permitted), 1 means something failed, 2 means doctor itself could not run.
