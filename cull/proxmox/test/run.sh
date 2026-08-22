@@ -175,6 +175,14 @@ says() {
     fi
 }
 
+never_says() {
+    if grep -qi "$1" "${WORK}/err" || grep -qi "$1" "${WORK}/out"; then
+        bad "should not have said: $1"
+    else
+        ok "never said: $1"
+    fi
+}
+
 expired="expires-1699999999"     # one second before NOW
 future="expires-1700009999"
 
@@ -186,6 +194,12 @@ JSON
 if run_cull; then ok "exited 0"; else bad "should have succeeded"; fi
 destroyed 9001
 says "reaped 1, skipped 0"
+# A delete is answered with a task handle and done asynchronously, and this
+# does not wait for it -- so the strongest honest claim is that the request was
+# lodged. It said "destroyed", which tells anybody later reading the log to
+# rule the sweeper out of a leak it may well be responsible for.
+says "9001 marked for destruction"
+never_says "9001 destroyed"
 
 echo
 echo "everything it must not touch"

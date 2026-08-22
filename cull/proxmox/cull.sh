@@ -175,11 +175,19 @@ while IFS="$(printf '\t')" read -r vmid node status tags; do
 		fi
 	fi
 
+	# "marked for destruction", not "destroyed", and the difference is the
+	# whole of what this line can honestly claim. PVE answers a delete with a
+	# task handle and does the work asynchronously, so a request that is
+	# accepted here can still fail afterwards -- and this does not wait to find
+	# out. Saying "destroyed" told anybody later reading the log to rule the
+	# sweeper out, which is precisely the wrong conclusion in the case where it
+	# matters. Nothing is lost by not waiting: this is stateless, the guest
+	# keeps its past expiry, and the next run picks it up again.
 	if api DELETE "/nodes/$node/qemu/$vmid?purge=1&destroy-unreferenced-disks=1" >/dev/null; then
-		log "vmid $vmid destroyed"
+		log "vmid $vmid marked for destruction"
 		reaped=$((reaped + 1))
 	else
-		err "vmid $vmid: destroy failed; will retry next run"
+		err "vmid $vmid: destroy request refused; will retry next run"
 	fi
 done <<ROWS
 $rows
