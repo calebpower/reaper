@@ -797,7 +797,7 @@ checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
 name = "reaper"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "libc",
@@ -808,7 +808,7 @@ dependencies = [
 
 [[package]]
 name = "reaper-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -817,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "reaper-manifest"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "jsonschema",
  "serde",
@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "reaper-provider-proxmox"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "reaper-core",
  "serde",
@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "reaper-providers"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "reaper-core",
  "reaper-provider-proxmox",
