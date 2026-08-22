@@ -92,8 +92,17 @@ guard_guest() {
     # runner/platform/, from when the runner was going to be a compiled binary
     # with a platform sub-module; it is a single shell script delivered over
     # SSH, so the directory is the boundary.
+    #
+    # .github/workflows/ is allowed because it names *build hosts*, not
+    # guests, and the two are unrelated questions. This seam exists so that
+    # adding a guest system is a template build and a registry entry rather
+    # than a code change; a release matrix saying which machines compile the
+    # binary cannot make that false, and no reaper code reads these files.
+    # Narrow deliberately: it is that one directory, and the tenant and
+    # provider seams below still apply to it in full -- a workflow naming a
+    # tenant, or reaching for a hypervisor's API, is still a failure.
     scan "guest seam" \
-        '^(docs/|README\.md$|manifest/examples/|\.reaper\.toml$|runner/|tools/guards\.sh$)' \
+        '^(docs/|README\.md$|manifest/examples/|\.reaper\.toml$|runner/|tools/guards\.sh$|\.github/workflows/)' \
         'systemctl|systemd|apt-get|dpkg |zfsutils-linux|/dev/(vd|vtbd|sd|nvme)[a-z0-9]|rc\.conf|\brc\.d\b|\b(ubuntu|debian|freebsd|alpine|centos|fedora)\b' \
         "An operating system leaked out of the runner's platform modules. The
 guest seam exists so that adding a system is a template build and a

@@ -137,6 +137,17 @@ whoever onboards a project, and whoever runs the loop all day.
 cargo build --release          # target/release/reaper
 ```
 
+Tagging `v<version>` builds it for x86-64 and arm64 Linux and x86-64 and arm64
+FreeBSD, and attaches the binaries to the release alongside a `hashes.txt` that
+`sha256sum -c` reads directly. Each is built against the oldest system it is
+meant to run on -- Debian 12's glibc, and FreeBSD 14 -- because both platforms
+are forward compatible and neither is backward compatible, so building on the
+newest thing available produces a binary that will not start on anything else. Each is a single self-contained file: the runner
+is compiled in, so there is nothing to unpack and nothing to install beside it.
+There is no Windows build, and that is a property of the program rather than of
+the pipeline -- see the header of
+[`.github/workflows/release.yml`](.github/workflows/release.yml).
+
 Nothing is installed into a guest. The runner is compiled into the binary and
 delivered over SSH on every operation, so upgrading reaper never means
 rebuilding a template.

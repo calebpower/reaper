@@ -258,9 +258,21 @@ printf '\n--- the gate: what reviews the reviewers ---\n\n'
 # choice someone gets to make mid-task. (Vendor-mandated YAML *content* inside
 # a guest runbook heredoc is not a file and is not ours; this checks files and
 # dependencies.)
-sources | grep -E '\.(ya?ml)$' | offenders \
-    "no YAML files, ever" \
-    "This project speaks TOML everywhere. Convert the file."
+#
+# Widened once, 2026-08-22, on Cal's decision and for the reason already in
+# the parenthesis above: GitHub defines the format its workflows are written
+# in and this project does not get a vote, so a workflow is vendor-mandated
+# YAML in exactly the sense a runbook heredoc is. The original wording drew
+# the line at content rather than files because no such file existed yet.
+#
+# The exemption is one directory wide and nothing else. YAML anywhere else in
+# the tree -- including elsewhere under .github/ -- still fails, and the
+# companion check below still refuses a YAML parser in the dependency tree,
+# which is the half that would put a YAML surface in reaper itself.
+sources | grep -E '\.(ya?ml)$' | grep -vE '^\.github/workflows/[^/]+\.ya?ml$' | offenders \
+    "no YAML files outside .github/workflows" \
+    "This project speaks TOML everywhere. GitHub's workflow format is the one
+exemption, and it is that directory only. Convert the file."
 
 sources | grep -E 'Cargo\.(toml|lock)$' | xargs grep -n 'yaml' 2>/dev/null | offenders \
     "no YAML parser in the dependency tree" \

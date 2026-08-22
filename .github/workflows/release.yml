@@ -1,0 +1,298 @@
+# Build reaper for every platform it can actually run on, and attach the
+# results to the tag that asked for them.
+#
+# Two decisions are worth stating up front, because both are visible in the
+# matrix below and neither is an oversight:
+#
+#   - **There is no Windows build.** reaper is Unix by construction, not by
+#     configuration: the heartbeat is detached with setsid(2) and stopped with
+#     kill(2), the rsh wrapper rsync runs is a `#!/bin/sh` script written at
+#     mode 0700, the token's permissions are read as a Unix mode, and every
+#     rendered command is quoted for a POSIX shell. Those are four
+#     unconditional uses of `std::os::unix` in shipped code, so a Windows
+#     target does not fail at runtime -- it fails to compile. Adding one is a
+#     port, not a line in this file.
+#
+#   - **FreeBSD is built natively, in a virtual machine, rather than
+#     cross-compiled.** The README says to build BSD natively and explains why
+#     (an OpenSSL linkage difference between build hosts is exactly the kind of
+#     portability failure that shows up late and confusingly); a release
+#     pipeline that ignored that would be the first thing to disprove it.
+#     That covers aarch64 too: tier 3 means the Rust project ships no prebuilt
+#     standard library to cross-compile *with*, which says nothing about a
+#     native toolchain -- pkg's rustc on FreeBSD/arm64 brings its own, so the
+#     tier never enters into it.
+#
+# Every binary is built against the OLDEST system it is meant to run on, which
+# is the only thing that makes "it built" and "it runs" the same claim. Both
+# platforms are forward compatible and neither is backward compatible, and
+# v0.1.0 shipped a FreeBSD binary that could not start on the workstation that
+# develops reaper -- built on 15.1, refused by 15.0 for a libc symbol version.
+# So the FreeBSD VMs are pinned to a release rather than tracking the newest,
+# and the Linux binaries are built inside a pinned container rather than
+# against whatever glibc the runner image happens to carry this month.
+#
+# Actions are pinned by commit, not by tag, for the same reason the manifest
+# schema demands image digests: a tag is a name somebody else can repoint.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # So the whole matrix can be proved without minting a release. Builds and
+  # hashes everything, publishes nothing.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The project's own standard, and the reason a release build fails here
+  # rather than on somebody's stricter machine. tools/check.sh applies the
+  # same flag to every target.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # -------------------------------------------------------------------------
+  # The gate. A tag is not a reason to ship something that was never run.
+  # -------------------------------------------------------------------------
+  gate:
+    name: gate (test suite and checks)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # tools/check.sh needs all three, and says so rather than passing
+      # without them: rsync because reaper drives it, shellcheck because
+      # reaper is half shell, jq because the sweeper's self-test reads canned
+      # API replies.
+      - name: Dependencies the checks refuse to run without
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq rsync shellcheck jq
+
+      - name: Toolchain
+        run: |
+          command -v cargo >/dev/null || {
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain stable --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          }
+
+      - run: cargo --version && rustc --version
+
+      - name: The tag and the crate must agree
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          REF: ${{ github.ref_name }}
+        run: |
+          set -eu
+          crate=$(cargo metadata --no-deps --format-version 1 \
+                  | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="reaper"))')
+          tag=${REF#v}
+          if [ "$crate" != "$tag" ]; then
+            echo "tag ${REF} claims ${tag}; cli/Cargo.toml says ${crate}." >&2
+            echo "A release whose binary reports a different version than the tag it" >&2
+            echo "hangs under is one nobody can reason about afterwards. Fix one of them." >&2
+            exit 1
+          fi
+          echo "tag ${REF} and crate ${crate} agree"
+
+      - run: cargo test --workspace --locked
+      - run: ./tools/check.sh
+
+  # -------------------------------------------------------------------------
+  # Linux, on real hardware of each architecture. No cross-compilation: the
+  # arm64 runner is genuinely arm64.
+  # -------------------------------------------------------------------------
+  linux:
+    name: ${{ matrix.target }}
+    needs: gate
+    runs-on: ${{ matrix.runner }}
+    # Debian 12 (glibc 2.36), by digest, on both architectures. The runner
+    # image decides nothing here: built directly on ubuntu-24.04, v0.1.0's
+    # binaries demanded GLIBC_2.39 and so would not start on Debian 12,
+    # Ubuntu 22.04 or RHEL 9 -- a portability floor nobody chose, inherited
+    # from whichever image GitHub happened to be shipping. Pinning it is the
+    # same rule the manifest schema already enforces for a tenant's images,
+    # and for the same reason: a tag is a name somebody else can repoint.
+    container:
+      image: debian:12@sha256:813017f3d62be4b5891a7acca6a01bdcd4b8513daa81b1ab99d3a50385b26931
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      # The base image carries none of these. cc is not optional: the TLS
+      # backend has assembly in it and will not link without one.
+      - name: What a bare Debian does not have
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq git curl ca-certificates build-essential file
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: |
+          cargo --version
+          cargo build --release --locked --bin reaper
+          # Confirm the architecture is the one claimed, rather than trusting
+          # the runner label. A mislabelled artifact is worse than none.
+          file target/release/reaper
+
+      - name: Name it after what it is
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          mkdir -p dist
+          cp target/release/reaper "dist/reaper-${TARGET}"
+          strip "dist/reaper-${TARGET}" || true
+          "./dist/reaper-${TARGET}" --version
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: reaper-${{ matrix.target }}
+          path: dist/reaper-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # -------------------------------------------------------------------------
+  # FreeBSD, natively, in a VM. Slower than cross-compiling and correct in the
+  # way cross-compiling is not -- and on arm64 the VM runs on an arm64 runner,
+  # so it is accelerated rather than emulated.
+  # -------------------------------------------------------------------------
+  freebsd:
+    name: ${{ matrix.target }}
+    needs: gate
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-freebsd
+            runner: ubuntu-24.04
+            arch: x86_64
+          - target: aarch64-unknown-freebsd
+            runner: ubuntu-24.04-arm
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build in a FreeBSD guest
+        uses: vmactions/freebsd-vm@d0518f912576ae759075aa00fb9fe27037940271 # v1.5.4
+        with:
+          # Pinned to the oldest release these binaries are meant to run on.
+          # FreeBSD is forward compatible and not backward compatible, so
+          # building on the newest available produces a binary that refuses to
+          # start anywhere older -- which is exactly what v0.1.0 shipped: built
+          # on 15.1, and rejected by 15.0-RELEASE for wanting FBSD_1.9 out of
+          # libc. Built on 14, it runs on 14 and on 15.
+          release: "14"
+          arch: ${{ matrix.arch }}
+          # Workflow-level env stops at the host; the guest is a different
+          # machine. Named here so the release build inside it is held to the
+          # same strictness as every other target.
+          envs: "RUSTFLAGS TARGET"
+          # rust brings its own cargo, and nothing else is needed: what runs
+          # here is the runner's own suite, which is pure POSIX sh with every
+          # tool it wants in base. That is the whole reason this platform is
+          # worth building for, and it is exactly what this project's own
+          # .reaper.toml asks of its FreeBSD guest.
+          prepare: pkg install -y rust
+          run: |
+            set -eu
+            cargo --version
+            cargo build --release --locked --bin reaper
+            ./runner/test/run.sh
+            mkdir -p dist
+            cp target/release/reaper "dist/reaper-${TARGET}"
+            strip "dist/reaper-${TARGET}" || true
+            "./dist/reaper-${TARGET}" --version
+        env:
+          TARGET: ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: reaper-${{ matrix.target }}
+          path: dist/reaper-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # -------------------------------------------------------------------------
+  # One release, carrying every binary and one file that says what they are.
+  # -------------------------------------------------------------------------
+  publish:
+    name: publish
+    needs: [linux, freebsd]
+    runs-on: ubuntu-24.04
+    permissions:
+      # The only job that gets it, and only because it creates the release.
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: staging
+
+      - name: Collect the binaries
+        env:
+          # Through the environment, never interpolated into the script body:
+          # a ref name is text somebody else chooses, and `${{ }}` pasted into
+          # a shell is how that text becomes a command.
+          REF: ${{ github.ref_name }}
+        run: |
+          set -eu
+          mkdir -p dist
+          # Each artifact arrives in its own directory. Flatten them, stamp the
+          # ref into the name -- a file called `reaper-x86_64-unknown-linux-gnu`
+          # says nothing about which release it came from once it is sitting in
+          # somebody's downloads directory -- and restore the executable bit,
+          # which the upload does not carry.
+          for f in staging/*/reaper-*; do
+            base=${f##*/}
+            cp "$f" "dist/reaper-${REF}-${base#reaper-}"
+          done
+          chmod 0755 dist/*
+          ls -l dist
+
+      - name: hashes.txt
+        run: |
+          set -eu
+          cd dist
+          # Two spaces between hash and name: the format `sha256sum -c` reads,
+          # so verifying is `sha256sum -c hashes.txt` and not an exercise for
+          # the reader.
+          sha256sum reaper-* > hashes.txt
+          sha256sum -c hashes.txt
+          cat hashes.txt
+
+      # Kept even on a manual run, so the matrix can be proved without
+      # publishing anything.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ github.ref_name }}
+          path: dist/
+          if-no-files-found: error
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          gh release create "$REF" dist/* \
+            --repo "$REPO" \
+            --title "$REF" \
+            --generate-notes
