@@ -572,6 +572,7 @@ fn ssh_never_prompts_and_never_shares_a_known_hosts_file() {
         None,
         PathBuf::from("/state/known-hosts-a-session"),
         Duration::from_secs(15),
+        Duration::from_secs(300),
     );
     let opts = ssh.options().join(" ");
 
@@ -597,6 +598,7 @@ fn a_configured_key_is_offered_and_it_is_the_only_one() {
         Some(PathBuf::from("/keys/session")),
         PathBuf::from("/state/kh"),
         Duration::from_secs(15),
+        Duration::from_secs(300),
     );
     let opts = ssh.options().join(" ");
     assert!(opts.contains("-i /keys/session"), "{opts}");
@@ -612,6 +614,7 @@ fn with_no_key_configured_nothing_is_forced() {
         None,
         PathBuf::from("/state/kh"),
         Duration::from_secs(15),
+        Duration::from_secs(300),
     );
     let opts = ssh.options().join(" ");
     assert!(!opts.contains("IdentitiesOnly"), "{opts}");
@@ -776,6 +779,7 @@ fn ssh_to(address: &str) -> Ssh {
         None,
         PathBuf::from("/tmp/kh"),
         Duration::from_secs(15),
+        Duration::from_secs(300),
     )
 }
 
@@ -866,6 +870,48 @@ fn clearing_the_results_directory_empties_it_and_keeps_it() {
 }
 
 #[test]
+fn both_directions_bound_a_transfer_that_stops_moving() {
+    // R-1, from the seance reports. Twice a results pull wedged with both ends
+    // idle in select and nothing transferring, while the run it was reporting
+    // on had already passed and the connection stayed ESTABLISHED -- a second
+    // ssh to the same guest answered instantly both times. Nothing at the
+    // connection layer was ever going to notice that, keepalives included,
+    // because nothing about the connection was wrong. rsync's own inactivity
+    // timeout is what notices, and without it `collector.join()` is an
+    // unbounded wait on a transfer that has stopped having anything to say.
+    let ssh = ssh_to("192.0.2.1");
+    let push = sync::push(
+        "rsync",
+        Path::new("/state/rsh"),
+        &ssh,
+        Path::new("/home/tree"),
+        "/pool/work/a-project",
+        &[],
+    );
+    let pull = sync::pull(
+        "rsync",
+        Path::new("/state/rsh"),
+        &ssh,
+        "/pool/work/a-project/out",
+        Path::new("/home/tree/out"),
+    );
+    for (which, plan) in [("push", &push), ("pull", &pull)] {
+        assert!(
+            plan.args.iter().any(|a| a.starts_with("--timeout=")),
+            "the {which} direction can stall for ever: {:?}",
+            plan.args
+        );
+    }
+    // Taken from the transport rather than passed alongside it, so ssh and
+    // rsync cannot end up with different patience for the same guest.
+    assert!(
+        push.args.contains(&"--timeout=300".to_string()),
+        "the timeout must come from the transport: {:?}",
+        push.args
+    );
+}
+
+#[test]
 fn the_results_channel_never_deletes() {
     let plan = sync::pull(
         "rsync",
@@ -912,6 +958,7 @@ fn the_transport_wrapper_carries_the_same_options_ssh_uses() {
         Some(PathBuf::from("/keys/session")),
         dir.join("known-hosts"),
         Duration::from_secs(15),
+        Duration::from_secs(300),
     );
 
     let path = sync::rsh_wrapper(&ssh, &dir.join("rsh")).expect("wrapper");
@@ -1300,6 +1347,7 @@ fn put_executable_quotes_the_destination() {
         None,
         dir.join("kh"),
         Duration::from_secs(15),
+        Duration::from_secs(300),
     );
     use crate::transport::Transport;
     ssh.put_executable(b"#!/bin/sh\n", "/tmp/a b;touch pwned")
@@ -1333,6 +1381,7 @@ fn put_executable_survives_a_chatty_child() {
         None,
         dir.join("kh"),
         Duration::from_secs(15),
+        Duration::from_secs(300),
     );
     use crate::transport::Transport;
     let payload = vec![b'x'; 1 << 20];
@@ -1419,6 +1468,7 @@ fn a_failed_sync_surfaces_the_tools_own_stderr() {
     let ssh = crate::transport::Ssh::new(
         "ssh", "root", "192.0.2.7".parse().unwrap(), None, dir.join("kh"),
         Duration::from_secs(15),
+        Duration::from_secs(300),
     );
     let plan = crate::sync::pull(
         stub.to_str().unwrap(),
@@ -1466,6 +1516,67 @@ fn a_pre_epoch_time_is_clamped_to_zero_not_a_panic() {
 }
 
 #[test]
+fn a_control_command_that_never_answers_is_given_up_on_and_killed() {
+    // R-3, from the seance reports: an ssh whose remote command had already
+    // exited sat in select for thirty-two minutes and held `reaper sync` open
+    // behind it. The guest was healthy throughout. ConnectTimeout does not
+    // reach this -- the connection was long since established -- so nothing
+    // bounded it at all.
+    let dir = scratch_dir("stalledcmd");
+    let stub = dir.join("fake-ssh");
+    // Answers nothing. `exec` so the stub *becomes* the sleep rather than
+    // spawning one: a real ssh is a single process, and a stub that left a
+    // grandchild behind would be testing a shape reaper never meets while
+    // leaking a process for the length of the sleep.
+    write_executable(&stub, "#!/bin/sh\nexec sleep 30\n");
+
+    let ssh = crate::transport::Ssh::new(
+        stub.to_str().unwrap(),
+        "root",
+        "192.0.2.7".parse::<IpAddr>().unwrap(),
+        None,
+        dir.join("kh"),
+        Duration::from_secs(15),
+        // The patience under test. Production is minutes; a test that waited
+        // those out is a test that stops being run.
+        Duration::from_millis(400),
+    );
+
+    let started = std::time::Instant::now();
+    let e = crate::transport::Transport::run(&ssh, "true", "making the workspace")
+        .expect_err("a command that never answers must not be waited on for ever");
+    let waited = started.elapsed();
+
+    assert!(
+        matches!(e, crate::transport::TransportError::Stalled { .. }),
+        "wanted Stalled, got {e}"
+    );
+    // It must not read as the guest having refused something. Only one of
+    // those two says anything about the guest, and saying the wrong one sends
+    // somebody to inspect a machine that is fine.
+    let said = e.to_string();
+    assert!(said.contains("stopped responding"), "{said}");
+    assert!(said.contains("io_timeout"), "say which knob owns it: {said}");
+    assert!(
+        waited < Duration::from_secs(5),
+        "took {waited:?}, so the deadline is not being enforced"
+    );
+
+    // And the child is gone rather than left running. A stall that leaked a
+    // process per occurrence would be a slower version of the same bug.
+    std::thread::sleep(Duration::from_millis(200));
+    let leftover = std::process::Command::new("pgrep")
+        .args(["-f", &format!("{}", stub.display())])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    assert!(
+        leftover.is_empty(),
+        "the stalled command was abandoned rather than killed: pids {leftover}"
+    );
+}
+
+#[test]
 fn a_failed_remote_command_reports_what_it_was_doing() {
     let dir = scratch_dir("runfail");
     let stub = dir.join("fake-ssh");
@@ -1473,6 +1584,7 @@ fn a_failed_remote_command_reports_what_it_was_doing() {
     let ssh = crate::transport::Ssh::new(
         stub.to_str().unwrap(), "root", "192.0.2.7".parse().unwrap(), None,
         dir.join("kh"), Duration::from_secs(15),
+        Duration::from_secs(300),
     );
     use crate::transport::Transport;
     let e = ssh.run("true", "checking the machine answers").expect_err("stub fails");

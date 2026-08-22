@@ -38,6 +38,7 @@ ssh_user           = "root"  # who reaper connects as; see docs/guests.md
 ssh_key            = "~/.config/reaper/session-key"  # the key every template trusts
 ssh_command        = "ssh"   # or a wrapper
 ssh_connect_timeout = "15s"
+io_timeout         = "5m"    # patience for a transport that has stopped moving
 
 # The guest registry. Names are free-form and mean whatever you say they mean;
 # a tenant asks for one by name and the framework looks it up here. Quote keys
@@ -111,6 +112,32 @@ has to be edited when you rebuild it; a tenant that names the *role* does not.
 **Operational limits** -- concurrency caps, free-space floors, default TTLs.
 These protect shared storage from a runaway loop, and they belong to you rather
 than to any tenant, because the tenant cannot see what else is running.
+
+### The two timeouts, and why they are two
+
+`ssh_connect_timeout` bounds *reaching* a guest. `io_timeout` bounds a
+conversation already in progress, and they are separate because the failure
+they catch is separate.
+
+A guest that has gone away is caught by the first. What the second catches is
+stranger and was found in the field twice: a transport that stops moving while
+the guest is perfectly healthy. In one case the results rsync sat idle at both
+ends with the run's output already written; in another an ssh whose remote
+command had already exited waited thirty-two minutes. Both times the connection
+was ESTABLISHED throughout, and both times a second ssh to the same guest
+answered in under a second -- so nothing about reachability was ever wrong, and
+nothing that measures reachability would have noticed.
+
+`io_timeout` is therefore an inactivity budget rather than a deadline: it is
+how long reaper will wait having heard *nothing at all*. It bounds reaper's own
+control commands and the results transfers in both directions. It deliberately
+does **not** bound a tenant's build or test command, which may legitimately run
+for hours without printing a word; that one runs unbounded and streams straight
+to the terminal, where a person can see it is stuck.
+
+Five minutes suits a local network. Raise it if your results are large and your
+link is slow, since a transfer that is genuinely crawling still counts as
+progress and will not trip it -- only silence will.
 
 ## Credentials
 

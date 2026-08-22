@@ -2691,3 +2691,69 @@ fn a_forward_sync_says_what_it_removed_there() {
         "without it rsync says nothing about what it deleted: {forward}"
     );
 }
+
+
+#[test]
+fn a_listing_whose_reader_goes_away_ends_quietly() {
+    // R-2, from the seance reports, reproducible on demand: `reaper list |
+    // head -1` printed the listing and then panicked. Rust ignores SIGPIPE, so
+    // a write into a closed pipe returns EPIPE and the print macros panic on
+    // it -- and a panic trace out of the tool that owns the test environment
+    // is exactly what gets read as a real failure at three in the morning.
+    //
+    // The listing has to be bigger than a pipe buffer for the write to reach
+    // the closed pipe at all; at seven lines everything fits in the buffer and
+    // reaper finishes before the reader is gone. That is why this was seen
+    // against a real cluster and never on a small one.
+    let h = Harness::new("epipe");
+    let mut store = String::from("{\n  \"version\": 1,\n  \"sessions\": {\n");
+    for i in 0..3000 {
+        if i > 0 {
+            store.push_str(",\n");
+        }
+        store.push_str(&format!(
+            "    \"p{i:05}\": {{ \"name\": \"p{i:05}\", \"project\": \"p{i:05}\", \
+             \"guest\": \"a-guest\", \"template\": \"t\", \"machine\": \"opaque-{i:05}\", \
+             \"address\": \"192.0.2.1\", \"created_at\": 1700000000, \"ready_at\": null, \
+             \"expires_at\": 4102444800, \"ttl\": 7200, \"heartbeat_pid\": null, \
+             \"synced_at\": null }}"
+        ));
+    }
+    store.push_str("\n  }\n}\n");
+    write(&h.dir.join("sessions.json"), &store, None);
+
+    // stdout to a pipe that is dropped after one line, which is what `head -1`
+    // is. stderr kept, because the panic went there and is the thing under
+    // test.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_reaper"))
+        .arg("list")
+        .current_dir(&h.dir)
+        .env("REAPER_CONFIG", h.dir.join("config.toml"))
+        .env("REAPER_STATE", h.dir.join("sessions.json"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run reaper");
+
+    {
+        use std::io::{BufRead, BufReader};
+        let out = child.stdout.take().expect("stdout was piped");
+        let mut reader = BufReader::new(out);
+        let mut first = String::new();
+        reader.read_line(&mut first).expect("the header");
+        assert!(first.starts_with("SESSION"), "wanted the header, got {first:?}");
+        // Dropped here: the reader has gone, exactly as `head -1` leaves it.
+    }
+
+    let done = child.wait_with_output().expect("reap");
+    let err = String::from_utf8_lossy(&done.stderr);
+    assert!(
+        !err.contains("panicked"),
+        "a closed pipe is not a defect to panic about: {err}"
+    );
+    assert!(
+        done.status.success(),
+        "expected a quiet exit, got {:?}: {err}",
+        done.status
+    );
+}

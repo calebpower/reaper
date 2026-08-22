@@ -98,6 +98,18 @@ pub struct SessionConfig {
     /// also what lets the suite exercise the whole path without a network.
     pub ssh_command: String,
     pub ssh_connect_timeout: Duration,
+    /// How long anything on the transport may go without progress before
+    /// reaper gives up on it.
+    ///
+    /// Distinct from `ssh_connect_timeout`, which bounds only *reaching* the
+    /// guest. This bounds a conversation already in progress -- a control
+    /// command whose answer never arrives, a results transfer that stops
+    /// moving -- both of which have been observed against guests that were
+    /// perfectly healthy and answering a second connection instantly.
+    ///
+    /// It does not bound a tenant's own build or test command, which may
+    /// legitimately run for hours and is deliberately left alone.
+    pub io_timeout: Duration,
     /// The rsync binary. Configurable for the same reasons as `ssh_command`:
     /// a site may want a wrapper, and the suite needs to exercise the whole
     /// path without a network.
@@ -152,6 +164,7 @@ struct RawSession {
     ssh_key: Option<String>,
     ssh_command: Option<String>,
     ssh_connect_timeout: Option<String>,
+    io_timeout: Option<String>,
     rsync_command: Option<String>,
     results_interval: Option<String>,
 }
@@ -168,6 +181,7 @@ impl Default for RawSession {
             ssh_key: None,
             ssh_command: None,
             ssh_connect_timeout: None,
+            io_timeout: None,
             rsync_command: None,
             results_interval: None,
         }
@@ -317,6 +331,7 @@ pub fn parse(text: &str, path: &Path) -> Result<Config, ConfigError> {
                 raw.session.ssh_connect_timeout.as_ref(),
                 "15s",
             )?,
+            io_timeout: dur("io_timeout", raw.session.io_timeout.as_ref(), "5m")?,
             rsync_command: raw.session.rsync_command.unwrap_or_else(|| "rsync".to_string()),
             results_interval,
         },

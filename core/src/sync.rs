@@ -170,6 +170,14 @@ pub fn push(rsync: &str, rsh: &Path, ssh: &Ssh, local: &Path, remote: &str, excl
         // the rsync builds this runs against; the extra lines are captured and
         // counted here, never shown.
         "--itemize-changes".to_string(),
+        // rsync's own inactivity timeout, and the only thing that bounds the
+        // failure this channel actually produces. Twice now a transfer has
+        // wedged with both ends idle in select and nothing moving, while the
+        // connection stayed ESTABLISHED and a second ssh to the same guest
+        // answered instantly -- so nothing at the connection layer, keepalives
+        // included, was ever going to notice. This does: no data for this long
+        // and rsync gives up and says so.
+        format!("--timeout={}", ssh.io_timeout().as_secs().max(1)),
     ];
     args.extend(ownership());
     args.push(format!("--exclude=/{RESULTS}/"));
@@ -208,7 +216,14 @@ pub fn deletions(output: &str) -> usize {
 /// entire purpose is that a failure trace must never exist only on a machine
 /// scheduled for destruction.
 pub fn pull(rsync: &str, rsh: &Path, ssh: &Ssh, remote: &str, local: &Path) -> Plan {
-    let mut args = vec!["-a".to_string()];
+    // Bounded for the same reason as the forward direction, and more urgently:
+    // this is the one that runs on a timer while a tenant's command is going,
+    // so a pull that never returns holds the whole verb open after the run it
+    // was reporting on has already passed.
+    let mut args = vec![
+        "-a".to_string(),
+        format!("--timeout={}", ssh.io_timeout().as_secs().max(1)),
+    ];
     args.extend(ownership());
     args.extend([
         "-e".to_string(),

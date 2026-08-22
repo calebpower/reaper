@@ -5,6 +5,12 @@
 //! the site configuration selected. Lint guards fail the build if hypervisor or
 //! operating-system vocabulary appears here.
 
+// Before the modules that use its macros: a macro_rules! macro is visible
+// only after its definition point, and #[macro_use] is what carries these
+// into the rest of the crate.
+#[macro_use]
+mod out;
+
 mod commands;
 mod proc;
 
@@ -164,7 +170,7 @@ fn main() -> ExitCode {
                 Ok(v) if v.fail == 0 => ExitCode::SUCCESS,
                 Ok(_) => ExitCode::FAILURE,
                 Err(e) => {
-                    eprintln!("reaper: {e}");
+                    warn_line!("reaper: {e}");
                     ExitCode::from(2)
                 }
             };
@@ -219,7 +225,7 @@ fn main() -> ExitCode {
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("reaper: {e}");
+            warn_line!("reaper: {e}");
             ExitCode::FAILURE
         }
     }

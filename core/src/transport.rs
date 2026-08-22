@@ -15,6 +15,14 @@ use std::time::Duration;
 pub enum TransportError {
     Spawn { program: String, source: std::io::Error },
     Failed { what: String, status: i32, stderr: String },
+    /// The command stopped making progress and was given up on.
+    ///
+    /// Deliberately distinct from `Failed`: only one of the two says anything
+    /// about the guest. A command that failed was answered; a command that
+    /// stalled was not, and the machine at the other end may be perfectly
+    /// healthy -- both times this was seen, a second ssh to the same guest
+    /// answered in under a second while the first sat in `select`.
+    Stalled { what: String, after: Duration },
 }
 
 impl fmt::Display for TransportError {
@@ -31,6 +39,14 @@ impl fmt::Display for TransportError {
                 }
                 Ok(())
             }
+            TransportError::Stalled { what, after } => write!(
+                f,
+                "{what} stopped responding: nothing came back for {}s, so reaper gave up on it \
+                 and closed the connection. This says nothing about whether the command \
+                 succeeded -- only that this end stopped hearing about it. session.io_timeout \
+                 is the patience",
+                after.as_secs()
+            ),
         }
     }
 }
@@ -46,6 +62,7 @@ pub struct Ssh {
     key: Option<PathBuf>,
     known_hosts: PathBuf,
     connect_timeout: Duration,
+    io_timeout: Duration,
 }
 
 impl Ssh {
@@ -57,6 +74,7 @@ impl Ssh {
         key: Option<PathBuf>,
         known_hosts: PathBuf,
         connect_timeout: Duration,
+        io_timeout: Duration,
     ) -> Ssh {
         Ssh {
             program: program.into(),
@@ -65,7 +83,17 @@ impl Ssh {
             key,
             known_hosts,
             connect_timeout,
+            io_timeout,
         }
+    }
+
+    /// How long anything on this transport may go without progress.
+    ///
+    /// Carried here rather than passed alongside, so that rsync -- which is
+    /// handed this same `Ssh` to build its transport from -- cannot end up
+    /// with a different patience than ssh has.
+    pub fn io_timeout(&self) -> Duration {
+        self.io_timeout
     }
 
     /// The options every invocation carries, and why.
@@ -102,6 +130,18 @@ impl Ssh {
             "-o".into(), "StrictHostKeyChecking=accept-new".into(),
             "-o".into(), format!("UserKnownHostsFile={}", self.known_hosts.display()),
             "-o".into(), format!("ConnectTimeout={}", self.connect_timeout.as_secs()),
+            // ConnectTimeout bounds *establishing* a connection and nothing
+            // after it. These bound an established one: without them a
+            // connection whose path has quietly gone away is indistinguishable
+            // from one where the far end is simply thinking, and ssh waits on
+            // it for ever. Four probes at a quarter of the patience each, so
+            // the whole budget is io_timeout however it is set.
+            //
+            // They do not bound a command that is merely slow, which is the
+            // point -- a build that runs for an hour without printing anything
+            // keeps answering keepalives and is left alone.
+            "-o".into(), format!("ServerAliveInterval={}", (self.io_timeout.as_secs() / 4).max(1)),
+            "-o".into(), "ServerAliveCountMax=4".into(),
             "-l".into(), self.user.clone(),
         ];
         if let Some(k) = &self.key {
@@ -151,14 +191,100 @@ pub trait Transport {
     fn describe(&self) -> String;
 }
 
+/// Wait for a child, but not for ever.
+///
+/// `Command::output()` waits until the child exits and its pipes close, with
+/// no way to say "and if that never happens". Both halves of that have been
+/// seen to never happen against a healthy guest: an ssh whose remote command
+/// had already exited sat in `select` for thirty-two minutes, and an rsync
+/// pair sat idle at both ends while `$REAPER_OUT` held the finished results.
+///
+/// The pipes are drained on their own threads because they must be: a child
+/// that fills a pipe buffer blocks, and a parent that waits for exit before
+/// reading would then wait for a child that cannot proceed. Read-then-wait is
+/// the deadlock this shape exists to avoid.
+fn wait_with_deadline(
+    program: &str,
+    mut child: std::process::Child,
+    what: &str,
+    within: Duration,
+) -> Result<std::process::Output> {
+    use std::io::Read;
+
+    let mut so = child.stdout.take().expect("stdout was piped");
+    let mut se = child.stderr.take().expect("stderr was piped");
+    let out_reader = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = so.read_to_end(&mut b);
+        b
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = se.read_to_end(&mut b);
+        b
+    });
+
+    let deadline = std::time::Instant::now() + within;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => {
+                return Err(TransportError::Spawn {
+                    program: program.to_string(),
+                    source: e,
+                })
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            // Killed rather than abandoned: leaving it would leak a process
+            // per stall.
+            let _ = child.kill();
+            let _ = child.wait();
+            // The readers are deliberately NOT joined here, and this cost a
+            // hung test to learn. Killing a process does not close pipes that
+            // something it spawned still holds open, so a `read_to_end` on
+            // them can outlive the child by as long as that grandchild lives
+            // -- which would make the deadline path block for ever, in the
+            // exact shape the deadline exists to prevent. Dropping the handles
+            // detaches them; each ends by itself when its pipe finally closes,
+            // and neither is holding anything anyone is waiting for.
+            drop(out_reader);
+            drop(err_reader);
+            return Err(TransportError::Stalled {
+                what: what.to_string(),
+                after: within,
+            });
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    Ok(std::process::Output {
+        status,
+        stdout: out_reader.join().unwrap_or_default(),
+        stderr: err_reader.join().unwrap_or_default(),
+    })
+}
+
 impl Transport for Ssh {
     fn run(&self, command: &str, what: &str) -> Result<String> {
-        let mut cmd = Command::new(&self.program);
-        cmd.args(self.options()).arg(command);
-        let out = cmd.output().map_err(|e| TransportError::Spawn {
-            program: self.program.clone(),
-            source: e,
-        })?;
+        // Bounded, unlike `run_live`. Everything that comes through here is
+        // reaper's own control chatter -- making a workspace, firstboot,
+        // listing snapshots -- and none of it has any business taking minutes.
+        // A tenant's command, which legitimately might, goes through
+        // `run_live` and is deliberately left unbounded.
+        let child = Command::new(&self.program)
+            .args(self.options())
+            .arg(command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| TransportError::Spawn {
+                program: self.program.clone(),
+                source: e,
+            })?;
+        let out = wait_with_deadline(&self.program, child, what, self.io_timeout)?;
 
         if !out.status.success() {
             return Err(TransportError::Failed {
@@ -225,12 +351,18 @@ impl Transport for Ssh {
             r
         });
 
-        let out = child.wait_with_output().map_err(|e| TransportError::Spawn {
-            program: self.program.clone(),
-            source: e,
-        })?;
-
+        // Bounded like `run`, and joined before the deadline is reported
+        // either way: a stall that returned early would leave the writer
+        // thread behind, and the whole point of the deadline is that nothing
+        // is left waiting on a conversation that has stopped.
+        let waited = wait_with_deadline(
+            &self.program,
+            child,
+            &format!("writing {dest}"),
+            self.io_timeout,
+        );
         let wrote = writer.join().expect("stdin writer thread panicked");
+        let out = waited?;
 
         // Status first: a write that broke mid-stream usually broke because
         // the remote command died, and the status plus stderr says why.

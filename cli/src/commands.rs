@@ -178,14 +178,14 @@ pub fn up(
                 let pid = start_heartbeat(&name)?;
                 store.update(&name, |st| st.heartbeat_pid = pid)?;
                 match pid {
-                    Some(pid) => println!(
+                    Some(pid) => say!(
                         "{name}: its heartbeat was dead; restarted as pid {pid}, which runs \
                          until `reaper down`"
                     ),
-                    None => println!("{name}: its heartbeat was dead; restarted"),
+                    None => say!("{name}: its heartbeat was dead; restarted"),
                 }
             }
-            println!(
+            say!(
                 "{name}: already up on {address} since {} ago -- reusing it",
                 duration::format_rough(existing.age(SystemTime::now()))
             );
@@ -216,7 +216,7 @@ pub fn up(
         }
 
         let template = cfg.template_for(&g.name).expect("resolved above").to_string();
-        println!("{name}: creating on {}", g.name);
+        say!("{name}: creating on {}", g.name);
 
         // The first expiry is the readiness grace, not the session's TTL: a
         // full-copy clone can take minutes, and a TTL counted from the create
@@ -285,12 +285,12 @@ pub fn up(
                         renewer = pid;
                         store.update(&name, |st| st.heartbeat_pid = pid)?;
                     }
-                    Err(e) => eprintln!(
+                    Err(e) => warn_line!(
                         "{name}: could not start the renewal heartbeat: {e}. The session works but its expiry will not move; `reaper renew` extends it by hand"
                     ),
                 }
 
-                println!(
+                say!(
                     "{name}: up at {address}, expires in {}",
                     duration::format(ttl)
                 );
@@ -301,7 +301,7 @@ pub fn up(
                 // `up` that never exited costs an afternoon, then costs the
                 // session too when the wrong process is killed.
                 if let Some(pid) = renewer {
-                    println!(
+                    say!(
                         "{name}: renewing in the background as pid {pid}. That process runs \
                          until `reaper down`; `up` itself is finished here"
                     );
@@ -310,7 +310,7 @@ pub fn up(
             None => {
                 // The machine exists and carries its grace expiry, so nothing
                 // is leaked whatever happens next.
-                println!(
+                say!(
                     "{name}: created, but nothing answered on it within {}. \
                      It is tagged to expire; `reaper list` will show it, and \
                      `reaper down {name}` will remove it.",
@@ -384,7 +384,7 @@ fn wait_until_reachable(
                     // and repeating it would bury anything else.
                     let note = format!("{address}: {e}");
                     if said.as_deref() != Some(&note) {
-                        println!("{session}: waiting -- {note}");
+                        say!("{session}: waiting -- {note}");
                         said = Some(note);
                     }
                 }
@@ -504,6 +504,7 @@ fn ssh_to(cfg: &Config, session: &str, address: std::net::IpAddr) -> Result<Ssh>
         cfg.session.ssh_key.clone(),
         state_file(session, "known-hosts")?,
         cfg.session.ssh_connect_timeout,
+        cfg.session.io_timeout,
     ))
 }
 
@@ -559,7 +560,7 @@ fn workspace(ssh: &Ssh, project: &str) -> Result<(String, String)> {
 
 /// Deliver the runner and build the session's storage.
 fn prepare(session: &str, ssh: &Ssh) -> Result<()> {
-    println!("{session}: preparing storage on {}", ssh.describe());
+    say!("{session}: preparing storage on {}", ssh.describe());
     deliver_runner(ssh)?;
     ssh.run(&format!("{RUNNER_PATH} firstboot"), "firstboot")?;
     Ok(())
@@ -613,12 +614,12 @@ pub fn list() -> Result<()> {
     let sessions = store.list()?;
 
     if sessions.is_empty() {
-        println!("no sessions");
+        say!("no sessions");
         return Ok(());
     }
 
     let now = SystemTime::now();
-    println!(
+    say!(
         "{:<24} {:<16} {:<8} {:<10} {:<16} {}",
         "SESSION", "GUEST", "AGE", "EXPIRES", "ADDRESS", "HEARTBEAT"
     );
@@ -641,7 +642,7 @@ pub fn list() -> Result<()> {
             Some(pid) => format!("{pid} DEAD"),
             None => "none".to_string(),
         };
-        println!(
+        say!(
             "{:<24} {:<16} {:<8} {:<10} {:<16} {}",
             s.name,
             s.guest,
@@ -727,7 +728,9 @@ fn implied_sessions(
         // to "there are none" should be the command that makes one, not just
         // the one that confirms there are none.
         return Err(format!(
-            "no sessions for {project:?}. `reaper up` creates one (it is not part of              `reaper test`, which needs a session to already be there); `reaper list`              shows what is running"
+            "no sessions for {project:?}. `reaper up` creates one (it is not part \
+             of `reaper test`, which needs a session to already be there); \
+             `reaper list` shows what is running"
         )
         .into());
     }
@@ -760,18 +763,18 @@ pub fn renew(
                     st.expires_at = expires_at;
                     st.ttl = ttl;
                 })?;
-                println!("{}: expires in {}", s.name, duration::format(ttl));
+                say!("{}: expires in {}", s.name, duration::format(ttl));
             }
             Err(reaper_core::ProviderError::NotFound(_)) => {
                 failures += 1;
-                eprintln!(
+                warn_line!(
                     "{}: its machine is gone (the sweeper collects anything past its expiry); there is nothing left to renew. `reaper down {}` clears the record",
                     s.name, s.name
                 );
             }
             Err(e) => {
                 failures += 1;
-                eprintln!("{}: could not renew: {e}", s.name);
+                warn_line!("{}: could not renew: {e}", s.name);
             }
         }
     }
@@ -794,7 +797,7 @@ pub fn down(session: Option<String>, all: bool, manifest_path: Option<PathBuf>) 
     };
 
     if targets.is_empty() {
-        println!("no sessions");
+        say!("no sessions");
         return Ok(());
     }
 
@@ -816,10 +819,10 @@ pub fn down(session: Option<String>, all: bool, manifest_path: Option<PathBuf>) 
             match proc::looks_like_heartbeat(pid) {
                 Some(true) => {
                     if !proc::stop(pid) {
-                        eprintln!("{}: heartbeat {pid} would not stop", s.name);
+                        warn_line!("{}: heartbeat {pid} would not stop", s.name);
                     }
                 }
-                Some(false) => eprintln!(
+                Some(false) => warn_line!(
                     "{}: pid {pid} is no longer the heartbeat (reused after a reboot?); leaving it alone",
                     s.name
                 ),
@@ -831,7 +834,7 @@ pub fn down(session: Option<String>, all: bool, manifest_path: Option<PathBuf>) 
             Ok(()) => {
                 store.remove(&s.name)?;
                 forget_workstation_files(&s.name);
-                println!("{}: destroyed", s.name);
+                say!("{}: destroyed", s.name);
             }
             // Already gone. The usual reason is the happy one: the session
             // outlived its expiry and the sweeper did exactly its job. Treating
@@ -840,14 +843,14 @@ pub fn down(session: Option<String>, all: bool, manifest_path: Option<PathBuf>) 
             Err(reaper_core::ProviderError::NotFound(_)) => {
                 store.remove(&s.name)?;
                 forget_workstation_files(&s.name);
-                println!("{}: already gone; forgotten", s.name);
+                say!("{}: already gone; forgotten", s.name);
             }
             Err(e) => {
                 failures += 1;
                 // The session stays in the store deliberately: forgetting it
                 // here would hide a machine that still exists. It carries an
                 // expiry, so the sweeper is the backstop either way.
-                eprintln!(
+                warn_line!(
                     "{}: could not destroy {}: {e}. The session is kept so it \
                      stays visible; its expiry means it will be collected regardless",
                     s.name, s.machine
@@ -883,7 +886,7 @@ pub fn heartbeat(name: &str) -> Result<()> {
             // `down` removed it. Nothing to renew and nothing to report.
             Ok(None) => return Ok(()),
             Err(e) => {
-                eprintln!("{name}: could not read the session store: {e}");
+                warn_line!("{name}: could not read the session store: {e}");
                 std::thread::sleep(interval);
                 continue;
             }
@@ -895,7 +898,7 @@ pub fn heartbeat(name: &str) -> Result<()> {
                 // The machine is renewed even when the record cannot say so;
                 // the record catches up on the next tick.
                 if let Err(e) = store.update(name, |s| s.expires_at = expires_at) {
-                    eprintln!("{name}: renewed, but could not record it: {e}");
+                    warn_line!("{name}: renewed, but could not record it: {e}");
                 }
             }
             // Gone is not a blip: the cluster listing no longer shows the
@@ -903,7 +906,7 @@ pub fn heartbeat(name: &str) -> Result<()> {
             // on warning every interval would be a leaked process wearing a
             // log line.
             Err(reaper_core::ProviderError::NotFound(_)) => {
-                eprintln!(
+                warn_line!(
                     "{name}: its machine is gone; nothing left to renew, so this heartbeat is ending. `reaper down {name}` clears the record"
                 );
                 return Ok(());
@@ -913,7 +916,7 @@ pub fn heartbeat(name: &str) -> Result<()> {
                 // because the interval fits several times into the TTL -- that
                 // margin is why the configuration insists on it. Giving up here
                 // would convert a blip into a destroyed session.
-                eprintln!("{name}: renewal failed: {e}");
+                warn_line!("{name}: renewal failed: {e}");
             }
         }
 
@@ -953,10 +956,10 @@ fn prepull(ssh: &Ssh, session: &str, images: &[String]) {
     if images.is_empty() {
         return;
     }
-    println!("{session}: fetching {} declared image(s)", images.len());
+    say!("{session}: fetching {} declared image(s)", images.len());
     let command = format!("{RUNNER_PATH} pull {}", images.join(" "));
     if let Err(e) = ssh.run_live(&command, "pre-pulling images") {
-        eprintln!(
+        warn_line!(
             "{session}: could not pre-fetch images: {e}. The session is up and \
              usable; the first build will fetch them itself."
         );
@@ -1023,7 +1026,7 @@ pub fn sync(session: Option<String>, manifest_path: Option<PathBuf>) -> Result<(
             let (work, results) = workspace(&ssh, &manifest.project)?;
             let rsh = sync::rsh_wrapper(&ssh, &state_file(&s.name, "rsh")?)?;
 
-            println!("{}: {} -> {}", s.name, tree.display(), ssh.describe());
+            say!("{}: {} -> {}", s.name, tree.display(), ssh.describe());
             let pushed = sync::push(
                 &cfg.session.rsync_command,
                 &rsh,
@@ -1040,7 +1043,7 @@ pub fn sync(session: Option<String>, manifest_path: Option<PathBuf>) -> Result<(
             // the one failure in this channel that looks like success.
             let removed = sync::deletions(&pushed);
             if removed > 0 {
-                println!(
+                say!(
                     "{}: {removed} path(s) removed there to match the tree here",
                     s.name
                 );
@@ -1050,14 +1053,14 @@ pub fn sync(session: Option<String>, manifest_path: Option<PathBuf>) -> Result<(
             // And straight back, so a session that already holds results hands
             // them over on the first sync rather than waiting for a run.
             results_plan(&cfg, &ssh, &rsh, &results, &tree)?.run()?;
-            println!("{}: synced", s.name);
+            say!("{}: synced", s.name);
             Ok(())
         };
         if let Err(e) = attempt() {
             failures += 1;
-            eprintln!("{}: could not sync: {e}", s.name);
+            warn_line!("{}: could not sync: {e}", s.name);
             if let Some(note) = expiry_note(&s) {
-                eprintln!("{note}");
+                warn_line!("{note}");
             }
         }
     }
@@ -1090,13 +1093,13 @@ fn take_pristine(ssh: &Ssh, session: &str, manifest: &Manifest) {
         ) {
             // The runner says so only when it actually took one, so a second
             // run does not repeat the explanation.
-            Ok(out) if out.contains("snapshot=") => println!(
+            Ok(out) if out.contains("snapshot=") => say!(
                 "{session}: {d} snapshotted as {PRISTINE} -- as it stands now, after this run. \
                  `reaper snapshot` names an earlier point if you want one"
             ),
             Ok(_) => {}
             // Not fatal. The run succeeded, and that is what was asked for.
-            Err(e) => eprintln!("{session}: could not take {PRISTINE}: {e}"),
+            Err(e) => warn_line!("{session}: could not take {PRISTINE}: {e}"),
         }
     }
 }
@@ -1159,7 +1162,7 @@ pub fn test(
     // in `out/`. The exit status said failed and the artifacts said passed.
     match sync::clear_results(&tree) {
         Ok(0) => {}
-        Ok(n) => println!(
+        Ok(n) => say!(
             "{}: cleared {n} entr{} from {}/ -- this run's results, and only this run's, land there",
             manifest.project,
             if n == 1 { "y" } else { "ies" },
@@ -1168,21 +1171,21 @@ pub fn test(
         // Not fatal. A results directory that will not clear is a permissions
         // problem worth saying out loud, but refusing to run the tests over it
         // helps nobody -- and the operator now knows what `out/` holds.
-        Err(e) => eprintln!(
+        Err(e) => warn_line!(
             "{}: could not clear {}/ before this run ({e}), so it may still hold results from an earlier one",
             manifest.project,
             sync::RESULTS
         ),
     }
 
-    println!("{}: sync", manifest.project);
+    say!("{}: sync", manifest.project);
     sync(session.clone(), manifest_path.clone())?;
 
     // A project with no build step is ordinary -- the smallest legal manifest
     // has none -- so this is a skip rather than a failure.
     let builds = manifest.guests.iter().any(|g| g.build.is_some());
     if builds {
-        println!("{}: build", manifest.project);
+        say!("{}: build", manifest.project);
         exec(
             Verb::Build,
             session.clone(),
@@ -1190,12 +1193,12 @@ pub fn test(
             manifest_path.clone(),
         )?;
     } else {
-        println!("{}: no build declared; skipping", manifest.project);
+        say!("{}: no build declared; skipping", manifest.project);
     }
 
     reset_before_run(&manifest, to, session.clone(), manifest_path.clone())?;
 
-    println!("{}: run", manifest.project);
+    say!("{}: run", manifest.project);
     exec(Verb::Run, session, profile, manifest_path)?;
     Ok(())
 }
@@ -1214,7 +1217,7 @@ fn reset_before_run(
 ) -> Result<()> {
     let name = to.clone().unwrap_or_else(|| PRISTINE.to_string());
     if manifest.reset.is_empty() {
-        println!("{}: no reset datasets declared; skipping", manifest.project);
+        say!("{}: no reset datasets declared; skipping", manifest.project);
         return Ok(());
     }
 
@@ -1243,7 +1246,7 @@ fn reset_before_run(
                     )
                     .into());
                 }
-                println!(
+                say!(
                     "{}: nothing to reset to yet; this run will take {PRISTINE}",
                     s.name
                 );
@@ -1254,7 +1257,7 @@ fn reset_before_run(
         if missing {
             continue;
         }
-        println!("{}: reset to {name}", s.name);
+        say!("{}: reset to {name}", s.name);
         reset(to.clone(), Some(s.name.clone()), manifest_path.clone())?;
     }
     Ok(())
@@ -1291,7 +1294,7 @@ pub fn snapshot(
                 "taking a snapshot",
             )?;
         }
-        println!("{}: {} snapshotted as {name}", s.name, datasets.join(", "));
+        say!("{}: {} snapshotted as {name}", s.name, datasets.join(", "));
     }
     Ok(())
 }
@@ -1330,7 +1333,7 @@ pub fn reset(
                 "rolling back",
             )?;
         }
-        println!(
+        say!(
             "{}: rolled back to {name} in {}",
             s.name,
             duration::format_rough(started.elapsed().unwrap_or_default())
@@ -1422,7 +1425,7 @@ pub fn exec(
                 // The nothing-to-build-anywhere case was refused before the
                 // loop, so silence here never means "did nothing at all".
                 None => {
-                    println!(
+                    say!(
                         "{}: {} declares no build; skipping",
                         s.name, g.name
                     );
@@ -1486,7 +1489,7 @@ pub fn exec(
         let rsh = sync::rsh_wrapper(&ssh, &state_file(&s.name, "rsh")?)?;
         let plan = results_plan(&cfg, &ssh, &rsh, &results, &tree)?;
 
-        println!(
+        say!(
             "{}: {} on {}{}",
             s.name,
             which.label(),
@@ -1523,7 +1526,7 @@ pub fn exec(
                         // Once. A broken channel would otherwise print on every
                         // tick and bury the output of the command itself.
                         if !complained {
-                            eprintln!("{name}: results are not coming back: {e}");
+                            warn_line!("{name}: results are not coming back: {e}");
                             complained = true;
                         }
                     }
@@ -1542,13 +1545,13 @@ pub fn exec(
         match (outcome, collected) {
             (Err(e), pulled) => {
                 if let Err(p) = pulled {
-                    eprintln!("{}: results could not be collected: {p}", s.name);
+                    warn_line!("{}: results could not be collected: {p}", s.name);
                 }
                 return Err(e.into());
             }
             (Ok(()), Err(p)) => return Err(p.into()),
             (Ok(()), Ok(_)) => {
-                println!("{}: {} finished", s.name, which.label());
+                say!("{}: {} finished", s.name, which.label());
                 if which == Verb::Run {
                     take_pristine(&ssh, &s.name, &manifest);
                 }
@@ -1558,9 +1561,9 @@ pub fn exec(
         };
         if let Err(e) = attempt() {
             failures += 1;
-            eprintln!("{}: {} failed: {e}", s.name, which.label());
+            warn_line!("{}: {} failed: {e}", s.name, which.label());
             if let Some(note) = expiry_note(&s) {
-                eprintln!("{note}");
+                warn_line!("{note}");
             }
         }
     }
@@ -1585,7 +1588,7 @@ fn collect_last_results(cfg: &Config, s: &Session, manifest_path: Option<&Path>)
     }
 
     let Some(tree) = tree_for(s, manifest_path) else {
-        eprintln!(
+        warn_line!(
             "{}: not standing in {}, so its results have nowhere to land. \
              Run `reaper sync` from the project before taking it down if you want them",
             s.name, s.project
@@ -1603,14 +1606,14 @@ fn collect_last_results(cfg: &Config, s: &Session, manifest_path: Option<&Path>)
     };
 
     match attempt() {
-        Ok(()) => println!("{}: results collected", s.name),
+        Ok(()) => say!("{}: results collected", s.name),
         Err(e) => {
-            eprintln!(
+            warn_line!(
                 "{}: could not collect results before destroying it: {e}",
                 s.name
             );
             if let Some(note) = expiry_note(s) {
-                eprintln!("{note}");
+                warn_line!("{note}");
             }
         }
     }
@@ -1641,7 +1644,7 @@ impl Report {
     }
 
     fn section(&mut self, title: &str) {
-        println!("\n--- {title} ---\n");
+        say!("\n--- {title} ---\n");
     }
 
     fn line(&mut self, label: &str, health: reaper_core::Health, detail: &str) {
@@ -1659,11 +1662,11 @@ impl Report {
                 "FAIL"
             }
         };
-        println!("{word}  {label}");
+        say!("{word}  {label}");
         for l in detail.lines() {
             // Six spaces, and the padding-collapse sweep must not "fix" it:
             // this indent is the report's structure, not an accident.
-            println!("{}{l}", "      ");
+            say!("{}{l}", "      ");
         }
     }
 }
@@ -1693,7 +1696,7 @@ pub fn doctor(
         Ok(c) => c,
         Err(e) => {
             r.line("site configuration", Health::Fail, &e.to_string());
-            println!("\n{} ok, {} warnings, {} failed", r.ok, r.warn, r.fail);
+            say!("\n{} ok, {} warnings, {} failed", r.ok, r.warn, r.fail);
             return Ok(DoctorVerdict { fail: r.fail });
         }
     };
@@ -1807,7 +1810,7 @@ pub fn doctor(
                 "skipped: without the provider, records cannot be checked \
                  against the machines they claim",
             );
-            println!("\n{} ok, {} warnings, {} failed", r.ok, r.warn, r.fail);
+            say!("\n{} ok, {} warnings, {} failed", r.ok, r.warn, r.fail);
             return Ok(DoctorVerdict { fail: r.fail });
         }
     };
@@ -1921,7 +1924,7 @@ pub fn doctor(
         run_canary(&mut r, &cfg, provider.as_ref(), within);
     }
 
-    println!("\n{} ok, {} warnings, {} failed", r.ok, r.warn, r.fail);
+    say!("\n{} ok, {} warnings, {} failed", r.ok, r.warn, r.fail);
     Ok(DoctorVerdict { fail: r.fail })
 }
 
@@ -1964,7 +1967,7 @@ fn run_canary(
             return;
         }
     };
-    println!(
+    say!(
         "      canary {machine} created, already expired; waiting up to {} \
          for the sweeper",
         duration::format(within)
@@ -1989,7 +1992,7 @@ fn run_canary(
             Ok(_) => {}
             Err(e) => {
                 // A blink mid-wait is absorbed; the deadline bounds it.
-                eprintln!("reaper: canary poll failed ({e}); retrying");
+                warn_line!("reaper: canary poll failed ({e}); retrying");
             }
         }
         if std::time::Instant::now() >= deadline {
