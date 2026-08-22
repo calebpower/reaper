@@ -37,7 +37,7 @@ impl Harness {
         hypervisor.reports_address("192.0.2.42");
 
         write(&dir.join("token"), hypervisor.credential(), Some(0o600));
-        write(
+        write_executable(
             &dir.join("fake-ssh"),
             r#"#!/bin/sh
 # Stands in for ssh. Records the invocation; captures an upload's stdin; fails
@@ -99,9 +99,8 @@ if [ -f "$(dirname "$0")/ssh.fail" ]; then
 fi
 exit 0
 "#,
-            Some(0o755),
         );
-        write(
+        write_executable(
             &dir.join("fake-rsync"),
             r#"#!/bin/sh
 # Stands in for rsync. Records the invocation and copies nothing: what the real
@@ -111,7 +110,6 @@ printf '%s
 ' "$*" >> "$(dirname "$0")/rsync.log"
 exit 0
 "#,
-            Some(0o755),
         );
         write(
             &dir.join("config.toml"),
@@ -234,6 +232,49 @@ fn write(path: &Path, body: &str, mode: Option<u32>) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(m)).unwrap();
     }
+}
+
+/// The line every stand-in carries, so that [`write_executable`] can prove a
+/// file is executable without the script *doing* anything. The ssh stand-in
+/// records every invocation it receives and several tests count those lines,
+/// so a probe run that logged itself would be a test failing for a reason the
+/// harness invented.
+const EXEC_PROBE_GUARD: &str = "if [ -n \"${REAPER_EXEC_PROBE:-}\" ]; then exit 0; fi\n";
+
+/// Write a stand-in, and do not return until it can actually be executed.
+///
+/// ETXTBSY. The kernel refuses to exec a file any process holds open for
+/// writing, and in a threaded test binary that is routine: while this thread
+/// has the file open, another thread's fork duplicates the descriptor into its
+/// child, and the copy is closed only when that child's own exec *succeeds*.
+/// For the width of that window a file this thread has already closed is still
+/// open somewhere else.
+///
+/// The exposure is worse here than in reaper-core, because the child that
+/// inherits the descriptor is a whole `reaper` process rather than something
+/// that execs immediately. Same fix, and the only one available: retrying the
+/// exec, since nothing on this side can close somebody else's descriptor.
+fn write_executable(path: &Path, body: &str) {
+    let (shebang, rest) = body.split_once('\n').expect("a stand-in needs a shebang");
+    assert!(shebang.starts_with("#!"), "a stand-in needs a shebang: {shebang:?}");
+    write(
+        path,
+        &format!("{shebang}\n{EXEC_PROBE_GUARD}{rest}"),
+        Some(0o755),
+    );
+
+    for _ in 0..400 {
+        match Command::new(path).env("REAPER_EXEC_PROBE", "1").output() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(5))
+            }
+            _ => return,
+        }
+    }
+    panic!(
+        "{} was still not executable after two seconds",
+        path.display()
+    );
 }
 
 #[test]

@@ -382,8 +382,18 @@ fn writes_replace_the_file_rather_than_editing_it_in_place() {
 
     // The half the exclusion above would otherwise cost: that the surviving
     // file is a *released* lock and not a leaked one. A guard that stopped
-    // releasing would leave this file exactly as it is, and only this can
-    // tell the difference.
+    // releasing would leave this file exactly as it is, and only this can tell
+    // the difference.
+    //
+    // Retried rather than sampled once, and for a reason worth knowing: a lock
+    // is inherited across fork, and released only when the last descriptor to
+    // it closes. Another thread in this binary forking between our release and
+    // our probe hands a copy to its child, which holds it until that child's
+    // own exec succeeds. So a single instantaneous sample can see a lock that
+    // *is* released, held by a process that is on its way out -- which made
+    // this assertion itself flaky, at about one run in twenty, before it
+    // learned to wait. The production locker rides out the same window through
+    // its own retry loop.
     let lock = dir.join("sessions.lock");
     if lock.exists() {
         let probe = std::fs::OpenOptions::new()
@@ -391,9 +401,18 @@ fn writes_replace_the_file_rather_than_editing_it_in_place() {
             .write(true)
             .open(&lock)
             .unwrap();
-        probe
-            .try_lock()
-            .expect("the store released its lock when the guard dropped");
+        let mut released = false;
+        for _ in 0..400 {
+            if probe.try_lock().is_ok() {
+                released = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            released,
+            "the store never released its lock: the guard is leaking it"
+        );
         probe.unlock().unwrap();
     }
 
@@ -948,15 +967,12 @@ fn scratch(label: &str) -> Scratch {
 /// single flag under test.
 fn local_rsh(dir: &Path) -> PathBuf {
     let path = dir.join("rsh-local");
-    std::fs::write(
+    // Through write_executable like every other generated stub: real rsync
+    // execs this one, so it is exposed to the same ETXTBSY race.
+    write_executable(
         &path,
         "#!/bin/sh\n# Stand-in for ssh: drop the host, run the rest here.\nshift\nexec \"$@\"\n",
-    )
-    .expect("write rsh");
-    use std::os::unix::fs::PermissionsExt;
-    let mut p = std::fs::metadata(&path).unwrap().permissions();
-    p.set_mode(0o700);
-    std::fs::set_permissions(&path, p).unwrap();
+    );
     path
 }
 
@@ -974,6 +990,56 @@ fn rsync_binary() -> String {
          Install it rather than letting this suite pass without checking them."
     );
     String::from_utf8_lossy(&found.stdout).trim().to_string()
+}
+
+/// The line every generated stub carries, so that [`write_executable`] can
+/// prove a file is executable without the script *doing* anything. Several of
+/// these stubs record what they were invoked with, and a probe run that landed
+/// in the record would be a test failing for a reason the harness invented.
+const EXEC_PROBE_GUARD: &str = "if [ -n \"${REAPER_EXEC_PROBE:-}\" ]; then exit 0; fi\n";
+
+/// Write a shell stub, and do not return until it can actually be executed.
+///
+/// ETXTBSY, and it is not hypothetical in a threaded test binary. The kernel
+/// refuses to exec a file that any process holds open for writing. While this
+/// thread has the stub open, another thread's fork duplicates that descriptor
+/// into its child -- and the copy is closed only when the child's own exec
+/// *succeeds*. For the width of that window a file this thread has already
+/// closed is still open somewhere else, and exec'ing it fails with "Text file
+/// busy".
+///
+/// Seen once in roughly six runs of this suite, as
+/// `could not run .../fake-rsync: Text file busy`. That was survivable while
+/// the suite was something a person ran; it stopped being survivable when a
+/// release gate started running the whole suite, because a flake there is a
+/// release that fails for no reason and a person who learns to re-run it.
+///
+/// So executability is confirmed rather than assumed. Retrying the exec is the
+/// only fix available: no amount of care on this side closes a descriptor that
+/// belongs to somebody else's child.
+fn write_executable(path: &Path, body: &str) {
+    let (shebang, rest) = body.split_once('\n').expect("a stub needs a shebang");
+    assert!(shebang.starts_with("#!"), "a stub needs a shebang: {shebang:?}");
+    write(path, format!("{shebang}\n{EXEC_PROBE_GUARD}{rest}").as_bytes());
+
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod stub");
+
+    for _ in 0..400 {
+        match std::process::Command::new(path)
+            .env("REAPER_EXEC_PROBE", "1")
+            .output()
+        {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(5))
+            }
+            _ => return,
+        }
+    }
+    panic!(
+        "{} was still not executable after two seconds",
+        path.display()
+    );
 }
 
 fn write(path: &Path, bytes: &[u8]) {
@@ -1220,19 +1286,13 @@ fn put_executable_quotes_the_destination() {
     let dir = scratch_dir("putquote");
     let stub = dir.join("fake-ssh");
     let record = dir.join("argv");
-    write(
-        &stub,
-        format!(
+    write_executable(&stub,
+        &format!(
             "#!/bin/sh\nshift $(($# - 1))\nprintf '%s' \"$1\" > {} ; cat > /dev/null\n",
             crate::job::quote(record.to_str().unwrap())
-        )
-        .as_bytes(),
+        ),
     );
 
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
     let ssh = crate::transport::Ssh::new(
         stub.to_str().unwrap(),
         "root",
@@ -1262,15 +1322,10 @@ fn put_executable_survives_a_chatty_child() {
     // of stderr first, then drains stdin, which is the pathological order.
     let dir = scratch_dir("putchatty");
     let stub = dir.join("fake-ssh");
-    write(
-        &stub,
-        b"#!/bin/sh\ni=0; while [ $i -lt 16384 ]; do printf '%064d\\n' $i >&2; i=$((i+1)); done; cat > /dev/null\n",
+    write_executable(&stub,
+        "#!/bin/sh\ni=0; while [ $i -lt 16384 ]; do printf '%064d\\n' $i >&2; i=$((i+1)); done; cat > /dev/null\n",
     );
 
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
     let ssh = crate::transport::Ssh::new(
         stub.to_str().unwrap(),
         "root",
@@ -1360,11 +1415,7 @@ fn a_failed_sync_surfaces_the_tools_own_stderr() {
     // destroyed; when it breaks, the person needs rsync's words, not ours.
     let dir = scratch_dir("syncfail");
     let stub = dir.join("fake-rsync");
-    write(&stub, b"#!/bin/sh\necho 'connection unexpectedly closed' >&2\nexit 23\n");
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    write_executable(&stub, "#!/bin/sh\necho 'connection unexpectedly closed' >&2\nexit 23\n");
     let ssh = crate::transport::Ssh::new(
         "ssh", "root", "192.0.2.7".parse().unwrap(), None, dir.join("kh"),
         Duration::from_secs(15),
@@ -1418,11 +1469,7 @@ fn a_pre_epoch_time_is_clamped_to_zero_not_a_panic() {
 fn a_failed_remote_command_reports_what_it_was_doing() {
     let dir = scratch_dir("runfail");
     let stub = dir.join("fake-ssh");
-    write(&stub, b"#!/bin/sh\necho 'the guest said no' >&2\nexit 9\n");
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    write_executable(&stub, "#!/bin/sh\necho 'the guest said no' >&2\nexit 9\n");
     let ssh = crate::transport::Ssh::new(
         stub.to_str().unwrap(), "root", "192.0.2.7".parse().unwrap(), None,
         dir.join("kh"), Duration::from_secs(15),

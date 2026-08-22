@@ -405,6 +405,14 @@ impl Store {
             match file.try_lock() {
                 Ok(()) => return Ok(LockGuard { _file: file }),
                 // Somebody live has it. Wait, within reason.
+                //
+                // "Somebody" is usually another reaper, and occasionally
+                // something briefer: a lock is inherited across fork and
+                // released when the last descriptor closes, so a child this
+                // process spawned while the lock was held keeps it alive until
+                // that child's own exec succeeds. Microseconds, and indistinguishable
+                // from contention from here -- which is exactly why this
+                // retries rather than refusing on the first refusal.
                 Err(fs::TryLockError::WouldBlock) => {}
                 // The lock could not be attempted at all -- an unwritable
                 // directory, a filesystem that does not carry locks. That is
