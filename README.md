@@ -191,7 +191,26 @@ read. Full reference: [`docs/site-config.md`](docs/site-config.md).
 **Deploy the sweeper** from [`cull/`](cull/) on a *different* machine with its
 *own* credential. This is the backstop that destroys anything whose expiry has
 passed, and it is what makes every other failure mode survivable. Run it from
-cron; `--dry-run` first.
+cron; `--dry-run` first. Read [`cull/README.md`](cull/README.md) before you do:
+it is short, and it is the only place the deployment itself is written down --
+[`docs/site-config.md`](docs/site-config.md) says why that credential is
+separate, not what the file looks like. Two things in it will otherwise cost
+you an evening:
+
+- **The credential is not the same shape as the CLI's.** The sweeper *sources*
+  a file that sets `PVE_TOKEN` to the entire authorization header value; the
+  CLI reads a file containing just `user@realm!name=secret`. They live on
+  different machines and neither should learn about the other, which is exactly
+  why nothing warns you when you write one and expect the other.
+- **The cron interval and `sweep_within` are the same decision.** `doctor`
+  reports the sweeper absent when something has been expired for longer than
+  `sweep_within` ([`docs/site-config.md`](docs/site-config.md), default 15m),
+  so a sweeper on a slower schedule than that is a healthy site that reports
+  itself broken. Set the interval comfortably under it.
+
+Nothing here deploys it, and nothing here should: adopting a new version means
+a person copying it across and reading the diff first. A backstop that shared a
+deployment path with the thing it backs up would fail at the same moment.
 
 ### 3. Onboard a project *(once per project)*
 
