@@ -22,3 +22,11 @@ token.*
 .#*
 \#*#
 .DS_Store
+
+# A CARGO_HOME that .github/workflows/release.yml puts inside the workspace,
+# because for one of the build jobs the workspace is the only thing that
+# crosses into the machine doing the build, and so the only thing a cache can
+# reach. See that file for which and why -- naming it here would be an
+# operating system in a place the guest seam does not allow one, and the guard
+# is right about that. Never present on a workstation.
+/.cargo-home/

@@ -176,6 +176,10 @@ jobs:
     name: ${{ matrix.target }}
     needs: gate
     runs-on: ${{ matrix.runner }}
+    # An emulated build that wedges would otherwise sit here for GitHub's
+    # six-hour default before anybody found out. Generous enough that a slow
+    # arm64 run finishes, short enough that a stuck one is not an afternoon.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -183,11 +187,31 @@ jobs:
           - target: x86_64-unknown-freebsd
             runner: ubuntu-24.04
             arch: x86_64
+            # This one is fast, so it carries the runner's own suite for both.
+            suite: "yes"
           - target: aarch64-unknown-freebsd
             runner: ubuntu-24.04-arm
             arch: aarch64
+            suite: "no"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Dependencies dominate the build and change only when Cargo.lock does,
+      # which for a release is almost never. Both live inside the workspace on
+      # purpose: that directory is what the VM action syncs in and copies back,
+      # so it is the only thing a host-side cache can reach.
+      #
+      # Worth measuring rather than assuming. The restore has to cross into the
+      # VM, and on the emulated target that crossing is not free either -- this
+      # is a trade between copying a tree and recompiling it, and which wins is
+      # a question about sizes rather than a matter of principle.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target
+            .cargo-home
+          key: freebsd-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: freebsd-${{ matrix.target }}-
 
       - name: Build in a FreeBSD guest
         uses: vmactions/freebsd-vm@d0518f912576ae759075aa00fb9fe27037940271 # v1.5.4
@@ -200,10 +224,11 @@ jobs:
           # libc. Built on 14, it runs on 14 and on 15.
           release: "14"
           arch: ${{ matrix.arch }}
-          # Workflow-level env stops at the host; the guest is a different
-          # machine. Named here so the release build inside it is held to the
-          # same strictness as every other target.
-          envs: "RUSTFLAGS TARGET"
+          # Every core the runner has. Left unset, the VM takes whatever the
+          # action defaults to, which on the emulated target is the difference
+          # between one thread of qemu and four.
+          cpu: 4
+          envs: "RUSTFLAGS TARGET SUITE"
           # rust brings its own cargo, and nothing else is needed: what runs
           # here is the runner's own suite, which is pure POSIX sh with every
           # tool it wants in base. That is the whole reason this platform is
@@ -212,15 +237,26 @@ jobs:
           prepare: pkg install -y rust
           run: |
             set -eu
+            # Inside the synced workspace so the cache above can hold it.
+            CARGO_HOME="$PWD/.cargo-home"
+            export CARGO_HOME
             cargo --version
             cargo build --release --locked --bin reaper
-            ./runner/test/run.sh
+            # The runner's suite is pure POSIX sh and identical on both
+            # architectures, so it runs once, on the fast target. Paying for a
+            # second copy of the same answer under emulation buys nothing.
+            if [ "${SUITE}" = "yes" ]; then
+              ./runner/test/run.sh
+            else
+              echo "runner suite: skipped here; it is architecture-independent and ran on x86_64"
+            fi
             mkdir -p dist
             cp target/release/reaper "dist/reaper-${TARGET}"
             strip "dist/reaper-${TARGET}" || true
             "./dist/reaper-${TARGET}" --version
         env:
           TARGET: ${{ matrix.target }}
+          SUITE: ${{ matrix.suite }}
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
