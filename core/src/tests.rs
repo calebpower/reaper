@@ -366,13 +366,37 @@ fn writes_replace_the_file_rather_than_editing_it_in_place() {
     let store = Store::at(&path);
     store.put(session("alpha", "m-1")).unwrap();
 
+    // sessions.lock is expected to survive and is excluded by name, not by
+    // pattern. The lock is now held *on* that file rather than being its
+    // existence, and removing it on release is the classic route to two
+    // holders -- so its presence is correct, and only its presence. Anything
+    // else lock-shaped, and every temp file, is still a leak.
     let leftovers: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n != "sessions.lock")
         .filter(|n| n.contains("tmp") || n.contains("lock"))
         .collect();
     assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+
+    // The half the exclusion above would otherwise cost: that the surviving
+    // file is a *released* lock and not a leaked one. A guard that stopped
+    // releasing would leave this file exactly as it is, and only this can
+    // tell the difference.
+    let lock = dir.join("sessions.lock");
+    if lock.exists() {
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        probe
+            .try_lock()
+            .expect("the store released its lock when the guard dropped");
+        probe.unlock().unwrap();
+    }
+
     assert!(serde_json::from_str::<serde_json::Value>(
         &std::fs::read_to_string(&path).unwrap()
     )
@@ -380,21 +404,60 @@ fn writes_replace_the_file_rather_than_editing_it_in_place() {
 }
 
 #[test]
-fn a_stale_lock_is_aged_out_rather_than_wedging_every_future_run() {
+fn a_lock_whose_holder_died_does_not_wedge_the_next_run() {
+    // What CI found and the workstation never did, because the window is
+    // microseconds wide and a loaded runner is where microseconds live.
+    //
+    // `down` stops the heartbeat with SIGTERM and then SIGKILL. If that lands
+    // while the heartbeat is inside a store mutation, the holder is gone --
+    // and whatever it left behind must not outlive it. Under a scheme where
+    // the lock *is* a file somebody created, it did: the next locker waited
+    // out its entire timeout and then refused, so `down` failed on
+    // `store.remove` having already destroyed the machine, leaving a session
+    // record for a machine that no longer exists and a store nothing could
+    // write for two minutes.
+    let dir = scratch_dir("orphanlock");
+    let path = dir.join("sessions.json");
+
+    // Precisely what a killed holder leaves behind: the file, freshly stamped,
+    // with nobody holding it.
+    std::fs::write(dir.join("sessions.lock"), "").unwrap();
+
+    let started = std::time::Instant::now();
+    Store::at(&path)
+        .put(session("alpha", "m-1"))
+        .expect("a lock whose holder is gone is not a lock");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "took {:?}, so it is still reading a leftover file as a live lock",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_leftover_lock_file_of_any_age_is_not_a_lock() {
+    // This used to assert that an old lock file was *aged out* after two
+    // minutes, which was the best a scheme built on file existence could do.
+    // The lock is now held on the file rather than being the file, so age
+    // stops meaning anything: an hour-old leftover and a one-second-old one
+    // are both simply files nobody is holding. Kept because the scenario is
+    // still worth pinning -- what changed is that the answer is now "instant"
+    // rather than "eventually".
     let dir = scratch_dir("stalelock");
     let path = dir.join("sessions.json");
     let lock = dir.join("sessions.lock");
     std::fs::write(&lock, "").unwrap();
 
-    // Backdate it well past the staleness threshold.
     let old = SystemTime::now() - Duration::from_secs(3600);
     let f = std::fs::File::open(&lock).unwrap();
     f.set_modified(old).unwrap();
     drop(f);
 
+    let started = std::time::Instant::now();
     Store::at(&path)
         .put(session("alpha", "m-1"))
-        .expect("a stale lock should not block forever");
+        .expect("a leftover lock file should not block at all");
+    assert!(started.elapsed() < Duration::from_secs(1), "it waited");
 }
 
 #[test]
@@ -1092,54 +1155,61 @@ fn an_epoch_that_overflows_systemtime_is_corrupt_not_a_panic() {
 }
 
 #[test]
-fn an_unstealable_stale_lock_ends_in_locked_not_a_spin() {
-    // When the stale lock cannot be removed (unwritable directory), the old
-    // code skipped both the deadline and the sleep and span forever at 100%
-    // CPU. It must give up with Locked like any other contended lock.
+fn a_lock_a_live_process_holds_ends_in_locked_not_a_spin() {
+    // The claim this has always made is the one that matters: a lock somebody
+    // else genuinely holds must end in Locked, within the deadline, without
+    // spinning at 100% CPU on the way there.
     //
-    // The wedge is an unwritable directory, and that binds only where DAC
-    // binds: run as root -- which is exactly how this suite runs inside a
-    // session -- the "unstealable" lock is simply stolen. Found by the live
-    // loop, not the workstation. So the environment is probed first, and the
-    // assertion matches the world it runs in; what neither world may do is
-    // spin.
-    use std::os::unix::fs::PermissionsExt;
-    let dir = scratch_dir("wedgedlock");
+    // What changed is that it can now be tested honestly. It used to simulate
+    // contention with a backdated file in an unwritable directory, which bound
+    // only where DAC binds -- run as root, which is how this suite runs inside
+    // a session, the "unstealable" lock was simply stolen and the test had to
+    // branch on which world it was in. A real advisory lock contends the same
+    // way for everyone, so the branch is gone and so is the ambiguity.
+    let dir = scratch_dir("heldlock");
     let path = dir.join("sessions.json");
-    let lock = dir.join("sessions.lock");
-    let probe = dir.join("probe");
-    std::fs::write(&lock, "").unwrap();
-    std::fs::write(&probe, "").unwrap();
-    let f = std::fs::File::open(&lock).unwrap();
-    f.set_modified(SystemTime::now() - Duration::from_secs(3600))
-        .unwrap();
-    drop(f);
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-    let wedge_holds = std::fs::remove_file(&probe).is_err();
 
-    let store = Store::with_timeouts(&path, Duration::from_millis(300), Duration::from_secs(120));
+    // A second open file description on the same file, held for the duration.
+    // flock contends across descriptions, including within one process, so
+    // this is real contention and not a stand-in for it.
+    let holder = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join("sessions.lock"))
+        .unwrap();
+    holder.try_lock().expect("the test takes the lock first");
+
+    let store = Store::with_timeouts(&path, Duration::from_millis(300));
     let started = std::time::Instant::now();
     let result = store.put(session("alpha", "m-1"));
-    // Permissions come back BEFORE any assertion: a test that can only be
-    // cleaned up when it passes leaks an unremovable directory when it fails.
-    std::fs::set_permissions(&*dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let waited = started.elapsed();
+    holder.unlock().unwrap();
 
-    if wedge_holds {
-        let e = result.expect_err("should refuse");
-        assert!(
-            matches!(e, crate::session::StoreError::Locked { .. }),
-            "wanted Locked, got {e}"
-        );
-    } else {
-        // Privileged: the stale lock is stealable after all, and stealing it
-        // promptly is the correct behavior.
-        result.expect("a stealable stale lock is stolen, not fatal");
-    }
+    let e = result.expect_err("a lock somebody holds must refuse, not proceed");
     assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "took {:?}, which looks like the spin",
-        started.elapsed()
+        matches!(e, crate::session::StoreError::Locked { .. }),
+        "wanted Locked, got {e}"
     );
+    // Long enough to have actually waited its deadline, short enough not to
+    // have spun past it. Both halves matter: returning instantly would mean
+    // it never retried, and running long would mean the deadline is not
+    // being checked.
+    assert!(
+        waited >= Duration::from_millis(250),
+        "gave up after {waited:?} without waiting out its deadline"
+    );
+    assert!(
+        waited < Duration::from_secs(5),
+        "took {waited:?}, which looks like the spin"
+    );
+
+    // And once the holder lets go, the very next attempt works -- the lock is
+    // released, not merely aged.
+    store
+        .put(session("alpha", "m-1"))
+        .expect("released means released");
 }
 
 #[test]

@@ -25,8 +25,8 @@ use crate::provider::MachineRef;
 pub enum StoreError {
     Io { path: PathBuf, source: io::Error },
     Corrupt { path: PathBuf, message: String },
-    /// Another process holds the lock and did not let go in time.
-    Locked { path: PathBuf, held_for: Duration },
+    /// Another *live* process holds the lock and did not let go in time.
+    Locked { path: PathBuf, waited: Duration },
 }
 
 impl fmt::Display for StoreError {
@@ -36,12 +36,15 @@ impl fmt::Display for StoreError {
             StoreError::Corrupt { path, message } => {
                 write!(f, "{}: unreadable session store: {message}", path.display())
             }
-            StoreError::Locked { path, held_for } => write!(
+            StoreError::Locked { path, waited } => write!(
                 f,
-                "{}: another reaper has held the session lock for {}s; \
-                 if nothing else is running, remove it",
+                "{}: another reaper is holding the session lock and did not let go \
+                 within {}s. It is a live process, not a leftover file -- the lock \
+                 is released by the kernel when its holder exits, so there is \
+                 nothing here to clear by hand. Wait for the other command, or \
+                 find it with `ps`",
                 path.display(),
-                held_for.as_secs()
+                waited.as_secs()
             ),
         }
     }
@@ -181,7 +184,6 @@ impl Default for Document {
 pub struct Store {
     path: PathBuf,
     lock_timeout: Duration,
-    stale_lock_after: Duration,
 }
 
 impl Store {
@@ -190,18 +192,13 @@ impl Store {
         Store::at(crate::paths::state_file())
     }
 
-    /// Test-only: the production timeouts make a wedged-lock test take ten
+    /// Test-only: the production timeout makes a contended-lock test take ten
     /// seconds, and a slow test is a test that stops being run.
     #[cfg(test)]
-    pub(crate) fn with_timeouts(
-        path: impl Into<PathBuf>,
-        lock_timeout: Duration,
-        stale_lock_after: Duration,
-    ) -> Store {
+    pub(crate) fn with_timeouts(path: impl Into<PathBuf>, lock_timeout: Duration) -> Store {
         Store {
             path: path.into(),
             lock_timeout,
-            stale_lock_after,
         }
     }
 
@@ -209,7 +206,6 @@ impl Store {
         Store {
             path: path.into(),
             lock_timeout: Duration::from_secs(10),
-            stale_lock_after: Duration::from_secs(120),
         }
     }
 
@@ -358,6 +354,32 @@ impl Store {
         self.path.with_extension("lock")
     }
 
+    /// Hold the store against every other process, for as long as the guard
+    /// lives.
+    ///
+    /// The lock is an advisory lock **on** a file, not the existence of one,
+    /// and that distinction is the whole of this function.
+    ///
+    /// A lock that *is* a file somebody created outlives whoever created it.
+    /// `down` stops the heartbeat with SIGTERM and then SIGKILL, and a
+    /// heartbeat killed inside a mutation left a file every later run read as
+    /// "somebody is working": the next locker waited out its entire timeout
+    /// and refused, so `down` failed on its own `remove` having already
+    /// destroyed the machine -- a session record for a machine that no longer
+    /// exists, and a store nothing could write until a staleness fallback
+    /// finally aged the file out two minutes later. Found by CI on a loaded
+    /// runner; the window is microseconds wide and a workstation never hit it.
+    ///
+    /// This lock is released by the kernel when the holder's descriptor
+    /// closes, which includes the holder dying by any means. There is no
+    /// orphaned state to recover from, so there is no staleness heuristic here
+    /// to get wrong -- and a lock that is still held is now proof that a live
+    /// process holds it, which is what the error says.
+    ///
+    /// The file is never removed. Unlinking a lock file is the classic way to
+    /// end up with two holders: one process unlinks while a second still holds
+    /// the old inode, a third creates a fresh file and locks that, and now two
+    /// processes each believe they are alone.
     fn lock(&self) -> Result<LockGuard> {
         let path = self.lock_path();
         if let Some(dir) = path.parent() {
@@ -367,58 +389,46 @@ impl Store {
             })?;
         }
 
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| StoreError::Io {
+                path: path.clone(),
+                source: e,
+            })?;
+
         let deadline = SystemTime::now() + self.lock_timeout;
         loop {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(_) => return Ok(LockGuard { path }),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(e) => {
-                    return Err(StoreError::Io {
-                        path: path.clone(),
-                        source: e,
-                    })
-                }
-            }
-
-            // A lock nobody released is worse than no lock: it wedges every
-            // future run. Age it out rather than requiring a person to know
-            // this file exists.
-            let held_for = fs::metadata(&path)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|m| SystemTime::now().duration_since(m).ok())
-                .unwrap_or_default();
-            if held_for > self.stale_lock_after {
-                // Steal by rename, then retry the create. rename is atomic, so
-                // when two waiters age the same lock out only one wins the
-                // steal -- remove-then-create would let both "acquire" it and
-                // reintroduce the lost update the lock exists to prevent. The
-                // deadline check below still runs: a steal that keeps failing
-                // (an unwritable directory) must end in Locked, not a spin.
-                let stale = path.with_extension(format!("lock.stale.{}", std::process::id()));
-                if fs::rename(&path, &stale).is_ok() {
-                    let _ = fs::remove_file(&stale);
+            match file.try_lock() {
+                Ok(()) => return Ok(LockGuard { _file: file }),
+                // Somebody live has it. Wait, within reason.
+                Err(fs::TryLockError::WouldBlock) => {}
+                // The lock could not be attempted at all -- an unwritable
+                // directory, a filesystem that does not carry locks. That is
+                // an I/O fault and must not be reported as contention, which
+                // would send somebody hunting a process that does not exist.
+                Err(fs::TryLockError::Error(e)) => {
+                    return Err(StoreError::Io { path, source: e })
                 }
             }
 
             if SystemTime::now() >= deadline {
-                return Err(StoreError::Locked { path, held_for });
+                return Err(StoreError::Locked {
+                    path,
+                    waited: self.lock_timeout,
+                });
             }
             std::thread::sleep(Duration::from_millis(50));
         }
     }
 }
 
+/// The open descriptor is the lock. Dropping it closes the descriptor, and
+/// closing it is what releases the lock -- so there is deliberately nothing to
+/// do here, and deliberately no file to remove.
 struct LockGuard {
-    path: PathBuf,
-}
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
+    _file: fs::File,
 }
