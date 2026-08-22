@@ -2490,3 +2490,163 @@ fn a_live_heartbeat_whose_expiry_decays_is_reported_stalled() {
         "{stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Reports from tenants dogfooding reaper, 2026-08-16 to 2026-08-21.
+//
+// Every one of these is a shape somebody met while using reaper on a real
+// project, written from their account of it. They are grouped because they
+// share a character: none of them is a crash. Each is reaper being confidently
+// wrong, or silently right in a way nobody could tell apart from being wrong.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_loop_that_fails_early_does_not_leave_the_last_green_run_in_place() {
+    // Reported while wiring a full-stack tier. `reaper test` failed in an
+    // early verb and never reached the run, so nothing was pulled back -- and
+    // because the backward sync merges rather than mirrors, `out/` still held
+    // eight stage result files from a successful run four hours earlier, all
+    // failures="0". A collector globbing out/*.xml, or a person, reads a
+    // complete green battery for a tier that did not execute. The exit status
+    // was right and the artifacts contradicted it.
+    let h = Harness::new("stalegreen");
+    h.ok(&["up"]);
+
+    let out = h.dir.join("out");
+    std::fs::create_dir_all(out.join("stage-3")).unwrap();
+    std::fs::write(out.join("results.xml"), "<testsuite failures=\"0\"/>").unwrap();
+    std::fs::write(out.join("stage-3/results.xml"), "<testsuite failures=\"0\"/>").unwrap();
+
+    // This run never reaches the guest at all.
+    h.make_ssh_fail("workspace");
+    let failed = h.run(&["test"]);
+    let _ = std::fs::remove_file(h.dir.join("ssh.fail"));
+
+    assert!(!failed.status.success(), "the loop failed and must say so");
+    let leftovers: Vec<String> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "a run that produced nothing must not leave the last run's results reading as its own: {leftovers:?}"
+    );
+    assert!(out.exists(), "the directory itself is the rsync destination");
+}
+
+#[test]
+fn a_loop_that_cannot_start_does_not_cost_the_last_one_its_results() {
+    // The clearing above must not fire for a run that never begins. `test` on
+    // a project whose session is gone would otherwise empty `out/` and then
+    // refuse -- taking the results of the run the operator is very likely
+    // still reading.
+    let h = Harness::new("noclearnostart");
+    let out = h.dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("results.xml"), "<testsuite failures=\"3\"/>").unwrap();
+
+    let err = h.fails(&["test"]);
+    assert!(err.contains("no sessions for"), "{err}");
+    assert!(
+        out.join("results.xml").exists(),
+        "a loop that could not start must leave the last one's results alone"
+    );
+}
+
+#[test]
+fn a_project_with_no_session_is_told_which_verb_makes_one() {
+    // "The whole loop: sync, build, reset, run" reads as though it includes
+    // bringing a machine up, and `reaper test` is the first thing a new tenant
+    // runs. Pointing only at `reaper list` answers a question they did not ask.
+    let h = Harness::new("nosession");
+    let err = h.fails(&["test"]);
+    assert!(err.contains("no sessions for"), "{err}");
+    assert!(err.contains("reaper up"), "name the verb that makes one: {err}");
+}
+
+#[test]
+fn up_names_the_process_it_leaves_running() {
+    // `up` detaches a heartbeat that runs until `down`, and used to say
+    // nothing about it. `ps` after `up` returns then shows a live `reaper`,
+    // which reads as an `up` that never exited -- an afternoon lost waiting on
+    // it, and the session lost when the wrong process was finally killed.
+    let h = Harness::new("namesheartbeat");
+    let said = h.ok(&["up"]);
+    let pid: u32 = said
+        .lines()
+        .find(|l| l.contains("renewing in the background"))
+        .and_then(|l| l.split("pid ").nth(1))
+        .and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|p| p.parse().ok())
+        .unwrap_or_else(|| panic!("up must name the process it leaves behind:\n{said}"));
+
+    assert!(
+        said.contains("`up` itself is finished"),
+        "and say that it is not `up`:\n{said}"
+    );
+    let listed = h.ok(&["list"]);
+    assert!(
+        listed.contains(&pid.to_string()),
+        "the pid named must be the one `list` shows as the heartbeat:\n{listed}"
+    );
+}
+
+#[test]
+fn a_verb_against_an_expired_session_says_so_rather_than_timing_out() {
+    // An expired session keeps its record and its address, and the machine
+    // behind it has very likely been collected. Every verb then fails as
+    // `ssh: connect to host <addr> port 22: Operation timed out`, minutes
+    // later, naming an address that stopped meaning anything hours ago. The
+    // record knows better than the transport does.
+    let h = Harness::new("expired");
+    h.ok(&["up"]);
+    h.ok(&["sync"]);
+
+    let long_ago = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 7_200;
+    rewrite_session_field(&h, "expires_at", long_ago);
+
+    h.make_ssh_fail("workspace");
+    let out = h.run(&["sync"]);
+    let _ = std::fs::remove_file(h.dir.join("ssh.fail"));
+
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        err.contains("expired"),
+        "the expiry is the explanation, and it is in the record: {err}"
+    );
+    assert!(
+        err.contains("reaper up"),
+        "and say what recovers it: {err}"
+    );
+}
+
+#[test]
+fn a_forward_sync_says_what_it_removed_there() {
+    // Reported from a QA run: a stash-based baseline removed two source files
+    // and the guest appeared not to notice, compiling as UP-TO-DATE. Whether
+    // `--delete` reached that path is answerable only by rsync, and reaper
+    // never asked. A baseline that quietly carries the previous run's classes
+    // is green for the wrong reason -- the one failure in this channel that
+    // looks like success.
+    let h = Harness::new("saysdeletions");
+    h.ok(&["up"]);
+
+    // The stand-in rsync records its arguments and copies nothing, so the flag
+    // is what is asserted here; core's suite runs the real program over the
+    // same flags and counts a real deletion.
+    h.ok(&["sync"]);
+    let invoked = h.log("rsync.log");
+    let forward = invoked
+        .lines()
+        .find(|l| l.contains("--delete"))
+        .unwrap_or_else(|| panic!("no forward sync in:\n{invoked}"));
+    assert!(
+        forward.contains("--itemize-changes"),
+        "without it rsync says nothing about what it deleted: {forward}"
+    );
+}

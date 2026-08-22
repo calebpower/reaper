@@ -177,7 +177,13 @@ pub fn up(
             if !existing.heartbeat_pid.map(proc::is_alive).unwrap_or(false) {
                 let pid = start_heartbeat(&name)?;
                 store.update(&name, |st| st.heartbeat_pid = pid)?;
-                println!("{name}: its heartbeat was dead; restarted");
+                match pid {
+                    Some(pid) => println!(
+                        "{name}: its heartbeat was dead; restarted as pid {pid}, which runs \
+                         until `reaper down`"
+                    ),
+                    None => println!("{name}: its heartbeat was dead; restarted"),
+                }
             }
             println!(
                 "{name}: already up on {address} since {} ago -- reusing it",
@@ -273,8 +279,10 @@ pub fn up(
                 session.ready_at = Some(ready_at);
                 session.expires_at = ready_at + ttl;
                 store.put(session)?;
+                let mut renewer = None;
                 match start_heartbeat(&name) {
                     Ok(pid) => {
+                        renewer = pid;
                         store.update(&name, |st| st.heartbeat_pid = pid)?;
                     }
                     Err(e) => eprintln!(
@@ -286,6 +294,18 @@ pub fn up(
                     "{name}: up at {address}, expires in {}",
                     duration::format(ttl)
                 );
+                // Named, because `up` leaves a second reaper process behind
+                // and nothing used to say so. It is detached into its own
+                // session so it survives the terminal, which means `ps` after
+                // `up` returns shows a live `reaper` -- and reading that as an
+                // `up` that never exited costs an afternoon, then costs the
+                // session too when the wrong process is killed.
+                if let Some(pid) = renewer {
+                    println!(
+                        "{name}: renewing in the background as pid {pid}. That process runs \
+                         until `reaper down`; `up` itself is finished here"
+                    );
+                }
             }
             None => {
                 // The machine exists and carries its grace expiry, so nothing
@@ -445,6 +465,32 @@ fn state_file(session: &str, prefix: &str) -> Result<PathBuf> {
         std::fs::create_dir_all(dir)?;
     }
     Ok(path)
+}
+
+/// Why a verb against this session probably failed, when the session is past
+/// its expiry.
+///
+/// An expired session keeps its record and its address, and the machine behind
+/// it may already have been collected. Every verb then fails the same way --
+/// `ssh: connect to host <addr> port 22: Operation timed out`, minutes later,
+/// naming an address that stopped meaning anything hours ago. The record knows
+/// better than the transport does, so it says so.
+fn expiry_note(s: &Session) -> Option<String> {
+    if s.remaining(SystemTime::now()).is_some() {
+        return None;
+    }
+    Some(format!(
+        "{}: this session expired {} ago, so the machine has very likely been collected \
+         and its address means nothing now. `reaper down {}` clears the record and \
+         `reaper up` starts fresh",
+        s.name,
+        duration::format_rough(
+            SystemTime::now()
+                .duration_since(s.expires_at)
+                .unwrap_or_default()
+        ),
+        s.name
+    ))
 }
 
 fn ssh_to(cfg: &Config, session: &str, address: std::net::IpAddr) -> Result<Ssh> {
@@ -675,7 +721,15 @@ fn implied_sessions(
         .collect();
 
     if mine.is_empty() {
-        return Err(format!("no sessions for {project:?}; try `reaper list`").into());
+        // Naming `up` rather than only `list`. "The whole loop: sync, build,
+        // reset, run" reads as though it includes bringing a machine up, and
+        // `reaper test` is the first thing a new tenant runs -- so the answer
+        // to "there are none" should be the command that makes one, not just
+        // the one that confirms there are none.
+        return Err(format!(
+            "no sessions for {project:?}. `reaper up` creates one (it is not part of              `reaper test`, which needs a session to already be there); `reaper list`              shows what is running"
+        )
+        .into());
     }
     Ok(mine)
 }
@@ -970,7 +1024,7 @@ pub fn sync(session: Option<String>, manifest_path: Option<PathBuf>) -> Result<(
             let rsh = sync::rsh_wrapper(&ssh, &state_file(&s.name, "rsh")?)?;
 
             println!("{}: {} -> {}", s.name, tree.display(), ssh.describe());
-            sync::push(
+            let pushed = sync::push(
                 &cfg.session.rsync_command,
                 &rsh,
                 &ssh,
@@ -979,6 +1033,18 @@ pub fn sync(session: Option<String>, manifest_path: Option<PathBuf>) -> Result<(
                 &manifest.sync_exclude,
             )
             .run()?;
+            // Said out loud, because the alternative is inferring it. A
+            // baseline taken by stashing removes files, and if that removal
+            // does not reach the guest the build there compiles code the
+            // operator deleted -- a green baseline for the wrong reason, and
+            // the one failure in this channel that looks like success.
+            let removed = sync::deletions(&pushed);
+            if removed > 0 {
+                println!(
+                    "{}: {removed} path(s) removed there to match the tree here",
+                    s.name
+                );
+            }
             store.update(&s.name, |st| st.synced_at = Some(SystemTime::now()))?;
 
             // And straight back, so a session that already holds results hands
@@ -990,6 +1056,9 @@ pub fn sync(session: Option<String>, manifest_path: Option<PathBuf>) -> Result<(
         if let Err(e) = attempt() {
             failures += 1;
             eprintln!("{}: could not sync: {e}", s.name);
+            if let Some(note) = expiry_note(&s) {
+                eprintln!("{note}");
+            }
         }
     }
     if failures > 0 {
@@ -1073,7 +1142,38 @@ pub fn test(
     profile: Option<String>,
     manifest_path: Option<PathBuf>,
 ) -> Result<()> {
-    let (manifest, _) = load_manifest_at(manifest_path.clone())?;
+    let (manifest, tree) = load_manifest_at(manifest_path.clone())?;
+
+    // Which sessions this loop will act on, asked before anything is touched.
+    // `sync` asks the same question a moment later and would refuse just as
+    // clearly -- but by then the results directory has been emptied, and a
+    // loop that could not start must not cost the last one its output.
+    implied_sessions(&Store::open(), session.clone(), Some(&manifest.project))?;
+
+    // Before anything else, and only here. `test` is the whole loop, so this
+    // is exactly once per run -- whereas clearing inside `build` or `run`
+    // would have the second step delete the first step's output. What it
+    // prevents is the shape found while wiring a full-stack tier: `test`
+    // failed in the build verb, never reached the run, pulled nothing back,
+    // and left eight result files from a green run four hours earlier sitting
+    // in `out/`. The exit status said failed and the artifacts said passed.
+    match sync::clear_results(&tree) {
+        Ok(0) => {}
+        Ok(n) => println!(
+            "{}: cleared {n} entr{} from {}/ -- this run's results, and only this run's, land there",
+            manifest.project,
+            if n == 1 { "y" } else { "ies" },
+            sync::RESULTS
+        ),
+        // Not fatal. A results directory that will not clear is a permissions
+        // problem worth saying out loud, but refusing to run the tests over it
+        // helps nobody -- and the operator now knows what `out/` holds.
+        Err(e) => eprintln!(
+            "{}: could not clear {}/ before this run ({e}), so it may still hold results from an earlier one",
+            manifest.project,
+            sync::RESULTS
+        ),
+    }
 
     println!("{}: sync", manifest.project);
     sync(session.clone(), manifest_path.clone())?;
@@ -1459,6 +1559,9 @@ pub fn exec(
         if let Err(e) = attempt() {
             failures += 1;
             eprintln!("{}: {} failed: {e}", s.name, which.label());
+            if let Some(note) = expiry_note(&s) {
+                eprintln!("{note}");
+            }
         }
     }
     if failures > 0 {
@@ -1501,10 +1604,15 @@ fn collect_last_results(cfg: &Config, s: &Session, manifest_path: Option<&Path>)
 
     match attempt() {
         Ok(()) => println!("{}: results collected", s.name),
-        Err(e) => eprintln!(
-            "{}: could not collect results before destroying it: {e}",
-            s.name
-        ),
+        Err(e) => {
+            eprintln!(
+                "{}: could not collect results before destroying it: {e}",
+                s.name
+            );
+            if let Some(note) = expiry_note(s) {
+                eprintln!("{note}");
+            }
+        }
     }
 }
 

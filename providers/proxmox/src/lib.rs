@@ -33,6 +33,13 @@ pub struct Proxmox {
     config: Config,
     client: http::Client,
     poll_interval: Duration,
+    /// The last set of addresses a guest agent reported, as it was printed.
+    ///
+    /// `address` is polled every few seconds while a machine boots, so the
+    /// note below would otherwise repeat until it buried everything else.
+    /// Keyed on nothing but the text: what is worth saying again is a set that
+    /// has *changed*, which is exactly the moment a lease arrived.
+    reported: std::sync::Mutex<Option<String>>,
 }
 
 impl Proxmox {
@@ -50,6 +57,7 @@ impl Proxmox {
             config,
             client,
             poll_interval: Duration::from_secs(2),
+            reported: std::sync::Mutex::new(None),
         })
     }
 
@@ -165,13 +173,6 @@ impl Proxmox {
             .to_string())
     }
 
-    /// Choose an unused identifier inside the permitted range.
-    ///
-    /// Deliberately drawn from the range rather than from the API's
-    /// next-free-id endpoint, which knows nothing about which identifiers are
-    /// reaper's to use and would happily hand back one belonging to the wider
-    /// cluster.
-
     /// Refuse a session that would leave a storage too full.
     ///
     /// What a session costs is the template's disks copied whole -- this
@@ -241,7 +242,20 @@ impl Proxmox {
         Ok(())
     }
 
-    fn free_id(&self) -> Result<u32> {
+    /// Choose an unused identifier inside the permitted range.
+    ///
+    /// Deliberately drawn from the range rather than from the API's
+    /// next-free-id endpoint, which knows nothing about which identifiers are
+    /// reaper's to use and would happily hand back one belonging to the wider
+    /// cluster.
+    ///
+    /// `avoid` carries identifiers this attempt has already been *told* are
+    /// taken. The cluster listing is the allocation view, and it is a very good
+    /// one, but it is not the filesystem: a configuration can sit on a node
+    /// that the listing does not show, and the only thing that ever finds out
+    /// is the clone that collides with it. Feeding that answer back is what
+    /// stops the next attempt choosing the same identifier again.
+    fn free_id_avoiding(&self, avoid: &[u32]) -> Result<u32> {
         // Every machine in range, whoever owns it. Identifiers are cluster-wide
         // in Proxmox, so an identifier held by another pool -- or by a template,
         // which `list` deliberately hides -- is still taken. Drawing from the
@@ -251,7 +265,7 @@ impl Proxmox {
         self.config
             .ids
             .iter()
-            .find(|id| !taken.contains(id))
+            .find(|id| !taken.contains(id) && !avoid.contains(id))
             .ok_or_else(|| {
                 ProviderError::Refused(format!(
                     "every identifier in {} is in use; nothing can be created until \
@@ -261,17 +275,36 @@ impl Proxmox {
             })
     }
 
+    /// The cluster's virtual machines, or an error.
+    ///
+    /// Deliberately not "or an empty list". Everything that reads this treats
+    /// absence as proof: `free_id` hands out an identifier nothing is using,
+    /// `still_exists` reports a machine gone, `list` shows the operator what
+    /// they have. A listing that could not be read is *unknown*, and quietly
+    /// spelling unknown as empty turns each of those into a confident wrong
+    /// answer -- an identifier that is already taken, a live session forgotten
+    /// without being destroyed, an empty `reaper list` on a busy cluster.
+    fn cluster_vms(&self) -> Result<Vec<Value>> {
+        let data = self.client.get("/cluster/resources?type=vm")?;
+        data.as_array().cloned().ok_or_else(|| ProviderError::Api {
+            status: 200,
+            message: format!(
+                "/cluster/resources?type=vm answered with {}, not a list of machines. \
+                 Nothing can be allocated or judged gone against a listing that \
+                 cannot be read",
+                kind_of(&data)
+            ),
+        })
+    }
+
     /// Every identifier in range that is spoken for, regardless of pool, and
     /// including templates.
     ///
     /// This is the allocation view, and it is deliberately wider than `list`:
     /// the question here is "what would collide", not "what is mine".
     fn occupied_in_range(&self) -> Result<Vec<u32>> {
-        let data = self.client.get("/cluster/resources?type=vm")?;
-        Ok(data
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
+        Ok(self
+            .cluster_vms()?
             .iter()
             .filter_map(|item| item.get("vmid").and_then(Value::as_u64))
             .map(|id| id as u32)
@@ -285,8 +318,7 @@ impl Proxmox {
     /// must never report, still less act on, a machine outside the range it is
     /// permitted to touch.
     fn all_in_pool(&self) -> Result<Vec<(u32, String, String, bool)>> {
-        let data = self.client.get("/cluster/resources?type=vm")?;
-        let items = data.as_array().cloned().unwrap_or_default();
+        let items = self.cluster_vms()?;
 
         let mut out = Vec::new();
         for item in items {
@@ -352,55 +384,77 @@ impl Provider for Proxmox {
             ));
         }
 
-        let id = self.free_id()?;
-
         // Before anything is created, not after. A clone that runs a shared
         // storage out of space takes down everything else living on it, and
         // the failure arrives minutes in, with a half-copied disk to clean up.
+        // It depends on the template and the requested disk, not on which
+        // identifier is chosen, so it is asked once however many identifiers
+        // the loop below has to walk past.
         self.check_room(template, req.data_disk_gb)?;
 
-        // pool is always sent. The credential can allocate nowhere else, and
-        // omitting it produces a permission error that reads like a bug.
-        let form = vec![
-            ("newid", id.to_string()),
-            ("name", sanitize_name(&req.name)),
-            ("pool", self.config.pool.clone()),
-            ("full", "1".to_string()),
-        ];
-        let task = self.client.post_form(
-            &format!("/nodes/{}/qemu/{template}/clone", self.node()),
-            &form,
-        )?;
-        let machine = MachineRef::new(id.to_string());
-        if let Err(e) = self.wait(&task) {
-            return Err(match e {
-                // Unknown outcome: leave it alone, but do not repeat the
-                // generic timeout's claim that the expiry tag covers this --
-                // no tag has been applied yet, so if the clone does finish,
-                // nothing will ever collect it.
-                ProviderError::Timeout(t) => ProviderError::Timeout(format!(
-                    "{t}. CAUTION: this was the clone making {id}, which has no expiry tag yet -- if it did finish, {id} exists and nothing will collect it. Check for {id} and destroy it by hand"
-                )),
-                // Known failure: the task itself said so, which licenses a
-                // cleanup the way a timeout does not. PVE usually removes the
-                // half-made target itself, in which case this is a NotFound
-                // and there was nothing to do.
-                failed => match self.destroy(&machine) {
-                    Ok(()) | Err(ProviderError::NotFound(_)) => ProviderError::Api {
-                        status: 0,
-                        message: format!(
-                            "cloning {template} into {id} failed ({failed}); nothing was left behind"
-                        ),
-                    },
-                    Err(also) => ProviderError::Api {
-                        status: 0,
-                        message: format!(
-                            "cloning {template} into {id} failed ({failed}), and the leftover could not be destroyed either ({also}). It carries no expiry, so nothing will collect it: destroy {id} by hand"
-                        ),
-                    },
-                },
-            });
-        }
+        // An identifier the cluster listing shows as free can still have a
+        // configuration file sitting on a node, and then the clone is refused
+        // with "config file already exists". That used to end `up`, and every
+        // later `up` for the tenant, until somebody cleared it by hand -- the
+        // pre-deploy gate simply unavailable for the project. It is a
+        // collision, not a catastrophe: note the identifier, take the next
+        // one, and say what was stepped over so the leftover can be chased.
+        let mut spoken_for: Vec<u32> = Vec::new();
+        let (id, machine) = loop {
+            let id = self.free_id_avoiding(&spoken_for)?;
+            let machine = MachineRef::new(id.to_string());
+
+            // pool is always sent. The credential can allocate nowhere else, and
+            // omitting it produces a permission error that reads like a bug.
+            let form = vec![
+                ("newid", id.to_string()),
+                ("name", sanitize_name(&req.name)),
+                ("pool", self.config.pool.clone()),
+                ("full", "1".to_string()),
+            ];
+            let outcome = self
+                .client
+                .post_form(
+                    &format!("/nodes/{}/qemu/{template}/clone", self.node()),
+                    &form,
+                )
+                // A node refuses a colliding identifier outright, before any
+                // task exists; a cluster that got further reports it through
+                // the task. Both are the same answer and both arrive here.
+                .and_then(|task| self.wait(&task));
+
+            match outcome {
+                Ok(()) => break (id, machine),
+                Err(e) if identifier_taken(&e) => {
+                    // Nothing was created, so nothing may be cleaned up. The
+                    // machine behind that identifier belongs to somebody, and
+                    // destroying it on the strength of our own failed clone
+                    // would be the worst thing this provider could do.
+                    eprintln!(
+                        "reaper: identifier {id} is taken by something the cluster listing \
+                         does not show ({e}); trying the next one. That leftover wants a \
+                         human eventually -- nothing here will ever collect it"
+                    );
+                    spoken_for.push(id);
+                    if spoken_for.len() >= MAX_ID_COLLISIONS {
+                        return Err(ProviderError::Refused(format!(
+                            "{} identifier(s) in {} were refused as already existing ({}), \
+                             which is too many to be leftovers. Something else is allocating \
+                             in this range, or these configurations need clearing on the node",
+                            spoken_for.len(),
+                            self.config.ids,
+                            spoken_for
+                                .iter()
+                                .map(u32::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )));
+                    }
+                }
+                Err(e) => return Err(clone_failure(self, template, id, &machine, e)),
+            }
+        };
+
 
         // Expiry first, before anything else and before the machine is ever
         // started. Between the clone finishing and this succeeding the machine
@@ -582,7 +636,29 @@ impl Provider for Proxmox {
             Err(e) => return Err(e),
         };
 
-        Ok(first_usable_address(&data))
+        let candidates = usable_addresses(&data);
+        // Said out loud when there is a choice to be made, because otherwise
+        // the choice is invisible: a session comes up on a v6 address one time
+        // and a v4 address the next, and nothing anywhere records that both
+        // were on offer. Silent when the guest reports one address, which is
+        // the ordinary case and carries no decision.
+        if candidates.len() > 1 {
+            let line = candidates
+                .iter()
+                .map(IpAddr::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut last = self.reported.lock().unwrap_or_else(|e| e.into_inner());
+            if last.as_deref() != Some(line.as_str()) {
+                eprintln!(
+                    "reaper: machine {id} reports {line}; using {} (IPv4 is preferred where \
+                     the guest offers both)",
+                    candidates[0]
+                );
+                *last = Some(line);
+            }
+        }
+        Ok(candidates.into_iter().next())
     }
 
     fn list(&self) -> Result<Vec<MachineSummary>> {
@@ -860,6 +936,69 @@ impl Proxmox {
     }
 }
 
+/// How many colliding identifiers to step over before calling it a pattern.
+///
+/// One or two are leftovers -- a destroy that did not finish, a configuration
+/// the cluster listing has not caught up with. Eight in a row is something else
+/// allocating in this range, and walking the whole range to find out would take
+/// a very long time and make a very confusing log.
+const MAX_ID_COLLISIONS: usize = 8;
+
+/// Does this failure mean the identifier we asked for is already spoken for?
+///
+/// Two spellings have been seen. A live node refuses with `unable to create VM
+/// <newid>: config file already exists` -- note that the message names the new
+/// identifier while the URL names the template, which reads as though it is
+/// complaining about the wrong machine. The stand-in says `identifier already
+/// in use`. Both mean the same thing, and neither describes a state reaper
+/// created: no cleanup may follow from one.
+fn identifier_taken(e: &ProviderError) -> bool {
+    let text = e.to_string().to_ascii_lowercase();
+    text.contains("already exists") || text.contains("already in use")
+}
+
+/// What a failed clone means once it is known *not* to be a collision.
+///
+/// Split out of `create` so that the collision path above cannot fall into it
+/// by accident: everything here is willing to destroy the target identifier,
+/// which is correct for a half-made clone of ours and catastrophic for a
+/// machine that was already there.
+fn clone_failure(
+    provider: &Proxmox,
+    template: u32,
+    id: u32,
+    machine: &MachineRef,
+    e: ProviderError,
+) -> ProviderError {
+    match e {
+        // Unknown outcome: leave it alone, but do not repeat the
+        // generic timeout's claim that the expiry tag covers this --
+        // no tag has been applied yet, so if the clone does finish,
+        // nothing will ever collect it.
+        ProviderError::Timeout(t) => ProviderError::Timeout(format!(
+            "{t}. CAUTION: this was the clone making {id}, which has no expiry tag yet -- if it did finish, {id} exists and nothing will collect it. Check for {id} and destroy it by hand"
+        )),
+        // Known failure: the task itself said so, which licenses a
+        // cleanup the way a timeout does not. PVE usually removes the
+        // half-made target itself, in which case this is a NotFound
+        // and there was nothing to do.
+        failed => match provider.destroy(machine) {
+            Ok(()) | Err(ProviderError::NotFound(_)) => ProviderError::Api {
+                status: 0,
+                message: format!(
+                    "cloning {template} into {id} failed ({failed}); nothing was left behind"
+                ),
+            },
+            Err(also) => ProviderError::Api {
+                status: 0,
+                message: format!(
+                    "cloning {template} into {id} failed ({failed}), and the leftover could not be destroyed either ({also}). It carries no expiry, so nothing will collect it: destroy {id} by hand"
+                ),
+            },
+        },
+    }
+}
+
 /// Proxmox names must look like hostnames. Rather than reject a session name a
 /// person chose, bend it into something acceptable and get on with it.
 fn sanitize_name(name: &str) -> String {
@@ -881,16 +1020,26 @@ fn sanitize_name(name: &str) -> String {
     out.trim_end_matches('-').to_string()
 }
 
-/// The first address a guest agent reports that is worth talking to.
+/// Every address a guest agent reports that is worth talking to, best first.
 ///
 /// Loopback and link-local are skipped: both are things every machine has and
 /// neither is reachable from here, so returning one would look like success and
 /// fail at the first connection.
-fn first_usable_address(data: &Value) -> Option<IpAddr> {
-    let interfaces = data
+///
+/// Separate from the pick so that the pick can be *shown*. A guest configures
+/// IPv6 by autoconfiguration in a second or two and takes several more to get a
+/// DHCPv4 lease, so which family a session lands on is decided by boot timing
+/// -- and a session recorded on an address the workstation cannot reach fails
+/// later as a connection timeout naming an address, with nothing to say where
+/// that address came from. The list is the evidence.
+fn usable_addresses(data: &Value) -> Vec<IpAddr> {
+    let Some(interfaces) = data
         .get("result")
         .and_then(Value::as_array)
-        .or_else(|| data.as_array())?;
+        .or_else(|| data.as_array())
+    else {
+        return Vec::new();
+    };
 
     let mut candidates: Vec<IpAddr> = Vec::new();
     for iface in interfaces {
@@ -925,16 +1074,27 @@ fn first_usable_address(data: &Value) -> Option<IpAddr> {
 
     // IPv4 first: every path this project uses today is v4, and preferring a
     // v6 address the tunnel cannot carry would be a confusing way to fail.
+    // A stable sort, so the agent's own order survives within each family.
+    candidates.sort_by_key(|ip| !ip.is_ipv4());
     candidates
-        .iter()
-        .find(|ip| ip.is_ipv4())
-        .or_else(|| candidates.first())
-        .copied()
 }
 
 #[cfg(test)]
 mod tests;
 
+
+/// What a JSON value is, in one word, for an error message that has to explain
+/// why a reply could not be used.
+fn kind_of(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "a list",
+        Value::Object(_) => "an object",
+    }
+}
 
 const GIB: u64 = 1024 * 1024 * 1024;
 

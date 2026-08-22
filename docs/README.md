@@ -17,11 +17,13 @@ departure is recorded in the root [`README.md`](../README.md) and in
 
 Two things to know when reading them:
 
-**`testing-methodology.md` has a dangling link.** Its §7 and §11 point at a
-`simulated-user-testing.md` deep-dive. That file is superseded and deliberately
-not shipped here; the living specification for that tier is a tenant's own
-`journeys` implementation, not a document. The link is left as-is because
-editing a record to tidy a link is how records stop being records.
+**`testing-methodology.md` once had a dangling link, and no longer does.** Its
+§7 and §11 pointed at a `simulated-user-testing.md` deep-dive that is superseded
+and not shipped here. Two tenants in a row followed it and concluded a file was
+missing from their checkout, which is a reader being misled rather than a record
+being preserved -- so the citations now point at §11 of that same document,
+which is the specification for the tier. What a tenant's own `journeys`
+implementation is remains the living *example*, as it always was.
 
 **`testing-methodology.html` is not shipped.** It is a rendering of the
 Markdown, which is normative. One source, not two.

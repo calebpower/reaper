@@ -4,9 +4,12 @@ How we test, and why each layer exists. Written to be transferable: the
 principles are general, and the yasss implementation is cited as a worked
 example rather than as the definition.
 
-The simulated-user tier has its own deep-dive in
-[`simulated-user-testing.md`](simulated-user-testing.md); §7 below is the
-summary and that document is the specification.
+The simulated-user tier is specified in
+[§11](#11-tier-9--simulated-users-the-seed-driven-tier) below. It once had a
+separate `simulated-user-testing.md` deep-dive; that document was folded into
+this one, and the citation is updated here rather than left dangling -- two
+tenants in a row followed it and concluded a file was missing from their
+checkout.
 
 ---
 
@@ -301,8 +304,9 @@ second needed no concurrency at all to violate.
 
 ## 11. Tier 9 — Simulated users (the seed-driven tier)
 
-Full specification in [`simulated-user-testing.md`](simulated-user-testing.md).
-The summary:
+This section is the full specification: the summary comes first, and the
+subsections below carry the detail. (It was once a separate
+`simulated-user-testing.md`, which no longer exists.)
 
 Several **actors**, each with a real account and a real session, take turns
 doing whatever they are currently able to do, for hundreds of actions. A

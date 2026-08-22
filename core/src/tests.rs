@@ -728,6 +728,62 @@ fn the_forward_sync_mirrors_deletions_and_protects_the_results_directory() {
 }
 
 #[test]
+fn the_forward_sync_reports_what_it_removed() {
+    // Not decoration. A stash-based baseline answers "does this failure predate
+    // my changes?" by removing files, and if that removal does not reach the
+    // guest, the build there compiles code the operator deleted -- a baseline
+    // that is green for the wrong reason, failing in the direction that looks
+    // like success. rsync's own itemized output is the only witness to whether
+    // `--delete` reached a given path, so it is asked rather than assumed.
+    let plan = sync::push(
+        "rsync",
+        Path::new("/state/rsh"),
+        &ssh_to("192.0.2.1"),
+        Path::new("/home/tree"),
+        "/pool/work/a-project",
+        &[],
+    );
+    assert!(
+        plan.args.contains(&"--itemize-changes".to_string()),
+        "without it rsync says nothing at all about deletions"
+    );
+
+    let itemized = "\
+*deleting   src/gone.rs
+>f.st...... src/main.rs
+*deleting   src/also-gone/
+cd+++++++++ src/new/
+";
+    assert_eq!(sync::deletions(itemized), 2);
+    assert_eq!(sync::deletions(""), 0, "a sync that removed nothing says nothing");
+}
+
+#[test]
+fn clearing_the_results_directory_empties_it_and_keeps_it() {
+    let dir = scratch("clear-results");
+    let tree = dir.join("tree");
+    let out = tree.join(sync::RESULTS);
+
+    // A directory that is not there is not an error: nothing to clear.
+    assert_eq!(sync::clear_results(&tree).expect("absent"), 0);
+
+    std::fs::create_dir_all(out.join("stage-3")).unwrap();
+    std::fs::write(out.join("results.xml"), b"<testsuite failures=\"0\"/>").unwrap();
+    std::fs::write(out.join("stage-3/results.xml"), b"<testsuite failures=\"0\"/>").unwrap();
+    // Outside the results directory, and none of its business.
+    std::fs::write(tree.join("src.rs"), b"fn main() {}").unwrap();
+
+    assert_eq!(sync::clear_results(&tree).expect("clear"), 2);
+    assert!(out.exists(), "the directory itself is the rsync destination");
+    assert_eq!(
+        std::fs::read_dir(&out).unwrap().count(),
+        0,
+        "a run that produces nothing must not inherit the last one's results"
+    );
+    assert!(tree.join("src.rs").exists(), "and nothing outside it is touched");
+}
+
+#[test]
 fn the_results_channel_never_deletes() {
     let plan = sync::pull(
         "rsync",
@@ -908,12 +964,20 @@ fn a_real_round_trip_keeps_results_and_mirrors_deletions() {
 
     // Now delete something locally and sync again: the guest must forget it.
     std::fs::remove_file(tree.join("doomed.txt")).unwrap();
-    sync::push(&rsync, &rsh, &ssh, &tree, &remote_str, &excludes)
+    let second = sync::push(&rsync, &rsh, &ssh, &tree, &remote_str, &excludes)
         .run()
         .expect("second push");
     assert!(
         !remote.join("doomed.txt").exists(),
         "a tree still holding a file the operator removed is not the tree under test"
+    );
+    // And real rsync says so in the shape reaper counts. An assertion against
+    // a hand-written sample proves the parser; this proves the parser against
+    // the program whose output it parses.
+    assert_eq!(
+        sync::deletions(&second),
+        1,
+        "the removal must be visible, not merely done: {second}"
     );
     assert!(remote.join("out/trace.json").exists(), "still protected");
 

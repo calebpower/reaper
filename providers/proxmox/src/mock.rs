@@ -75,6 +75,19 @@ pub struct State {
     /// Answer the next N task-status polls with a 502. How a test says "the
     /// API blinked mid-wait" without breaking the operation itself.
     pub flake_next: u32,
+    /// Identifiers that exist but are left out of the cluster listing.
+    ///
+    /// The state a live node was found in: a configuration file sitting on
+    /// disk that `/cluster/resources` does not report. Nothing can allocate
+    /// around what it cannot see, so the only thing that discovers one is the
+    /// clone that collides with it.
+    pub hidden_from_listing: Vec<u32>,
+    /// Answer the cluster listing with something that is not a list.
+    ///
+    /// "The listing could not be read" and "there is nothing there" are
+    /// different claims, and the second one licenses handing out an identifier
+    /// somebody is using and forgetting a session without destroying it.
+    pub listing_unreadable: bool,
 }
 
 pub struct MockPve {
@@ -257,6 +270,16 @@ task_timeout = "5s"
         self.state.lock().expect("mock state").flake_next = n;
     }
 
+    /// Make this machine real but invisible to the cluster listing.
+    pub fn hide_from_listing(&self, id: u32) {
+        self.with_state(|s| s.hidden_from_listing.push(id));
+    }
+
+    /// Answer the cluster listing with a null rather than a list of machines.
+    pub fn listing_unreadable(&self, broken: bool) {
+        self.with_state(|s| s.listing_unreadable = broken);
+    }
+
     pub fn reports_address(&self, addr: &str) {
         self.with_state(|s| {
             s.agent_interfaces = Some(serde_json::json!([
@@ -419,9 +442,13 @@ fn route(s: &mut State, method: &str, path: &str, body: &str) -> (u16, Value) {
 
         ("GET", ["cluster", "resources"]) => {
             let _ = query;
+            if s.listing_unreadable {
+                return (200, json!({ "data": Value::Null }));
+            }
             let items: Vec<Value> = s
                 .vms
                 .iter()
+                .filter(|(id, _)| !s.hidden_from_listing.contains(id))
                 .map(|(id, vm)| {
                     json!({
                         "vmid": id,
@@ -444,7 +471,16 @@ fn route(s: &mut State, method: &str, path: &str, body: &str) -> (u16, Value) {
             let form = parse_form(body);
             let newid: u32 = form.get("newid").and_then(|v| v.parse().ok()).unwrap_or(0);
             if s.vms.contains_key(&newid) {
-                return (500, json!({"errors": "identifier already in use"}));
+                // Verbatim from a live node, including the oddity that the
+                // message names the identifier being created while the URL
+                // names the template it is being cloned from.
+                return (
+                    500,
+                    json!({
+                        "data": Value::Null,
+                        "message": format!("unable to create VM {newid}: config file already exists")
+                    }),
+                );
             }
             let vm = Vm {
                 name: form.get("name").cloned().unwrap_or_default(),

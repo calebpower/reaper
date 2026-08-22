@@ -27,6 +27,7 @@ cache = ["whatever-you-call-it"]
 
 [run]
 cmd = "make e2e"
+exec = "host"                    # this verb needs the guest's own engine client
 images = ["registry.example.com/thing@sha256:..."]    # optional; pre-pulled for you
 
 [sync]
@@ -39,6 +40,13 @@ datasets = ["state"]
 cores = 4
 ram_gb = 8
 ```
+
+The `exec = "host"` on `[run]` is there deliberately, and it is the line tenants
+most often discover the hard way. A project that declares `[run] images` is a
+project whose tests drive containers, and a container-execution verb is given no
+engine client -- so the pairing above is the ordinary shape, not an exotic one.
+[Container execution or host execution](#container-execution-or-host-execution)
+below is the full account.
 
 ## What the framework promises
 
@@ -222,8 +230,20 @@ reaper run           # your run command
 reaper down          # destroy it, results collected on the way
 ```
 
+`reaper test` is the middle three in order: sync, build, reset, run. It is
+**not** a superset of `up`, and it will not create a session for you -- on a
+project with none it stops at the first step and says so. That is deliberate:
+`up` spends minutes and a machine, and no verb whose job is "run my tests
+again" should do that on your behalf. Start with `up`.
+
 Every verb acts on all of this project's sessions, so a manifest naming two
 guests tests both with one command. Name a session to act on just one.
+
+`up` leaves one process behind: a heartbeat that renews the session's expiry
+until `down` stops it. `up` names its process identifier when it finishes, so
+a live `reaper` in `ps` afterwards can be told apart from an `up` that has not
+returned. Do not kill it and expect the session to survive; the expiry stops
+moving the moment it does, and the sweeper collects the machine on schedule.
 
 ### What `test` skips, and why
 
@@ -254,6 +274,21 @@ authoritative for what it produced; it is not authoritative for what was in your
 
 `out/` is excluded from the forward direction whatever else you write, because
 mirroring deletions into the directory results arrive in would destroy them.
+
+**So `reaper test` empties `out/` before it starts.** A merging backward sync has
+one sharp consequence, and it was found on a real project: a `test` that fails in
+an early verb never reaches the run, pulls nothing back, and leaves the previous
+run's results sitting there -- eight stage result files, every one of them
+`failures="0"`, for a tier that did not execute. The exit status is right and the
+artifacts contradict it, and anything globbing `out/*.xml` believes the artifacts.
+Clearing once at the top of the loop is what makes `out/` mean *this* run.
+
+Two things follow from where that clearing happens. It is `test` only: `build`
+and `run` invoked by hand do not clear, because the second of them would
+otherwise delete the first one's output. And it is the workstation's copy only --
+the session keeps whatever it has, so if your command appends to `out/` rather
+than replacing what it finds, clear it guest-side at the start of your own run
+command as well.
 
 ### Results arrive while a run is happening
 

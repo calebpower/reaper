@@ -159,7 +159,18 @@ fn make_executable(at: &Path) -> Result<()> {
 /// No `-z`. This is a local network, and compressing an already-compressed
 /// artifact costs more than it saves.
 pub fn push(rsync: &str, rsh: &Path, ssh: &Ssh, local: &Path, remote: &str, exclude: &[String]) -> Plan {
-    let mut args = vec!["-a".to_string(), "--delete".to_string()];
+    let mut args = vec![
+        "-a".to_string(),
+        "--delete".to_string(),
+        // Itemized so that [`deletions`] can count what went. A removal that
+        // silently fails to propagate leaves the guest compiling a file the
+        // operator deleted, and a baseline built that way is green for the
+        // wrong reason -- the one failure this channel has that looks like
+        // success. `-i` rather than `--info=DEL`, which is newer than some of
+        // the rsync builds this runs against; the extra lines are captured and
+        // counted here, never shown.
+        "--itemize-changes".to_string(),
+    ];
     args.extend(ownership());
     args.push(format!("--exclude=/{RESULTS}/"));
     for pattern in exclude {
@@ -170,6 +181,22 @@ pub fn push(rsync: &str, rsh: &Path, ssh: &Ssh, local: &Path, remote: &str, excl
     args.push(dir(local));
     args.push(format!("{}:{}", ssh.rsync_host(), with_slash(remote)));
     Plan { program: rsync.to_string(), args }
+}
+
+/// How many paths a forward sync removed from the receiver.
+///
+/// Read from rsync's own itemized output rather than inferred here, because
+/// the question this answers is precisely "did `--delete` reach that path?" --
+/// and a count reaper computed from what it *believed* it had deleted would
+/// answer a different question, the one that is never in doubt.
+///
+/// rsync writes one `*deleting   <path>` line per removal. Directories and
+/// files both count: a removed directory is a removed path.
+pub fn deletions(output: &str) -> usize {
+    output
+        .lines()
+        .filter(|l| l.trim_start().starts_with("*deleting"))
+        .count()
 }
 
 /// Results, back out.
@@ -190,6 +217,49 @@ pub fn pull(rsync: &str, rsh: &Path, ssh: &Ssh, remote: &str, local: &Path) -> P
         dir(local),
     ]);
     Plan { program: rsync.to_string(), args }
+}
+
+/// Empty the workstation's results directory, and say how many entries went.
+///
+/// The counterpart to [`pull`]'s refusal to delete, and the reason that refusal
+/// is safe to keep. Because the backward sync merges, a run that fails *before
+/// the guest produces anything* leaves the previous run's results sitting in
+/// `out/` -- and a collector globbing `out/*.xml`, or a person, then reads a
+/// complete green battery for a tier that never executed. The exit status is
+/// right and the artifacts contradict it, which is the worst shape a result can
+/// have.
+///
+/// So this runs once at the top of a whole loop, before anything is synced: the
+/// operator asking for another run is what supersedes the last one's output.
+/// Nothing is destroyed to mirror the guest, which is the trade `pull`
+/// documents and declines; the failure trace from the run just finished
+/// survives until the next run is deliberately started.
+///
+/// The directory itself is kept, because it is the rsync destination and
+/// recreating it is one more thing to get wrong. A directory that is not there
+/// is not an error: there is nothing to clear.
+pub fn clear_results(tree: &Path) -> io::Result<usize> {
+    let at = tree.join(RESULTS);
+    let entries = match std::fs::read_dir(&at) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry?;
+        // Never followed. A symlink in here is removed as a link; whatever it
+        // points at is somebody else's file and is none of this function's
+        // business.
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            std::fs::remove_file(entry.path())?;
+        }
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 /// Numeric owners are not carried across.

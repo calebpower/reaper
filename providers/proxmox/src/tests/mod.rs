@@ -67,6 +67,175 @@ fn request(name: &str, expires: u64) -> CreateRequest {
     }
 }
 
+// --- identifiers the listing cannot see ------------------------------------
+//
+// Found live, gating a release: an expired session was forgotten, and every
+// later `up` for that project failed with
+//
+//     api error 500: /nodes/<node>/qemu/9001/clone:
+//     unable to create VM 9000: config file already exists
+//
+// -- a configuration sitting on the node that `/cluster/resources` did not
+// report, so `free_id` handed it out and the clone collided with it. The
+// project's pre-deploy gate was unavailable until somebody intervened.
+
+#[test]
+fn an_identifier_the_listing_cannot_see_is_stepped_over_rather_than_fatal() {
+    let pve = pve_with_template();
+    // 9001 exists on the node and is missing from the listing, exactly as the
+    // leftover was. It is the identifier free_id would otherwise choose first.
+    pve.with_state(|s| {
+        s.vms.insert(
+            9001,
+            Vm {
+                name: "a-leftover".into(),
+                pool: POOL.into(),
+                ..Vm::default()
+            },
+        );
+    });
+    pve.hide_from_listing(9001);
+
+    let p = provider_for(&pve);
+    let m = p.create(&request("a-session", 1_700_000_000)).expect(
+        "a leftover configuration must cost this session an identifier, not the session",
+    );
+
+    assert_eq!(
+        m.as_str(),
+        "9002",
+        "the collision should have moved allocation on to the next identifier"
+    );
+    assert!(
+        pve.vm(9001).is_some(),
+        "the leftover belongs to somebody: a failed clone must never license destroying it"
+    );
+    assert_eq!(
+        pve.vm(9001).map(|v| v.name),
+        Some("a-leftover".to_string()),
+        "and it must be untouched, not merely present"
+    );
+}
+
+#[test]
+fn a_leftover_is_never_destroyed_on_the_strength_of_our_own_failed_clone() {
+    // The sharp edge in the fix above. Before it, any clone failure ran the
+    // cleanup path -- which for a collision means destroying a machine that
+    // was already there and is not ours. The tags prove identity: a destroy
+    // and re-clone would lose them.
+    let pve = pve_with_template();
+    pve.with_state(|s| {
+        s.vms.insert(
+            9001,
+            Vm {
+                name: "somebody-elses".into(),
+                tags: "expires-4102444800".into(),
+                running: true,
+                pool: "another/pool".into(),
+                ..Vm::default()
+            },
+        );
+    });
+    pve.hide_from_listing(9001);
+
+    let p = provider_for(&pve);
+    p.create(&request("a-session", 1_700_000_000)).expect("create");
+
+    let leftover = pve.vm(9001).expect("the machine that was already there");
+    assert_eq!(leftover.name, "somebody-elses");
+    assert_eq!(leftover.tags, "expires-4102444800");
+    assert!(leftover.running, "it was not even stopped");
+    let calls = pve.calls();
+    assert!(
+        !calls
+            .iter()
+            .any(|(method, path)| method == "DELETE" && path.contains("/qemu/9001")),
+        "nothing may delete 9001: {calls:?}"
+    );
+}
+
+#[test]
+fn a_range_full_of_leftovers_is_refused_with_the_identifiers_named() {
+    // One or two are leftovers. A wall of them is something else allocating in
+    // this range, and walking a hundred identifiers to discover that would be
+    // slow and unreadable. The refusal has to name what it stepped over, or
+    // the person who has to clear them has nothing to go on.
+    let pve = pve_with_template();
+    pve.with_state(|s| {
+        for id in 9001..=9099 {
+            s.vms.insert(
+                id,
+                Vm {
+                    name: format!("leftover-{id}"),
+                    pool: POOL.into(),
+                    ..Vm::default()
+                },
+            );
+            s.hidden_from_listing.push(id);
+        }
+    });
+
+    let p = provider_for(&pve);
+    let Err(e) = p.create(&request("a-session", 1_700_000_000)) else {
+        panic!("a range that is entirely leftovers cannot produce a session");
+    };
+    let text = e.to_string();
+    assert!(text.contains("9001"), "the identifiers must be named: {text}");
+    assert!(text.contains("9008"), "all of them, not just the first: {text}");
+}
+
+#[test]
+fn a_listing_that_cannot_be_read_is_not_an_empty_cluster() {
+    // Read as "nothing exists", an unreadable listing hands out the lowest
+    // identifier in the range -- which on a busy cluster is the one most
+    // likely to be taken -- and reports every live machine gone.
+    let pve = pve_with_template();
+    let p = provider_for(&pve);
+    pve.listing_unreadable(true);
+
+    let Err(e) = p.list() else {
+        panic!("a listing that is not a list must not read as an empty cluster");
+    };
+    assert!(
+        e.to_string().contains("not a list"),
+        "and it must say what went wrong: {e}"
+    );
+
+    let Err(e) = p.create(&request("a-session", 1_700_000_000)) else {
+        panic!("nothing may be allocated against a listing that could not be read");
+    };
+    assert!(e.to_string().contains("not a list"), "{e}");
+    let calls = pve.calls();
+    assert!(
+        !calls.iter().any(|(m, path)| m == "POST" && path.contains("/clone")),
+        "and the refusal must come before the clone: {calls:?}"
+    );
+}
+
+#[test]
+fn an_unreadable_listing_is_never_proof_that_a_machine_is_gone() {
+    // The severe one. A pool-scoped token answers a per-VM route for a machine
+    // it cannot see with 403, not 404, so "gone" is only ever concluded by
+    // consulting the listing. If that listing is unreadable and gets read as
+    // empty, `down` reports "already gone; forgotten" and drops the session
+    // record -- while the machine, if it is really there, is left with nobody
+    // to destroy it.
+    let pve = pve_with_template();
+    let p = provider_for(&pve);
+    pve.listing_unreadable(true);
+
+    match p.destroy(&MachineRef::new("9001")) {
+        Err(ProviderError::NotFound(_)) => {
+            panic!("a refusal plus an unreadable listing is not evidence of absence")
+        }
+        Err(e) => assert!(
+            e.to_string().contains("not a list"),
+            "and it must say why it could not tell: {e}"
+        ),
+        Ok(()) => panic!("nothing existed to destroy"),
+    }
+}
+
 // --- creation --------------------------------------------------------------
 
 #[test]
@@ -1187,6 +1356,41 @@ fn a_v6_only_guest_still_yields_its_address() {
 }
 
 #[test]
+fn every_address_the_guest_offers_is_kept_with_ipv4_first() {
+    // A guest configures IPv6 by autoconfiguration in a second or two and
+    // takes several more to get a DHCPv4 lease, so which family a session
+    // lands on is decided by boot timing. Sessions have come up on both. The
+    // pick is v4 where there is one -- but the *others* have to survive the
+    // call, or nothing anywhere can say a choice was ever made.
+    // Documentation ranges throughout, as everywhere else in this suite. The
+    // v6 host parts are EUI-64 in shape -- derived from a MAC, so built by
+    // autoconfiguration from a router advertisement rather than by any server
+    // round-trip -- because that shape is what made the selection visible in
+    // the field. The literals are not: they come from the reserved
+    // documentation MAC block, not from anybody's network card.
+    let both = serde_json::json!({"result": [
+        {"name": "lo", "ip-addresses": [{"ip-address": "127.0.0.1"}]},
+        {"name": "net0", "ip-addresses": [
+            {"ip-address": "fe80::200:5eff:fe00:5313"},
+            {"ip-address": "2001:db8:187f:8500:200:5eff:fe00:5313"},
+            {"ip-address": "192.0.2.83"}
+        ]}
+    ]});
+    let found: Vec<String> = crate::usable_addresses(&both)
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+    assert_eq!(
+        found,
+        vec![
+            "192.0.2.83".to_string(),
+            "2001:db8:187f:8500:200:5eff:fe00:5313".to_string()
+        ],
+        "IPv4 first, the global v6 kept, loopback and link-local dropped"
+    );
+}
+
+#[test]
 fn an_agent_reply_shaped_as_a_bare_array_still_parses() {
     // Older agents answer the array without the {"result": ...} wrapper; the
     // parser takes both shapes, and only the wrapped one had a test.
@@ -1194,7 +1398,9 @@ fn an_agent_reply_shaped_as_a_bare_array_still_parses() {
         {"name": "eth0", "ip-addresses": [{"ip-address": "192.0.2.9"}]}
     ]);
     assert_eq!(
-        crate::first_usable_address(&bare).map(|a| a.to_string()),
+        crate::usable_addresses(&bare)
+            .first()
+            .map(|a| a.to_string()),
         Some("192.0.2.9".to_string())
     );
 }

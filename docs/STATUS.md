@@ -768,12 +768,14 @@ So the acceptance criterion is restated:
 
 That is a claim `reset` can actually carry, and it is worth carrying.
 
-### 2. `testing-methodology.md` links to a document that is not here
+### 2. `testing-methodology.md` linked to a document that is not here -- resolved
 
-Its §7 and §11 point at `simulated-user-testing.md`. That file is superseded and
-deliberately not shipped; the living specification is a tenant's own `journeys`
-implementation. The link is left intact because the document is a record. Noted
-in [`README.md`](README.md).
+Its §7 and §11 pointed at `simulated-user-testing.md`, which is superseded and
+deliberately not shipped. The link was left intact on the grounds that the
+document is a record. Two tenants dogfooding reaper followed it independently
+and each concluded a file was missing from their checkout, so the citations now
+point at §11 of that same document, which is the specification for the tier.
+Preserving a record should not cost every new reader the same wrong conclusion.
 
 ## Reference tenants
 
